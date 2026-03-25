@@ -13,6 +13,8 @@ dotenv.config({ path: envPath });
 const app = express();
 const port = Number(process.env.PORT || 3001);
 const KNOWLEDGE_FILE_PATH = path.join(__dirname, "salonKnowledge.json");
+const MAX_WHATSAPP_HISTORY_MESSAGES = 20;
+const whatsappConversations = new Map();
 
 app.use(express.json());
 app.use((req, res, next) => {
@@ -33,12 +35,71 @@ function ensureEnv(name) {
   return value.trim();
 }
 
+function getConfiguredEstablishmentId() {
+  const raw =
+    String(process.env.TRINKS_ESTABLISHMENT_ID || "").trim() ||
+    String(process.env.VITE_TRINKS_ESTABLISHMENT_ID || "").trim();
+
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return null;
+  }
+
+  return parsed;
+}
+
 function toIsoDateTime(date, time) {
   return `${date}T${time}:00`;
 }
 
 function normalizePhone(phone) {
   return String(phone || "").replace(/\D/g, "");
+}
+
+function normalizeWhatsappNumber(value) {
+  const raw = String(value || "").trim();
+  if (!raw) {
+    return "";
+  }
+
+  const withoutDeviceSuffix = raw.split(":")[0];
+  const withoutJidSuffix = withoutDeviceSuffix.split("@")[0];
+  return normalizePhone(withoutJidSuffix);
+}
+
+function toNonEmptyString(value) {
+  const text = String(value || "").trim();
+  return text || "";
+}
+
+function firstNonEmpty(values) {
+  for (const value of values) {
+    const text = toNonEmptyString(value);
+    if (text) {
+      return text;
+    }
+  }
+  return "";
+}
+
+function getWhatsappHistory(phone) {
+  if (!phone) {
+    return [];
+  }
+
+  return Array.isArray(whatsappConversations.get(phone))
+    ? whatsappConversations.get(phone)
+    : [];
+}
+
+function pushWhatsappHistory(phone, role, content) {
+  if (!phone || !role || !content) {
+    return;
+  }
+
+  const current = getWhatsappHistory(phone);
+  const updated = [...current, { role, content: String(content) }].slice(-MAX_WHATSAPP_HISTORY_MESSAGES);
+  whatsappConversations.set(phone, updated);
 }
 
 function normalizeTrinksPhone(phone) {
@@ -405,6 +466,328 @@ async function evolutionRequest(path, { method = "POST", body } = {}) {
   }
 
   return json;
+}
+
+async function evolutionRequestWithFallback(attempts) {
+  const errors = [];
+
+  for (const attempt of attempts) {
+    try {
+      const payload = await evolutionRequest(attempt.path, {
+        method: attempt.method || "POST",
+        body: attempt.body,
+      });
+      return { payload, attempt };
+    } catch (error) {
+      errors.push({
+        path: attempt.path,
+        method: attempt.method || "POST",
+        message: error.message || "Erro desconhecido",
+        details: error.details || null,
+        status: error.status || null,
+      });
+    }
+  }
+
+  const aggregate = new Error("Falha em todas as tentativas na Evolution API.");
+  aggregate.status = errors[0]?.status || 500;
+  aggregate.details = errors;
+  throw aggregate;
+}
+
+function extractQrValue(payload) {
+  return firstNonEmpty([
+    payload?.base64,
+    payload?.qrcode?.base64,
+    payload?.qrcode,
+    payload?.qr,
+    payload?.code,
+    payload?.data?.base64,
+    payload?.data?.qrcode?.base64,
+    payload?.data?.qrcode,
+    payload?.data?.qr,
+    payload?.data?.code,
+    payload?.pairingCode,
+    payload?.data?.pairingCode,
+  ]);
+}
+
+function toQrDataUrl(rawQr) {
+  const value = toNonEmptyString(rawQr);
+  if (!value) {
+    return "";
+  }
+
+  if (value.startsWith("data:image")) {
+    return value;
+  }
+
+  if (value.startsWith("data:")) {
+    return value;
+  }
+
+  const looksLikeBase64 = /^[A-Za-z0-9+/=\s]+$/.test(value) && value.replace(/\s/g, "").length > 120;
+  if (looksLikeBase64) {
+    return `data:image/png;base64,${value.replace(/\s/g, "")}`;
+  }
+
+  return "";
+}
+
+function resolveEvolutionInstance(preferred) {
+  const fromArg = toNonEmptyString(preferred);
+  if (fromArg) {
+    return fromArg;
+  }
+
+  return toNonEmptyString(process.env.EVOLUTION_INSTANCE);
+}
+
+async function createEvolutionInstance(instanceName) {
+  const name = toNonEmptyString(instanceName);
+  if (!name) {
+    const error = new Error("Nome da instancia nao informado.");
+    error.status = 400;
+    throw error;
+  }
+
+  try {
+    const { payload, attempt } = await evolutionRequestWithFallback([
+      {
+        path: "/instance/create",
+        method: "POST",
+        body: {
+          instanceName: name,
+          qrcode: true,
+          integration: "WHATSAPP-BAILEYS",
+        },
+      },
+      {
+        path: "/instance/create",
+        method: "POST",
+        body: {
+          name,
+          qrcode: true,
+          integration: "WHATSAPP-BAILEYS",
+        },
+      },
+      {
+        path: `/instance/create/${name}`,
+        method: "POST",
+        body: {
+          qrcode: true,
+          integration: "WHATSAPP-BAILEYS",
+        },
+      },
+    ]);
+
+    return { created: true, payload, attempt };
+  } catch (error) {
+    const message = String(error.message || "").toLowerCase();
+    const alreadyExists = message.includes("exist") || message.includes("already") || message.includes("ja existe");
+    if (alreadyExists) {
+      return { created: false, alreadyExists: true, message: error.message, details: error.details || null };
+    }
+    throw error;
+  }
+}
+
+async function fetchEvolutionQr(instanceName) {
+  const instance = toNonEmptyString(instanceName);
+  if (!instance) {
+    const error = new Error("Nome da instancia nao informado.");
+    error.status = 400;
+    throw error;
+  }
+
+  const { payload, attempt } = await evolutionRequestWithFallback([
+    { path: `/instance/connect/${instance}`, method: "GET" },
+    { path: `/instance/qrcode/${instance}`, method: "GET" },
+    { path: `/instance/qr/${instance}`, method: "GET" },
+    { path: `/instance/connect/${instance}`, method: "POST" },
+  ]);
+
+  const qrRaw = extractQrValue(payload);
+  const qrDataUrl = toQrDataUrl(qrRaw);
+  const pairingCode = firstNonEmpty([payload?.pairingCode, payload?.data?.pairingCode]);
+
+  return {
+    payload,
+    attempt,
+    qrRaw,
+    qrDataUrl,
+    pairingCode,
+  };
+}
+
+function extractIncomingWhatsapp(body) {
+  const data = body?.data && typeof body.data === "object" ? body.data : body;
+  const key = data?.key && typeof data.key === "object" ? data.key : body?.key || {};
+  const message = data?.message && typeof data.message === "object" ? data.message : body?.message || {};
+
+  const senderRaw = firstNonEmpty([
+    key?.remoteJid,
+    data?.sender,
+    data?.from,
+    body?.sender,
+    body?.from,
+  ]);
+
+  const text = firstNonEmpty([
+    message?.conversation,
+    message?.extendedTextMessage?.text,
+    message?.imageMessage?.caption,
+    message?.videoMessage?.caption,
+    message?.documentMessage?.caption,
+    data?.text,
+    data?.body,
+    body?.text,
+    body?.body,
+  ]);
+
+  const instanceName = resolveEvolutionInstance(
+    firstNonEmpty([
+      body?.instance,
+      body?.instanceName,
+      data?.instance,
+      data?.instanceName,
+    ]),
+  );
+
+  return {
+    event: firstNonEmpty([body?.event, body?.type, data?.event]),
+    fromMe: Boolean(key?.fromMe ?? data?.fromMe ?? body?.fromMe ?? false),
+    senderRaw,
+    senderNumber: normalizeWhatsappNumber(senderRaw),
+    senderName: firstNonEmpty([data?.pushName, body?.pushName, data?.senderName]),
+    messageText: text,
+    messageId: firstNonEmpty([key?.id, data?.id, body?.id]),
+    isGroup: senderRaw.includes("@g.us"),
+    instanceName,
+  };
+}
+
+function escapeHtml(value) {
+  return String(value || "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/\"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+function renderQrPage({ instance, qrDataUrl, pairingCode, statusMessage, details }) {
+  const safeInstance = escapeHtml(instance || "nao informado");
+  const safeStatus = escapeHtml(statusMessage || "Aguardando leitura do QR Code.");
+  const safePairingCode = escapeHtml(pairingCode || "");
+  const safeDetails = escapeHtml(details || "");
+
+  return `<!doctype html>
+<html lang="pt-BR">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Conectar WhatsApp - IA.AGENDAMENTO</title>
+    <style>
+      :root {
+        color-scheme: light;
+      }
+      body {
+        margin: 0;
+        font-family: "Segoe UI", sans-serif;
+        background: radial-gradient(circle at top, #f3f7ff, #eef3f7 55%, #e8eef4);
+        color: #123;
+      }
+      main {
+        max-width: 760px;
+        margin: 24px auto;
+        padding: 24px;
+      }
+      .card {
+        background: #fff;
+        border-radius: 16px;
+        border: 1px solid #d8e2ed;
+        padding: 24px;
+        box-shadow: 0 8px 30px rgba(23, 42, 63, 0.08);
+      }
+      h1 {
+        margin-top: 0;
+        font-size: 1.5rem;
+      }
+      .meta {
+        margin: 8px 0;
+        font-size: 0.95rem;
+      }
+      .status {
+        background: #f7fbff;
+        border: 1px solid #d5e6f6;
+        border-radius: 10px;
+        padding: 10px 12px;
+        margin: 12px 0 18px;
+      }
+      .qr {
+        display: grid;
+        place-items: center;
+        padding: 20px;
+        border: 1px dashed #bdd2e5;
+        border-radius: 12px;
+        background: #fbfdff;
+        min-height: 280px;
+      }
+      img {
+        width: min(320px, 100%);
+        height: auto;
+      }
+      .actions {
+        display: flex;
+        gap: 10px;
+        margin-top: 18px;
+        flex-wrap: wrap;
+      }
+      button {
+        border: 0;
+        border-radius: 10px;
+        background: #0a6bd8;
+        color: #fff;
+        font-weight: 600;
+        padding: 10px 14px;
+        cursor: pointer;
+      }
+      code {
+        background: #f2f6fa;
+        padding: 2px 6px;
+        border-radius: 6px;
+      }
+      pre {
+        white-space: pre-wrap;
+        word-break: break-word;
+        background: #f2f6fa;
+        border: 1px solid #d8e2ed;
+        border-radius: 10px;
+        padding: 10px;
+        font-size: 0.85rem;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <div class="card">
+        <h1>Conectar WhatsApp por QR Code</h1>
+        <div class="meta">Instancia: <code>${safeInstance}</code></div>
+        <div class="status">${safeStatus}</div>
+        <div class="qr">
+          ${qrDataUrl ? `<img src="${qrDataUrl}" alt="QR Code WhatsApp" />` : "<div>QR indisponivel no momento. Clique em atualizar.</div>"}
+        </div>
+        ${safePairingCode ? `<p class="meta">Pairing code: <code>${safePairingCode}</code></p>` : ""}
+        <div class="actions">
+          <button onclick="window.location.reload()">Atualizar QR</button>
+          <button onclick="window.location.href='/api/evolution/instance/status?instance=${encodeURIComponent(instance || "")}'">Ver status</button>
+        </div>
+        ${safeDetails ? `<pre>${safeDetails}</pre>` : ""}
+      </div>
+    </main>
+  </body>
+</html>`;
 }
 
 function safeJsonParse(value) {
@@ -952,8 +1335,129 @@ app.get("/", (req, res) => {
       trinksAppointments: "POST /api/trinks/appointments",
       trinksProfessionals: "POST /api/trinks/professionals",
       trinksReschedule: "POST /api/trinks/appointments/reschedule",
+      evolutionSendText: "POST /api/evolution/send-text",
+      evolutionQrPage: "GET /api/evolution/instance/connect?instance=SEU_NOME",
     },
   });
+});
+
+app.post("/api/evolution/instance/create", async (req, res) => {
+  try {
+    const instance = resolveEvolutionInstance(req.body?.instance || req.body?.instanceName);
+    if (!instance) {
+      return res.status(400).json({ message: "Informe instance/instanceName ou configure EVOLUTION_INSTANCE." });
+    }
+
+    const created = await createEvolutionInstance(instance);
+    return res.json({ status: "ok", instance, created });
+  } catch (error) {
+    return res.status(error.status || 500).json({
+      status: "error",
+      message: error.message || "Erro ao criar instancia na Evolution.",
+      details: error.details || null,
+    });
+  }
+});
+
+app.get("/api/evolution/instance/status", async (req, res) => {
+  try {
+    const instance = resolveEvolutionInstance(req.query.instance || req.query.instanceName);
+    if (!instance) {
+      return res.status(400).json({ message: "Informe instance ou configure EVOLUTION_INSTANCE." });
+    }
+
+    const payload = await evolutionRequest("/instance/fetchInstances", { method: "GET" });
+    const instances = Array.isArray(payload) ? payload : Array.isArray(payload?.instances) ? payload.instances : [];
+    const found = instances.find(
+      (item) =>
+        toNonEmptyString(item?.name || item?.instanceName || item?.instance).toLowerCase() === instance.toLowerCase(),
+    );
+
+    return res.json({ status: "ok", instance, connected: Boolean(found), data: found || null, raw: payload });
+  } catch (error) {
+    return res.status(error.status || 500).json({
+      status: "error",
+      message: error.message || "Erro ao consultar status da instancia.",
+      details: error.details || null,
+    });
+  }
+});
+
+app.get("/api/evolution/instance/qr", async (req, res) => {
+  try {
+    const instance = resolveEvolutionInstance(req.query.instance || req.query.instanceName);
+    if (!instance) {
+      return res.status(400).json({ message: "Informe instance ou configure EVOLUTION_INSTANCE." });
+    }
+
+    const qr = await fetchEvolutionQr(instance);
+    return res.json({
+      status: "ok",
+      instance,
+      qr: {
+        hasQrImage: Boolean(qr.qrDataUrl),
+        qrDataUrl: qr.qrDataUrl || null,
+        qrRaw: qr.qrRaw || null,
+        pairingCode: qr.pairingCode || null,
+        sourcePath: qr.attempt?.path || null,
+      },
+      raw: qr.payload,
+    });
+  } catch (error) {
+    return res.status(error.status || 500).json({
+      status: "error",
+      message: error.message || "Erro ao buscar QR code da instancia.",
+      details: error.details || null,
+    });
+  }
+});
+
+app.get("/api/evolution/instance/connect", async (req, res) => {
+  try {
+    const instance = resolveEvolutionInstance(req.query.instance || req.query.instanceName);
+    if (!instance) {
+      return res.status(400).send("Informe ?instance=nome-da-instancia ou configure EVOLUTION_INSTANCE.");
+    }
+
+    const created = await createEvolutionInstance(instance);
+    const qr = await fetchEvolutionQr(instance);
+
+    const statusMessage = created?.alreadyExists
+      ? "Instancia ja existia. Escaneie o QR para conectar."
+      : "Instancia criada. Escaneie o QR no WhatsApp Business.";
+
+    const details = qr.qrDataUrl
+      ? ""
+      : JSON.stringify({ create: created, qrSource: qr.attempt?.path, qrRaw: qr.qrRaw, raw: qr.payload }, null, 2);
+
+    res.setHeader("Content-Type", "text/html; charset=utf-8");
+    return res.send(
+      renderQrPage({
+        instance,
+        qrDataUrl: qr.qrDataUrl,
+        pairingCode: qr.pairingCode,
+        statusMessage,
+        details,
+      }),
+    );
+  } catch (error) {
+    const html = renderQrPage({
+      instance: resolveEvolutionInstance(req.query.instance || req.query.instanceName),
+      qrDataUrl: "",
+      pairingCode: "",
+      statusMessage: "Falha ao criar/conectar instancia na Evolution.",
+      details: JSON.stringify(
+        {
+          message: error.message || "Erro desconhecido",
+          details: error.details || null,
+        },
+        null,
+        2,
+      ),
+    });
+    res.setHeader("Content-Type", "text/html; charset=utf-8");
+    return res.status(error.status || 500).send(html);
+  }
 });
 
 app.post("/api/trinks/availability", async (req, res) => {
@@ -1354,9 +1858,79 @@ app.post("/api/evolution/send-text", async (req, res) => {
   }
 });
 
-app.post("/webhook/whatsapp", (req, res) => {
-  const body = req.body || {};
-  return res.status(200).json({ received: true, event: body?.event || null });
+app.post("/webhook/whatsapp", async (req, res) => {
+  try {
+    const incoming = extractIncomingWhatsapp(req.body || {});
+
+    if (incoming.fromMe) {
+      return res.status(200).json({ received: true, ignored: true, reason: "fromMe" });
+    }
+
+    if (incoming.isGroup) {
+      return res.status(200).json({ received: true, ignored: true, reason: "groupMessage" });
+    }
+
+    if (!incoming.senderNumber || !incoming.messageText) {
+      return res.status(200).json({
+        received: true,
+        ignored: true,
+        reason: "missingSenderOrText",
+        event: incoming.event || null,
+      });
+    }
+
+    const establishmentId = getConfiguredEstablishmentId();
+    if (!establishmentId) {
+      const configError = new Error(
+        "Configure TRINKS_ESTABLISHMENT_ID (ou VITE_TRINKS_ESTABLISHMENT_ID) no backend para usar webhook WhatsApp.",
+      );
+      configError.status = 500;
+      throw configError;
+    }
+
+    const previousHistory = getWhatsappHistory(incoming.senderNumber);
+    pushWhatsappHistory(incoming.senderNumber, "user", incoming.messageText);
+
+    const answer = await sendChatMessage({
+      establishmentId,
+      message: incoming.messageText,
+      history: previousHistory,
+    });
+
+    const instance = resolveEvolutionInstance(incoming.instanceName);
+    if (!instance) {
+      const instanceError = new Error("EVOLUTION_INSTANCE nao configurado e nao informado no webhook.");
+      instanceError.status = 500;
+      throw instanceError;
+    }
+
+    await evolutionRequest(`/message/sendText/${instance}`, {
+      method: "POST",
+      body: {
+        number: incoming.senderNumber,
+        text: answer,
+      },
+    });
+
+    pushWhatsappHistory(incoming.senderNumber, "assistant", answer);
+
+    return res.status(200).json({
+      received: true,
+      processed: true,
+      instance,
+      to: incoming.senderNumber,
+      event: incoming.event || null,
+      messageId: incoming.messageId || null,
+    });
+  } catch (error) {
+    return res.status(error.status || 500).json({
+      received: true,
+      processed: false,
+      status: "error",
+      message: error.message || "Erro ao processar webhook do WhatsApp.",
+      details: error.details || null,
+    });
+  }
 });
 
 app.listen(port, () => {
