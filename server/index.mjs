@@ -1,7 +1,7 @@
 import express from "express";
 import dotenv from "dotenv";
 import { GoogleGenAI, Type } from "@google/genai";
-import { readFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -33,6 +33,16 @@ function ensureEnv(name) {
     throw new Error(`Variavel obrigatoria ausente: ${name}`);
   }
   return value.trim();
+}
+
+function isKnowledgeWriteAuthorized(req) {
+  const requiredToken = String(process.env.KNOWLEDGE_ADMIN_TOKEN || "").trim();
+  if (!requiredToken) {
+    return true;
+  }
+
+  const provided = String(req.headers["x-admin-token"] || "").trim();
+  return provided && provided === requiredToken;
 }
 
 function getConfiguredEstablishmentId() {
@@ -252,6 +262,12 @@ function loadSalonKnowledge() {
   } catch {
     return {};
   }
+}
+
+function saveSalonKnowledge(nextKnowledge) {
+  const json = JSON.stringify(nextKnowledge, null, 2);
+  writeFileSync(KNOWLEDGE_FILE_PATH, `${json}\n`, "utf-8");
+  return nextKnowledge;
 }
 
 function formatKnowledgeForPrompt(knowledge) {
@@ -1322,6 +1338,41 @@ async function sendChatMessage({ establishmentId, message, history }) {
 
 app.get("/api/health", (req, res) => {
   res.json({ status: "ok" });
+});
+
+app.get("/api/knowledge", (req, res) => {
+  try {
+    const knowledge = loadSalonKnowledge();
+    return res.json({ knowledge });
+  } catch (error) {
+    return res.status(500).json({
+      message: error.message || "Erro ao carregar base de conhecimento.",
+    });
+  }
+});
+
+app.put("/api/knowledge", (req, res) => {
+  try {
+    if (!isKnowledgeWriteAuthorized(req)) {
+      return res.status(401).json({
+        message: "Nao autorizado para atualizar a base de conhecimento.",
+      });
+    }
+
+    const knowledge = req.body?.knowledge;
+    if (!knowledge || typeof knowledge !== "object" || Array.isArray(knowledge)) {
+      return res.status(400).json({
+        message: "Campo obrigatorio: knowledge (objeto JSON).",
+      });
+    }
+
+    const saved = saveSalonKnowledge(knowledge);
+    return res.json({ status: "ok", knowledge: saved });
+  } catch (error) {
+    return res.status(500).json({
+      message: error.message || "Erro ao salvar base de conhecimento.",
+    });
+  }
 });
 
 app.get("/", (req, res) => {

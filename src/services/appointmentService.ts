@@ -3,6 +3,8 @@ type ChatHistoryItem = {
   content: string;
 };
 
+type KnowledgePayload = Record<string, unknown>;
+
 export class AppointmentService {
   private backendUrl: string;
   private establishmentId: string;
@@ -51,5 +53,43 @@ export class AppointmentService {
 
     const data = await response.json();
     return data.text as string;
+  }
+
+  async getKnowledge() {
+    const response = await fetch(this.getBackendEndpoint("/api/knowledge"), {
+      method: "GET",
+      headers: { "Content-Type": "application/json" },
+    });
+
+    if (!response.ok) {
+      throw new Error(`Falha ao carregar base de conhecimento (${response.status}).`);
+    }
+
+    const data = (await response.json()) as { knowledge?: KnowledgePayload };
+    return data.knowledge || {};
+  }
+
+  async saveKnowledge(knowledge: KnowledgePayload) {
+    const response = await fetch(this.getBackendEndpoint("/api/knowledge"), {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ knowledge }),
+    });
+
+    if (!response.ok) {
+      let message = `Falha ao salvar base de conhecimento (${response.status}).`;
+      try {
+        const payload = (await response.json()) as { message?: string };
+        if (payload?.message) {
+          message = payload.message;
+        }
+      } catch {
+        // Keep fallback message.
+      }
+      throw new Error(message);
+    }
+
+    const data = (await response.json()) as { knowledge?: KnowledgePayload };
+    return data.knowledge || {};
   }
 }

@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
-import { Send, Calendar, Sparkles, Phone, User, ChevronRight, MessageSquare } from 'lucide-react';
+import { Send, Calendar, Sparkles, Phone } from 'lucide-react';
 import { AppointmentService } from './services/appointmentService';
 
 interface Message {
@@ -8,6 +8,36 @@ interface Message {
   role: 'user' | 'assistant';
   content: string;
   timestamp: Date;
+}
+
+type TopSection = 'chat' | 'services' | 'salon' | 'contact' | 'knowledge';
+
+const initialKnowledge = {
+  identity: {
+    brandName: 'Fabiana Luxury Salon',
+    toneGuide: 'sofisticado, acolhedor, objetivo',
+  },
+  business: {
+    address: '',
+    phone: '',
+    openingHours: '',
+    paymentMethods: ['PIX', 'Cartao de credito', 'Cartao de debito'],
+  },
+  policies: {
+    latePolicy: '',
+    cancellationPolicy: '',
+    noShowPolicy: '',
+  },
+  services: [],
+  faq: [],
+};
+
+function safeParseKnowledge(raw: string) {
+  const parsed = JSON.parse(raw);
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new Error('A base de conhecimento deve ser um objeto JSON.');
+  }
+  return parsed;
 }
 
 export default function App() {
@@ -21,11 +51,32 @@ export default function App() {
   ]);
   const [input, setInput] = useState('');
   const [isLoading, setIsLoading] = useState(false);
+  const [activeSection, setActiveSection] = useState<TopSection>('chat');
+  const [knowledgeJson, setKnowledgeJson] = useState(JSON.stringify(initialKnowledge, null, 2));
+  const [knowledgeStatus, setKnowledgeStatus] = useState('');
+  const [isSavingKnowledge, setIsSavingKnowledge] = useState(false);
+  const [isLoadingKnowledge, setIsLoadingKnowledge] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const appointmentService = useRef<AppointmentService | null>(null);
 
   useEffect(() => {
     appointmentService.current = new AppointmentService();
+
+    const loadKnowledge = async () => {
+      if (!appointmentService.current) return;
+      setIsLoadingKnowledge(true);
+      try {
+        const knowledge = await appointmentService.current.getKnowledge();
+        setKnowledgeJson(JSON.stringify(knowledge, null, 2));
+      } catch (error) {
+        const message = error instanceof Error ? error.message : 'Erro ao carregar base de conhecimento.';
+        setKnowledgeStatus(message);
+      } finally {
+        setIsLoadingKnowledge(false);
+      }
+    };
+
+    loadKnowledge();
   }, []);
 
   useEffect(() => {
@@ -78,6 +129,35 @@ export default function App() {
     }
   };
 
+  const handleSaveKnowledge = async () => {
+    if (!appointmentService.current || isSavingKnowledge) return;
+    setIsSavingKnowledge(true);
+    setKnowledgeStatus('Salvando base de conhecimento...');
+
+    try {
+      const parsed = safeParseKnowledge(knowledgeJson);
+      const saved = await appointmentService.current.saveKnowledge(parsed);
+      setKnowledgeJson(JSON.stringify(saved, null, 2));
+      setKnowledgeStatus('Base de conhecimento salva com sucesso.');
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Erro ao salvar base de conhecimento.';
+      setKnowledgeStatus(message);
+    } finally {
+      setIsSavingKnowledge(false);
+    }
+  };
+
+  const knowledgeObject = (() => {
+    try {
+      return safeParseKnowledge(knowledgeJson) as Record<string, any>;
+    } catch {
+      return initialKnowledge;
+    }
+  })();
+
+  const services = Array.isArray(knowledgeObject?.services) ? knowledgeObject.services : [];
+  const faq = Array.isArray(knowledgeObject?.faq) ? knowledgeObject.faq : [];
+
   return (
     <div className="min-h-screen flex flex-col luxury-gradient">
       {/* Header */}
@@ -91,15 +171,100 @@ export default function App() {
             <p className="label-micro text-brand-blue">Concierge de Luxo</p>
           </div>
         </div>
-        <div className="hidden sm:flex items-center gap-6 text-[11px] uppercase tracking-widest text-white/60">
-          <span className="hover:text-white cursor-pointer transition-colors">Serviços</span>
-          <span className="hover:text-white cursor-pointer transition-colors">O Salão</span>
-          <span className="hover:text-white cursor-pointer transition-colors">Contato</span>
+        <div className="hidden sm:flex items-center gap-5 text-[11px] uppercase tracking-widest text-white/60">
+          <button onClick={() => setActiveSection('services')} className="hover:text-white cursor-pointer transition-colors">Servicos</button>
+          <button onClick={() => setActiveSection('salon')} className="hover:text-white cursor-pointer transition-colors">O Salao</button>
+          <button onClick={() => setActiveSection('contact')} className="hover:text-white cursor-pointer transition-colors">Contato</button>
+          <button onClick={() => setActiveSection('knowledge')} className="hover:text-white cursor-pointer transition-colors">Base</button>
         </div>
       </header>
 
       {/* Main Content */}
       <main className="flex-1 max-w-4xl w-full mx-auto p-4 sm:p-8 flex flex-col gap-6 overflow-hidden">
+        {activeSection !== 'chat' && (
+          <div className="glass rounded-2xl p-5 sm:p-6 space-y-4">
+            {activeSection === 'services' && (
+              <>
+                <h2 className="heading-bold text-lg text-white">Servicos</h2>
+                {!services.length && <p className="text-white/70 text-sm">Nenhum servico cadastrado na base de conhecimento.</p>}
+                <div className="grid sm:grid-cols-2 gap-3">
+                  {services.map((item: any, idx: number) => (
+                    <div key={`${item?.name || 'servico'}-${idx}`} className="rounded-xl bg-white/5 border border-white/10 p-4">
+                      <p className="font-display font-bold text-white/90">{item?.name || 'Servico'}</p>
+                      <p className="text-xs text-white/60 mt-1">Duracao: {item?.durationMinutes || '-'} min</p>
+                      <p className="text-xs text-brand-blue mt-1">Preco: {item?.price || 'sob consulta'}</p>
+                    </div>
+                  ))}
+                </div>
+              </>
+            )}
+
+            {activeSection === 'salon' && (
+              <>
+                <h2 className="heading-bold text-lg text-white">O Salao</h2>
+                <div className="space-y-2 text-sm text-white/80">
+                  <p><strong className="text-white/95">Nome:</strong> {knowledgeObject?.identity?.brandName || 'Nao informado'}</p>
+                  <p><strong className="text-white/95">Endereco:</strong> {knowledgeObject?.business?.address || 'Nao informado'}</p>
+                  <p><strong className="text-white/95">Horarios:</strong> {knowledgeObject?.business?.openingHours || 'Nao informado'}</p>
+                  <p><strong className="text-white/95">Politica de atraso:</strong> {knowledgeObject?.policies?.latePolicy || 'Nao informado'}</p>
+                  <p><strong className="text-white/95">Cancelamento:</strong> {knowledgeObject?.policies?.cancellationPolicy || 'Nao informado'}</p>
+                </div>
+              </>
+            )}
+
+            {activeSection === 'contact' && (
+              <>
+                <h2 className="heading-bold text-lg text-white">Contato</h2>
+                <div className="space-y-2 text-sm text-white/80">
+                  <p><strong className="text-white/95">Telefone:</strong> {knowledgeObject?.business?.phone || 'Nao informado'}</p>
+                  <p><strong className="text-white/95">Pagamento:</strong> {Array.isArray(knowledgeObject?.business?.paymentMethods) && knowledgeObject.business.paymentMethods.length ? knowledgeObject.business.paymentMethods.join(', ') : 'Nao informado'}</p>
+                </div>
+                {faq.length > 0 && (
+                  <div className="mt-4 space-y-2">
+                    {faq.map((item: any, idx: number) => (
+                      <div key={`faq-${idx}`} className="rounded-lg bg-white/5 border border-white/10 p-3">
+                        <p className="text-xs uppercase tracking-wider text-brand-blue">Pergunta</p>
+                        <p className="text-sm text-white/90">{item?.question}</p>
+                        <p className="text-xs uppercase tracking-wider text-brand-green mt-2">Resposta</p>
+                        <p className="text-sm text-white/80">{item?.answer}</p>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </>
+            )}
+
+            {activeSection === 'knowledge' && (
+              <>
+                <div className="flex items-center justify-between gap-3 flex-wrap">
+                  <h2 className="heading-bold text-lg text-white">Editar Base de Conhecimento</h2>
+                  <button
+                    onClick={handleSaveKnowledge}
+                    disabled={isSavingKnowledge || isLoadingKnowledge}
+                    className="px-4 py-2 rounded-lg bg-brand-blue text-white text-xs uppercase tracking-wider disabled:opacity-50"
+                  >
+                    {isSavingKnowledge ? 'Salvando...' : 'Salvar'}
+                  </button>
+                </div>
+                <p className="text-xs text-white/60">Edite o JSON abaixo e clique em Salvar. Isso atualiza a base usada pela IA em tempo real.</p>
+                <textarea
+                  value={knowledgeJson}
+                  onChange={(e) => setKnowledgeJson(e.target.value)}
+                  className="w-full min-h-72 rounded-xl bg-[#0f1731] border border-white/15 text-white/90 text-xs p-3 font-mono"
+                />
+                {knowledgeStatus && <p className="text-xs text-brand-green">{knowledgeStatus}</p>}
+              </>
+            )}
+
+            <button
+              onClick={() => setActiveSection('chat')}
+              className="label-micro text-white/70 hover:text-white"
+            >
+              Voltar para chat
+            </button>
+          </div>
+        )}
+
         <div className="flex-1 overflow-y-auto pr-2 space-y-8 scrollbar-hide">
           <AnimatePresence initial={false}>
             {messages.map((msg) => (
@@ -185,6 +350,12 @@ export default function App() {
             className="px-4 py-2 rounded-full glass label-micro text-white/60 hover:text-brand-green hover:border-brand-green/30 transition-all flex items-center gap-2"
           >
             <Phone className="w-3 h-3 text-brand-green" /> Suporte Humano
+          </button>
+          <button
+            onClick={() => setActiveSection('knowledge')}
+            className="px-4 py-2 rounded-full glass label-micro text-white/60 hover:text-white hover:border-white/30 transition-all flex items-center gap-2"
+          >
+            <Sparkles className="w-3 h-3 text-white/70" /> Editar Base
           </button>
         </div>
       </main>
