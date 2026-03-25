@@ -175,6 +175,9 @@ export default function App() {
   const paymentMethods = Array.isArray(knowledgeObject?.business?.paymentMethods)
     ? knowledgeObject.business.paymentMethods
     : [];
+  const knowledgeStatusClass = knowledgeStatus.toLowerCase().includes('erro')
+    ? 'text-red-300'
+    : 'text-brand-green';
 
   return (
     <div className="min-h-screen flex flex-col luxury-gradient">
@@ -226,6 +229,7 @@ export default function App() {
                     </button>
                   </div>
                 </div>
+                {knowledgeStatus && <p className={`text-xs ${knowledgeStatusClass}`}>{knowledgeStatus}</p>}
                 {!services.length && <p className="text-white/70 text-sm">Nenhum servico cadastrado. Clique em + Servico.</p>}
                 <div className="grid sm:grid-cols-2 gap-3">
                   {services.map((item: any, idx: number) => (
@@ -301,6 +305,7 @@ export default function App() {
                     {isSavingKnowledge ? 'Salvando...' : 'Salvar'}
                   </button>
                 </div>
+                {knowledgeStatus && <p className={`text-xs ${knowledgeStatusClass}`}>{knowledgeStatus}</p>}
                 <div className="grid sm:grid-cols-2 gap-3">
                   <input
                     value={toText(knowledgeObject?.identity?.brandName)}
@@ -411,6 +416,7 @@ export default function App() {
                     </button>
                   </div>
                 </div>
+                {knowledgeStatus && <p className={`text-xs ${knowledgeStatusClass}`}>{knowledgeStatus}</p>}
                 <div className="space-y-3 text-sm text-white/80">
                   <input
                     value={toText(knowledgeObject?.business?.phone)}
@@ -501,7 +507,7 @@ export default function App() {
                 <p className="text-xs text-white/60">
                   Preencha os campos abaixo e clique em Salvar. A IA usa esta base em tempo real.
                 </p>
-                {knowledgeStatus && <p className="text-xs text-brand-green">{knowledgeStatus}</p>}
+                {knowledgeStatus && <p className={`text-xs ${knowledgeStatusClass}`}>{knowledgeStatus}</p>}
 
                 <div className="grid sm:grid-cols-2 gap-3">
                   <input
