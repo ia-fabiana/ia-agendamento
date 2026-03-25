@@ -47,7 +47,13 @@ export default function App() {
     setIsLoading(true);
 
     try {
-      const response = await appointmentService.current?.sendMessage(input);
+      const response = await appointmentService.current?.sendMessage(
+        input,
+        messages.map((message) => ({
+          role: message.role,
+          content: message.content,
+        })),
+      );
       const assistantMessage: Message = {
         id: (Date.now() + 1).toString(),
         role: 'assistant',
@@ -57,6 +63,16 @@ export default function App() {
       setMessages((prev) => [...prev, assistantMessage]);
     } catch (error) {
       console.error('Error sending message:', error);
+      const fallbackMessage =
+        'Nao foi possivel concluir sua mensagem agora. Verifique a conexao com o servidor e tente novamente.';
+      const content = error instanceof Error && error.message ? error.message : fallbackMessage;
+      const errorMessage: Message = {
+        id: (Date.now() + 2).toString(),
+        role: 'assistant',
+        content,
+        timestamp: new Date(),
+      };
+      setMessages((prev) => [...prev, errorMessage]);
     } finally {
       setIsLoading(false);
     }
@@ -141,6 +157,8 @@ export default function App() {
             <button
               onClick={handleSend}
               disabled={isLoading || !input.trim()}
+              aria-label="Enviar mensagem"
+              title="Enviar mensagem"
               className="w-10 h-10 rounded-xl bg-gradient-to-br from-brand-purple to-brand-blue text-white flex items-center justify-center hover:opacity-90 transition-all disabled:opacity-50 disabled:cursor-not-allowed shadow-lg shadow-brand-purple/20"
             >
               <Send className="w-4 h-4" />

@@ -1,0 +1,44 @@
+{
+  "identity": {
+    "brandName": "Fabiana Luxury Salon",
+    "toneGuide": "sofisticado, acolhedor, objetivo"
+  },
+  "business": {
+    "address": "Atualize com o endereco oficial",
+    "phone": "Atualize com o telefone oficial",
+    "openingHours": "Seg a Sab, 09:00-19:00",
+    "paymentMethods": ["PIX", "Cartao de credito", "Cartao de debito"]
+  },
+  "policies": {
+    "latePolicy": "Tolerancia de 10 minutos; apos isso pode haver ajuste na agenda.",
+    "cancellationPolicy": "Cancelamentos e remarcacoes com pelo menos 24h de antecedencia.",
+    "noShowPolicy": "Faltas sem aviso podem exigir sinal para novos agendamentos."
+  },
+  "services": [
+    {
+      "name": "Corte Feminino",
+      "durationMinutes": 60,
+      "price": "a partir de 180"
+    },
+    {
+      "name": "Escova",
+      "durationMinutes": 45,
+      "price": "a partir de 120"
+    },
+    {
+      "name": "Hidratacao",
+      "durationMinutes": 50,
+      "price": "a partir de 150"
+    }
+  ],
+  "faq": [
+    {
+      "question": "Vocês atendem com hora marcada?",
+      "answer": "Sim, trabalhamos com agendamento para garantir a melhor experiencia."
+    },
+    {
+      "question": "Aceitam PIX?",
+      "answer": "Sim, aceitamos PIX e cartoes."
+    }
+  ]
+}
