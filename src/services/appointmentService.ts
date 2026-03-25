@@ -4,6 +4,24 @@ type ChatHistoryItem = {
 };
 
 type KnowledgePayload = Record<string, unknown>;
+type EvolutionStatusResponse = {
+  status?: string;
+  instance?: string;
+  connected?: boolean;
+  data?: Record<string, unknown> | null;
+};
+
+type EvolutionQrResponse = {
+  status?: string;
+  instance?: string;
+  qr?: {
+    hasQrImage?: boolean;
+    qrDataUrl?: string | null;
+    qrRaw?: string | null;
+    pairingCode?: string | null;
+    sourcePath?: string | null;
+  };
+};
 
 export class AppointmentService {
   private backendUrl: string;
@@ -91,5 +109,78 @@ export class AppointmentService {
 
     const data = (await response.json()) as { knowledge?: KnowledgePayload };
     return data.knowledge || {};
+  }
+
+  async createEvolutionInstance(instance: string) {
+    const response = await fetch(this.getBackendEndpoint("/api/evolution/instance/create"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ instance }),
+    });
+
+    if (!response.ok) {
+      let message = `Falha ao criar instancia (${response.status}).`;
+      try {
+        const payload = (await response.json()) as { message?: string };
+        if (payload?.message) {
+          message = payload.message;
+        }
+      } catch {
+        // Keep fallback message.
+      }
+      throw new Error(message);
+    }
+
+    return response.json();
+  }
+
+  async getEvolutionQr(instance: string) {
+    const response = await fetch(
+      this.getBackendEndpoint(`/api/evolution/instance/qr?instance=${encodeURIComponent(instance)}`),
+      {
+        method: "GET",
+        headers: { "Content-Type": "application/json" },
+      },
+    );
+
+    if (!response.ok) {
+      let message = `Falha ao buscar QR (${response.status}).`;
+      try {
+        const payload = (await response.json()) as { message?: string };
+        if (payload?.message) {
+          message = payload.message;
+        }
+      } catch {
+        // Keep fallback message.
+      }
+      throw new Error(message);
+    }
+
+    return (await response.json()) as EvolutionQrResponse;
+  }
+
+  async getEvolutionStatus(instance: string) {
+    const response = await fetch(
+      this.getBackendEndpoint(`/api/evolution/instance/status?instance=${encodeURIComponent(instance)}`),
+      {
+        method: "GET",
+        headers: { "Content-Type": "application/json" },
+      },
+    );
+
+    if (!response.ok) {
+      let message = `Falha ao consultar status (${response.status}).`;
+      try {
+        const payload = (await response.json()) as { message?: string };
+        if (payload?.message) {
+          message = payload.message;
+        }
+      } catch {
+        // Keep fallback message.
+      }
+      throw new Error(message);
+    }
+
+    return (await response.json()) as EvolutionStatusResponse;
   }
 }

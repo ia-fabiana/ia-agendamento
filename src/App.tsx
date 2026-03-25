@@ -11,6 +11,22 @@ interface Message {
 }
 
 type TopSection = 'chat' | 'services' | 'salon' | 'contact' | 'knowledge';
+type EvolutionStatus = {
+  status?: string;
+  instance?: string;
+  connected?: boolean;
+  data?: Record<string, unknown> | null;
+};
+
+type EvolutionQr = {
+  status?: string;
+  instance?: string;
+  qr?: {
+    hasQrImage?: boolean;
+    qrDataUrl?: string | null;
+    pairingCode?: string | null;
+  };
+};
 
 const initialKnowledge = {
   identity: {
@@ -60,6 +76,11 @@ export default function App() {
   const [knowledgeStatus, setKnowledgeStatus] = useState('');
   const [isSavingKnowledge, setIsSavingKnowledge] = useState(false);
   const [isLoadingKnowledge, setIsLoadingKnowledge] = useState(false);
+  const [whatsappInstance, setWhatsappInstance] = useState('ia-agendamento');
+  const [whatsappStatus, setWhatsappStatus] = useState<EvolutionStatus | null>(null);
+  const [whatsappQr, setWhatsappQr] = useState<EvolutionQr | null>(null);
+  const [whatsappError, setWhatsappError] = useState('');
+  const [isLoadingWhatsapp, setIsLoadingWhatsapp] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const appointmentService = useRef<AppointmentService | null>(null);
 
@@ -178,6 +199,60 @@ export default function App() {
   const knowledgeStatusClass = knowledgeStatus.toLowerCase().includes('erro')
     ? 'text-red-300'
     : 'text-brand-green';
+  const whatsappStatusRaw = whatsappStatus?.data || null;
+  const whatsappConnectionStatus =
+    whatsappStatusRaw && typeof whatsappStatusRaw === 'object'
+      ? (whatsappStatusRaw as Record<string, unknown>)?.connectionStatus
+      : null;
+  const whatsappStatusLabel = whatsappStatus
+    ? String(whatsappConnectionStatus || (whatsappStatus.connected ? 'connected' : 'disconnected'))
+    : 'desconhecido';
+  const whatsappStatusBadgeClass = whatsappStatus
+    ? whatsappStatus.connected
+      ? 'bg-green-500/20 text-green-200 border-green-400/40'
+      : 'bg-red-500/20 text-red-200 border-red-400/40'
+    : 'bg-white/10 text-white/70 border-white/10';
+
+  const ensureWhatsappInstance = () => {
+    if (!whatsappInstance.trim()) {
+      setWhatsappError('Informe o nome da instancia para continuar.');
+      return false;
+    }
+    return true;
+  };
+
+  const handleRefreshWhatsappStatus = async () => {
+    if (!appointmentService.current || isLoadingWhatsapp || !ensureWhatsappInstance()) return;
+    setIsLoadingWhatsapp(true);
+    setWhatsappError('');
+
+    try {
+      const status = await appointmentService.current.getEvolutionStatus(whatsappInstance.trim());
+      setWhatsappStatus(status);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Erro ao consultar status do WhatsApp.';
+      setWhatsappError(message);
+    } finally {
+      setIsLoadingWhatsapp(false);
+    }
+  };
+
+  const handleLoadWhatsappQr = async () => {
+    if (!appointmentService.current || isLoadingWhatsapp || !ensureWhatsappInstance()) return;
+    setIsLoadingWhatsapp(true);
+    setWhatsappError('');
+
+    try {
+      await appointmentService.current.createEvolutionInstance(whatsappInstance.trim());
+      const qr = await appointmentService.current.getEvolutionQr(whatsappInstance.trim());
+      setWhatsappQr(qr);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Erro ao carregar QR code do WhatsApp.';
+      setWhatsappError(message);
+    } finally {
+      setIsLoadingWhatsapp(false);
+    }
+  };
 
   return (
     <div className="min-h-screen flex flex-col luxury-gradient">
@@ -442,6 +517,64 @@ export default function App() {
                     placeholder="Formas de pagamento separadas por virgula"
                     className="w-full rounded-md bg-[#0f1731] border border-white/15 text-white/90 px-3 py-2 text-sm"
                   />
+                </div>
+                <div className="mt-6 rounded-2xl bg-white/5 border border-white/10 p-4 space-y-4">
+                  <div className="flex items-center justify-between gap-3 flex-wrap">
+                    <div className="flex items-center gap-2">
+                      <Phone className="w-4 h-4 text-brand-blue" />
+                      <h3 className="text-sm uppercase tracking-widest text-white">WhatsApp</h3>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <button
+                        onClick={handleRefreshWhatsappStatus}
+                        disabled={isLoadingWhatsapp}
+                        className="px-3 py-2 rounded-lg bg-white/10 text-white text-xs uppercase tracking-wider disabled:opacity-50"
+                      >
+                        Atualizar status
+                      </button>
+                      <button
+                        onClick={handleLoadWhatsappQr}
+                        disabled={isLoadingWhatsapp}
+                        className="px-3 py-2 rounded-lg bg-brand-blue text-white text-xs uppercase tracking-wider disabled:opacity-50"
+                      >
+                        {isLoadingWhatsapp ? 'Carregando...' : 'Gerar QR'}
+                      </button>
+                    </div>
+                  </div>
+                  <div className="grid sm:grid-cols-2 gap-3">
+                    <input
+                      value={whatsappInstance}
+                      onChange={(e) => setWhatsappInstance(e.target.value)}
+                      placeholder="Nome da instancia (ex: ia-agendamento)"
+                      className="w-full rounded-md bg-[#0f1731] border border-white/15 text-white/90 px-3 py-2 text-sm"
+                    />
+                    <div className="rounded-md bg-[#0f1731] border border-white/15 text-white/80 px-3 py-2 text-sm flex items-center">
+                      Status:
+                      <span
+                        className={`ml-2 px-2 py-0.5 rounded-full border text-[11px] uppercase tracking-wider ${whatsappStatusBadgeClass}`}
+                      >
+                        {whatsappStatusLabel}
+                      </span>
+                    </div>
+                  </div>
+                  {whatsappError && <p className="text-xs text-red-300">{whatsappError}</p>}
+                  <div className="rounded-xl bg-white/5 border border-white/10 p-4 flex items-center justify-center min-h-[220px]">
+                    {whatsappQr?.qr?.qrDataUrl ? (
+                      <img src={whatsappQr.qr.qrDataUrl} alt="QR Code WhatsApp" className="w-56 h-auto" />
+                    ) : (
+                      <p className="text-xs text-white/60 text-center">
+                        Clique em Gerar QR para conectar o WhatsApp da unidade.
+                      </p>
+                    )}
+                  </div>
+                  {whatsappQr?.qr?.pairingCode && (
+                    <p className="text-xs text-white/70">
+                      Pairing code: <span className="text-white/90">{whatsappQr.qr.pairingCode}</span>
+                    </p>
+                  )}
+                  <p className="text-[11px] text-white/50">
+                    O QR expira em poucos minutos. Se falhar, gere um novo e tente novamente.
+                  </p>
                 </div>
                 {faq.length > 0 && (
                   <div className="mt-4 space-y-2">
