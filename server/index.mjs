@@ -326,6 +326,7 @@ Fluxo de Atendimento:
 Reconhecimento: Se for uma cliente nova, dê as boas-vindas ao universo de beleza da Fabiana. Se for recorrente, utilize o histórico para ser mais pessoal.
 Consultoria: Identifique o serviço desejado (ex: mechas, corte, tratamento).
 Agendamento (Trinks): Quando a cliente solicitar um horário, informe que você verificará a disponibilidade em tempo real na agenda oficial.
+Regra de agenda: Antes de sugerir ou confirmar horarios, consulte os agendamentos do dia (listAppointmentsForDate) e evite horarios ocupados.
 Reagendamento: Para alterar horário, solicite código de confirmação (TRK-123) ou ID do agendamento.
 Fechamento: Após a confirmação do horário, solicite o nome completo e telefone para finalizar a reserva no sistema Trinks.
 
@@ -351,6 +352,20 @@ const chatTools = [
         },
       },
       required: ["service", "date"],
+    },
+  },
+  {
+    name: "listAppointmentsForDate",
+    parameters: {
+      type: Type.OBJECT,
+      description: "Lista os horarios ja ocupados (agendamentos) em uma data.",
+      properties: {
+        date: {
+          type: Type.STRING,
+          description: "A data desejada (formato YYYY-MM-DD).",
+        },
+      },
+      required: ["date"],
     },
   },
   {
@@ -600,7 +615,29 @@ async function createEvolutionInstance(instanceName) {
     return { created: true, payload, attempt };
   } catch (error) {
     const message = String(error.message || "").toLowerCase();
-    const alreadyExists = message.includes("exist") || message.includes("already") || message.includes("ja existe");
+    const details = error?.details;
+
+    const extractErrorTexts = (value) => {
+      if (value == null) return [];
+      if (typeof value === "string") return [value.toLowerCase()];
+      if (Array.isArray(value)) {
+        return value.flatMap((item) => extractErrorTexts(item));
+      }
+      if (typeof value === "object") {
+        return Object.values(value).flatMap((item) => extractErrorTexts(item));
+      }
+      return [String(value).toLowerCase()];
+    };
+
+    const errorTexts = [message, ...extractErrorTexts(details)];
+    const alreadyExists = errorTexts.some(
+      (text) =>
+        text.includes("already") ||
+        text.includes("already in use") ||
+        text.includes("ja existe") ||
+        text.includes("exists"),
+    );
+
     if (alreadyExists) {
       return { created: false, alreadyExists: true, message: error.message, details: error.details || null };
     }
@@ -862,6 +899,114 @@ function collectProfessionalsFromPayload(payload) {
   return result;
 }
 
+function formatTimeFromDateTime(value) {
+  const text = toNonEmptyString(value);
+  if (!text) {
+    return "";
+  }
+
+  const split = text.includes("T") ? text.split("T")[1] : text.split(" ")[1];
+  if (!split) {
+    return "";
+  }
+
+  return split.slice(0, 5);
+}
+
+function extractServiceNames(item) {
+  const direct = firstNonEmpty([
+    item?.servico?.nome,
+    item?.servicoNome,
+    item?.servico,
+  ]);
+
+  if (direct) {
+    return [direct];
+  }
+
+  if (Array.isArray(item?.servicos)) {
+    return item.servicos
+      .map((service) => firstNonEmpty([service?.nome, service?.servico?.nome, service?.name]))
+      .filter(Boolean);
+  }
+
+  return [];
+}
+
+function normalizeAppointmentItem(item) {
+  if (!item || typeof item !== "object") {
+    return null;
+  }
+
+  const start = firstNonEmpty([item?.dataHoraInicio, item?.dataHora, item?.inicio, item?.start]);
+  const time = formatTimeFromDateTime(start);
+  const professional = firstNonEmpty([
+    item?.profissional?.nome,
+    item?.profissionalNome,
+    item?.professionalName,
+  ]);
+  const client = firstNonEmpty([item?.cliente?.nome, item?.clienteNome, item?.clientName]);
+  const services = extractServiceNames(item);
+
+  return {
+    id: item?.id ?? item?.agendamentoId ?? null,
+    dateTime: start || null,
+    time: time || null,
+    professional: professional || null,
+    client: client || null,
+    services,
+    raw: item,
+  };
+}
+
+async function getAppointmentsForDate(establishmentId, date) {
+  const attempts = [
+    {
+      query: { data: date, page: 1, pageSize: 200 },
+      label: "data",
+    },
+    {
+      query: { dataInicial: `${date}T00:00:00`, dataFinal: `${date}T23:59:59`, page: 1, pageSize: 200 },
+      label: "dataInicial-dataFinal",
+    },
+    {
+      query: { dataInicial: date, dataFinal: date, page: 1, pageSize: 200 },
+      label: "dataInicial-dataFinal-short",
+    },
+  ];
+
+  const errors = [];
+
+  for (const attempt of attempts) {
+    try {
+      const payload = await trinksRequest("/agendamentos", {
+        method: "GET",
+        estabelecimentoId: establishmentId,
+        query: attempt.query,
+      });
+
+      const items = extractItems(payload);
+      return {
+        source: attempt.label,
+        items,
+        raw: payload,
+      };
+    } catch (error) {
+      errors.push({
+        label: attempt.label,
+        message: error.message || "Erro desconhecido",
+        details: error.details || null,
+        status: error.status || null,
+      });
+    }
+  }
+
+  const aggregate = new Error("Falha ao buscar agendamentos do dia na Trinks.");
+  aggregate.status = errors[0]?.status || 500;
+  aggregate.details = errors;
+  throw aggregate;
+}
+
 async function getProfessionals({ establishmentId, date, serviceId }) {
   const payload = await trinksRequest(`/agendamentos/profissionais/${date}`, {
     method: "GET",
@@ -958,6 +1103,7 @@ async function getAvailability(establishmentId, service, date) {
   if (!foundService) {
     return {
       availableTimes: [],
+      occupiedTimes: [],
       message: `Servico nao encontrado para: ${service}`,
     };
   }
@@ -981,8 +1127,23 @@ async function getAvailability(establishmentId, service, date) {
     availableTimes = ["09:00", "10:00", "11:00", "14:00", "15:00", "16:00"];
   }
 
+  let occupiedTimes = [];
+  try {
+    const response = await getAppointmentsForDate(establishmentId, date);
+    const normalized = response.items.map(normalizeAppointmentItem).filter(Boolean);
+    const times = normalized.map((item) => item.time).filter(Boolean);
+    occupiedTimes = [...new Set(times)].sort();
+    if (occupiedTimes.length) {
+      const occupiedSet = new Set(occupiedTimes);
+      availableTimes = availableTimes.filter((time) => !occupiedSet.has(time));
+    }
+  } catch {
+    // If appointments query fails, keep availability as-is.
+  }
+
   return {
     availableTimes,
+    occupiedTimes,
     serviceId: serviceIdFrom(foundService),
     message: `Horarios consultados para ${service} em ${date}`,
   };
@@ -1296,6 +1457,16 @@ async function sendChatMessage({ establishmentId, message, history }) {
         continue;
       }
 
+      if (call.name === "listAppointmentsForDate") {
+        const { items, source } = await getAppointmentsForDate(
+          establishmentId,
+          String(call.args.date),
+        );
+        const normalized = items.map(normalizeAppointmentItem).filter(Boolean);
+        results.push({ name: call.name, result: { source, appointments: normalized } });
+        continue;
+      }
+
       if (call.name === "bookAppointment") {
         const booking = await createAppointment({
           establishmentId,
@@ -1384,6 +1555,7 @@ app.get("/", (req, res) => {
       chat: "POST /api/chat",
       trinksAvailability: "POST /api/trinks/availability",
       trinksAppointments: "POST /api/trinks/appointments",
+      trinksAppointmentsDay: "POST /api/trinks/appointments/day",
       trinksProfessionals: "POST /api/trinks/professionals",
       trinksReschedule: "POST /api/trinks/appointments/reschedule",
       evolutionSendText: "POST /api/evolution/send-text",
@@ -1562,6 +1734,33 @@ app.post("/api/trinks/appointments", async (req, res) => {
     return res.status(error.status || 500).json({
       status: "error",
       message: error.message || "Erro ao criar agendamento.",
+      details: error.details || null,
+    });
+  }
+});
+
+app.post("/api/trinks/appointments/day", async (req, res) => {
+  try {
+    const { establishmentId, date } = req.body || {};
+
+    if (!establishmentId || !date) {
+      return res.status(400).json({
+        message: "Campos obrigatorios: establishmentId, date",
+      });
+    }
+
+    const response = await getAppointmentsForDate(Number(establishmentId), String(date));
+    const normalized = response.items.map(normalizeAppointmentItem).filter(Boolean);
+
+    return res.json({
+      source: response.source,
+      appointments: normalized,
+      raw: response.raw,
+    });
+  } catch (error) {
+    return res.status(error.status || 500).json({
+      status: "error",
+      message: error.message || "Erro ao buscar agendamentos do dia.",
       details: error.details || null,
     });
   }

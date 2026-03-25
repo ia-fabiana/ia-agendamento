@@ -40,6 +40,10 @@ function safeParseKnowledge(raw: string) {
   return parsed;
 }
 
+function toText(value: unknown) {
+  return typeof value === 'string' ? value : '';
+}
+
 export default function App() {
   const [messages, setMessages] = useState<Message[]>([
     {
@@ -155,8 +159,22 @@ export default function App() {
     }
   })();
 
+  const updateKnowledge = (updater: (draft: Record<string, any>) => void) => {
+    try {
+      const draft = safeParseKnowledge(knowledgeJson) as Record<string, any>;
+      updater(draft);
+      setKnowledgeJson(JSON.stringify(draft, null, 2));
+      setKnowledgeStatus('Edicao local atualizada. Clique em Salvar para persistir.');
+    } catch {
+      setKnowledgeStatus('JSON invalido na aba Base. Corrija o JSON para continuar editando pelos formulários.');
+    }
+  };
+
   const services = Array.isArray(knowledgeObject?.services) ? knowledgeObject.services : [];
   const faq = Array.isArray(knowledgeObject?.faq) ? knowledgeObject.faq : [];
+  const paymentMethods = Array.isArray(knowledgeObject?.business?.paymentMethods)
+    ? knowledgeObject.business.paymentMethods
+    : [];
 
   return (
     <div className="min-h-screen flex flex-col luxury-gradient">
@@ -185,14 +203,86 @@ export default function App() {
           <div className="glass rounded-2xl p-5 sm:p-6 space-y-4">
             {activeSection === 'services' && (
               <>
-                <h2 className="heading-bold text-lg text-white">Servicos</h2>
-                {!services.length && <p className="text-white/70 text-sm">Nenhum servico cadastrado na base de conhecimento.</p>}
+                <div className="flex items-center justify-between gap-3 flex-wrap">
+                  <h2 className="heading-bold text-lg text-white">Servicos</h2>
+                  <div className="flex items-center gap-2">
+                    <button
+                      onClick={() =>
+                        updateKnowledge((draft) => {
+                          const current = Array.isArray(draft.services) ? draft.services : [];
+                          draft.services = [...current, { name: '', durationMinutes: 60, price: '' }];
+                        })
+                      }
+                      className="px-3 py-2 rounded-lg bg-white/10 text-white text-xs uppercase tracking-wider"
+                    >
+                      + Servico
+                    </button>
+                    <button
+                      onClick={handleSaveKnowledge}
+                      disabled={isSavingKnowledge || isLoadingKnowledge}
+                      className="px-4 py-2 rounded-lg bg-brand-blue text-white text-xs uppercase tracking-wider disabled:opacity-50"
+                    >
+                      {isSavingKnowledge ? 'Salvando...' : 'Salvar'}
+                    </button>
+                  </div>
+                </div>
+                {!services.length && <p className="text-white/70 text-sm">Nenhum servico cadastrado. Clique em + Servico.</p>}
                 <div className="grid sm:grid-cols-2 gap-3">
                   {services.map((item: any, idx: number) => (
                     <div key={`${item?.name || 'servico'}-${idx}`} className="rounded-xl bg-white/5 border border-white/10 p-4">
-                      <p className="font-display font-bold text-white/90">{item?.name || 'Servico'}</p>
-                      <p className="text-xs text-white/60 mt-1">Duracao: {item?.durationMinutes || '-'} min</p>
-                      <p className="text-xs text-brand-blue mt-1">Preco: {item?.price || 'sob consulta'}</p>
+                      <div className="space-y-2">
+                        <input
+                          value={toText(item?.name)}
+                          onChange={(e) =>
+                            updateKnowledge((draft) => {
+                              const current = Array.isArray(draft.services) ? draft.services : [];
+                              current[idx] = { ...(current[idx] || {}), name: e.target.value };
+                              draft.services = current;
+                            })
+                          }
+                          placeholder="Nome do servico"
+                          className="w-full rounded-md bg-[#0f1731] border border-white/15 text-white/90 px-3 py-2 text-sm"
+                        />
+                        <input
+                          value={String(item?.durationMinutes ?? '')}
+                          onChange={(e) =>
+                            updateKnowledge((draft) => {
+                              const current = Array.isArray(draft.services) ? draft.services : [];
+                              current[idx] = {
+                                ...(current[idx] || {}),
+                                durationMinutes: Number(e.target.value || 0),
+                              };
+                              draft.services = current;
+                            })
+                          }
+                          placeholder="Duracao em minutos"
+                          type="number"
+                          className="w-full rounded-md bg-[#0f1731] border border-white/15 text-white/90 px-3 py-2 text-sm"
+                        />
+                        <input
+                          value={toText(item?.price)}
+                          onChange={(e) =>
+                            updateKnowledge((draft) => {
+                              const current = Array.isArray(draft.services) ? draft.services : [];
+                              current[idx] = { ...(current[idx] || {}), price: e.target.value };
+                              draft.services = current;
+                            })
+                          }
+                          placeholder="Preco (ex: a partir de 180)"
+                          className="w-full rounded-md bg-[#0f1731] border border-white/15 text-white/90 px-3 py-2 text-sm"
+                        />
+                        <button
+                          onClick={() =>
+                            updateKnowledge((draft) => {
+                              const current = Array.isArray(draft.services) ? draft.services : [];
+                              draft.services = current.filter((_: any, currentIdx: number) => currentIdx !== idx);
+                            })
+                          }
+                          className="text-xs text-red-300 hover:text-red-200"
+                        >
+                          Remover servico
+                        </button>
+                      </div>
                     </div>
                   ))}
                 </div>
@@ -201,43 +291,8 @@ export default function App() {
 
             {activeSection === 'salon' && (
               <>
-                <h2 className="heading-bold text-lg text-white">O Salao</h2>
-                <div className="space-y-2 text-sm text-white/80">
-                  <p><strong className="text-white/95">Nome:</strong> {knowledgeObject?.identity?.brandName || 'Nao informado'}</p>
-                  <p><strong className="text-white/95">Endereco:</strong> {knowledgeObject?.business?.address || 'Nao informado'}</p>
-                  <p><strong className="text-white/95">Horarios:</strong> {knowledgeObject?.business?.openingHours || 'Nao informado'}</p>
-                  <p><strong className="text-white/95">Politica de atraso:</strong> {knowledgeObject?.policies?.latePolicy || 'Nao informado'}</p>
-                  <p><strong className="text-white/95">Cancelamento:</strong> {knowledgeObject?.policies?.cancellationPolicy || 'Nao informado'}</p>
-                </div>
-              </>
-            )}
-
-            {activeSection === 'contact' && (
-              <>
-                <h2 className="heading-bold text-lg text-white">Contato</h2>
-                <div className="space-y-2 text-sm text-white/80">
-                  <p><strong className="text-white/95">Telefone:</strong> {knowledgeObject?.business?.phone || 'Nao informado'}</p>
-                  <p><strong className="text-white/95">Pagamento:</strong> {Array.isArray(knowledgeObject?.business?.paymentMethods) && knowledgeObject.business.paymentMethods.length ? knowledgeObject.business.paymentMethods.join(', ') : 'Nao informado'}</p>
-                </div>
-                {faq.length > 0 && (
-                  <div className="mt-4 space-y-2">
-                    {faq.map((item: any, idx: number) => (
-                      <div key={`faq-${idx}`} className="rounded-lg bg-white/5 border border-white/10 p-3">
-                        <p className="text-xs uppercase tracking-wider text-brand-blue">Pergunta</p>
-                        <p className="text-sm text-white/90">{item?.question}</p>
-                        <p className="text-xs uppercase tracking-wider text-brand-green mt-2">Resposta</p>
-                        <p className="text-sm text-white/80">{item?.answer}</p>
-                      </div>
-                    ))}
-                  </div>
-                )}
-              </>
-            )}
-
-            {activeSection === 'knowledge' && (
-              <>
                 <div className="flex items-center justify-between gap-3 flex-wrap">
-                  <h2 className="heading-bold text-lg text-white">Editar Base de Conhecimento</h2>
+                  <h2 className="heading-bold text-lg text-white">O Salao</h2>
                   <button
                     onClick={handleSaveKnowledge}
                     disabled={isSavingKnowledge || isLoadingKnowledge}
@@ -246,13 +301,442 @@ export default function App() {
                     {isSavingKnowledge ? 'Salvando...' : 'Salvar'}
                   </button>
                 </div>
-                <p className="text-xs text-white/60">Edite o JSON abaixo e clique em Salvar. Isso atualiza a base usada pela IA em tempo real.</p>
-                <textarea
-                  value={knowledgeJson}
-                  onChange={(e) => setKnowledgeJson(e.target.value)}
-                  className="w-full min-h-72 rounded-xl bg-[#0f1731] border border-white/15 text-white/90 text-xs p-3 font-mono"
-                />
+                <div className="grid sm:grid-cols-2 gap-3">
+                  <input
+                    value={toText(knowledgeObject?.identity?.brandName)}
+                    onChange={(e) =>
+                      updateKnowledge((draft) => {
+                        draft.identity = { ...(draft.identity || {}), brandName: e.target.value };
+                      })
+                    }
+                    placeholder="Nome comercial"
+                    className="rounded-md bg-[#0f1731] border border-white/15 text-white/90 px-3 py-2 text-sm"
+                  />
+                  <input
+                    value={toText(knowledgeObject?.identity?.toneGuide)}
+                    onChange={(e) =>
+                      updateKnowledge((draft) => {
+                        draft.identity = { ...(draft.identity || {}), toneGuide: e.target.value };
+                      })
+                    }
+                    placeholder="Guia de tom"
+                    className="rounded-md bg-[#0f1731] border border-white/15 text-white/90 px-3 py-2 text-sm"
+                  />
+                  <input
+                    value={toText(knowledgeObject?.business?.address)}
+                    onChange={(e) =>
+                      updateKnowledge((draft) => {
+                        draft.business = { ...(draft.business || {}), address: e.target.value };
+                      })
+                    }
+                    placeholder="Endereco"
+                    className="sm:col-span-2 rounded-md bg-[#0f1731] border border-white/15 text-white/90 px-3 py-2 text-sm"
+                  />
+                  <input
+                    value={toText(knowledgeObject?.business?.openingHours)}
+                    onChange={(e) =>
+                      updateKnowledge((draft) => {
+                        draft.business = { ...(draft.business || {}), openingHours: e.target.value };
+                      })
+                    }
+                    placeholder="Horario de funcionamento"
+                    className="rounded-md bg-[#0f1731] border border-white/15 text-white/90 px-3 py-2 text-sm"
+                  />
+                  <input
+                    value={toText(knowledgeObject?.business?.phone)}
+                    onChange={(e) =>
+                      updateKnowledge((draft) => {
+                        draft.business = { ...(draft.business || {}), phone: e.target.value };
+                      })
+                    }
+                    placeholder="Telefone"
+                    className="rounded-md bg-[#0f1731] border border-white/15 text-white/90 px-3 py-2 text-sm"
+                  />
+                  <textarea
+                    value={toText(knowledgeObject?.policies?.latePolicy)}
+                    onChange={(e) =>
+                      updateKnowledge((draft) => {
+                        draft.policies = { ...(draft.policies || {}), latePolicy: e.target.value };
+                      })
+                    }
+                    placeholder="Politica de atraso"
+                    className="rounded-md bg-[#0f1731] border border-white/15 text-white/90 px-3 py-2 text-sm min-h-20"
+                  />
+                  <textarea
+                    value={toText(knowledgeObject?.policies?.cancellationPolicy)}
+                    onChange={(e) =>
+                      updateKnowledge((draft) => {
+                        draft.policies = { ...(draft.policies || {}), cancellationPolicy: e.target.value };
+                      })
+                    }
+                    placeholder="Politica de cancelamento"
+                    className="rounded-md bg-[#0f1731] border border-white/15 text-white/90 px-3 py-2 text-sm min-h-20"
+                  />
+                  <textarea
+                    value={toText(knowledgeObject?.policies?.noShowPolicy)}
+                    onChange={(e) =>
+                      updateKnowledge((draft) => {
+                        draft.policies = { ...(draft.policies || {}), noShowPolicy: e.target.value };
+                      })
+                    }
+                    placeholder="Politica de no-show"
+                    className="sm:col-span-2 rounded-md bg-[#0f1731] border border-white/15 text-white/90 px-3 py-2 text-sm min-h-20"
+                  />
+                </div>
+              </>
+            )}
+
+            {activeSection === 'contact' && (
+              <>
+                <div className="flex items-center justify-between gap-3 flex-wrap">
+                  <h2 className="heading-bold text-lg text-white">Contato</h2>
+                  <div className="flex items-center gap-2">
+                    <button
+                      onClick={() =>
+                        updateKnowledge((draft) => {
+                          const current = Array.isArray(draft.faq) ? draft.faq : [];
+                          draft.faq = [...current, { question: '', answer: '' }];
+                        })
+                      }
+                      className="px-3 py-2 rounded-lg bg-white/10 text-white text-xs uppercase tracking-wider"
+                    >
+                      + FAQ
+                    </button>
+                    <button
+                      onClick={handleSaveKnowledge}
+                      disabled={isSavingKnowledge || isLoadingKnowledge}
+                      className="px-4 py-2 rounded-lg bg-brand-blue text-white text-xs uppercase tracking-wider disabled:opacity-50"
+                    >
+                      {isSavingKnowledge ? 'Salvando...' : 'Salvar'}
+                    </button>
+                  </div>
+                </div>
+                <div className="space-y-3 text-sm text-white/80">
+                  <input
+                    value={toText(knowledgeObject?.business?.phone)}
+                    onChange={(e) =>
+                      updateKnowledge((draft) => {
+                        draft.business = { ...(draft.business || {}), phone: e.target.value };
+                      })
+                    }
+                    placeholder="Telefone de contato"
+                    className="w-full rounded-md bg-[#0f1731] border border-white/15 text-white/90 px-3 py-2 text-sm"
+                  />
+                  <input
+                    value={paymentMethods.join(', ')}
+                    onChange={(e) =>
+                      updateKnowledge((draft) => {
+                        const methods = e.target.value
+                          .split(',')
+                          .map((item) => item.trim())
+                          .filter(Boolean);
+                        draft.business = { ...(draft.business || {}), paymentMethods: methods };
+                      })
+                    }
+                    placeholder="Formas de pagamento separadas por virgula"
+                    className="w-full rounded-md bg-[#0f1731] border border-white/15 text-white/90 px-3 py-2 text-sm"
+                  />
+                </div>
+                {faq.length > 0 && (
+                  <div className="mt-4 space-y-2">
+                    {faq.map((item: any, idx: number) => (
+                      <div key={`faq-${idx}`} className="rounded-lg bg-white/5 border border-white/10 p-3">
+                        <p className="text-xs uppercase tracking-wider text-brand-blue">Pergunta</p>
+                        <input
+                          value={toText(item?.question)}
+                          onChange={(e) =>
+                            updateKnowledge((draft) => {
+                              const current = Array.isArray(draft.faq) ? draft.faq : [];
+                              current[idx] = { ...(current[idx] || {}), question: e.target.value };
+                              draft.faq = current;
+                            })
+                          }
+                          placeholder="Pergunta frequente"
+                          className="w-full rounded-md bg-[#0f1731] border border-white/15 text-white/90 px-3 py-2 text-sm mt-1"
+                        />
+                        <p className="text-xs uppercase tracking-wider text-brand-green mt-2">Resposta</p>
+                        <textarea
+                          value={toText(item?.answer)}
+                          onChange={(e) =>
+                            updateKnowledge((draft) => {
+                              const current = Array.isArray(draft.faq) ? draft.faq : [];
+                              current[idx] = { ...(current[idx] || {}), answer: e.target.value };
+                              draft.faq = current;
+                            })
+                          }
+                          placeholder="Resposta da pergunta"
+                          className="w-full rounded-md bg-[#0f1731] border border-white/15 text-white/90 px-3 py-2 text-sm mt-1 min-h-20"
+                        />
+                        <button
+                          onClick={() =>
+                            updateKnowledge((draft) => {
+                              const current = Array.isArray(draft.faq) ? draft.faq : [];
+                              draft.faq = current.filter((_: any, currentIdx: number) => currentIdx !== idx);
+                            })
+                          }
+                          className="text-xs text-red-300 hover:text-red-200 mt-2"
+                        >
+                          Remover FAQ
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                )}
+                {!faq.length && <p className="text-white/70 text-sm">Nenhum FAQ cadastrado. Clique em + FAQ.</p>}
+              </>
+            )}
+
+            {activeSection === 'knowledge' && (
+              <>
+                <div className="flex items-center justify-between gap-3 flex-wrap">
+                  <h2 className="heading-bold text-lg text-white">Base de Conhecimento</h2>
+                  <button
+                    onClick={handleSaveKnowledge}
+                    disabled={isSavingKnowledge || isLoadingKnowledge}
+                    className="px-4 py-2 rounded-lg bg-brand-blue text-white text-xs uppercase tracking-wider disabled:opacity-50"
+                  >
+                    {isSavingKnowledge ? 'Salvando...' : 'Salvar'}
+                  </button>
+                </div>
+                <p className="text-xs text-white/60">
+                  Preencha os campos abaixo e clique em Salvar. A IA usa esta base em tempo real.
+                </p>
                 {knowledgeStatus && <p className="text-xs text-brand-green">{knowledgeStatus}</p>}
+
+                <div className="grid sm:grid-cols-2 gap-3">
+                  <input
+                    value={toText(knowledgeObject?.identity?.brandName)}
+                    onChange={(e) =>
+                      updateKnowledge((draft) => {
+                        draft.identity = { ...(draft.identity || {}), brandName: e.target.value };
+                      })
+                    }
+                    placeholder="Nome comercial"
+                    className="rounded-md bg-[#0f1731] border border-white/15 text-white/90 px-3 py-2 text-sm"
+                  />
+                  <input
+                    value={toText(knowledgeObject?.identity?.toneGuide)}
+                    onChange={(e) =>
+                      updateKnowledge((draft) => {
+                        draft.identity = { ...(draft.identity || {}), toneGuide: e.target.value };
+                      })
+                    }
+                    placeholder="Guia de tom"
+                    className="rounded-md bg-[#0f1731] border border-white/15 text-white/90 px-3 py-2 text-sm"
+                  />
+                  <input
+                    value={toText(knowledgeObject?.business?.address)}
+                    onChange={(e) =>
+                      updateKnowledge((draft) => {
+                        draft.business = { ...(draft.business || {}), address: e.target.value };
+                      })
+                    }
+                    placeholder="Endereco"
+                    className="sm:col-span-2 rounded-md bg-[#0f1731] border border-white/15 text-white/90 px-3 py-2 text-sm"
+                  />
+                  <input
+                    value={toText(knowledgeObject?.business?.openingHours)}
+                    onChange={(e) =>
+                      updateKnowledge((draft) => {
+                        draft.business = { ...(draft.business || {}), openingHours: e.target.value };
+                      })
+                    }
+                    placeholder="Horario de funcionamento"
+                    className="rounded-md bg-[#0f1731] border border-white/15 text-white/90 px-3 py-2 text-sm"
+                  />
+                  <input
+                    value={toText(knowledgeObject?.business?.phone)}
+                    onChange={(e) =>
+                      updateKnowledge((draft) => {
+                        draft.business = { ...(draft.business || {}), phone: e.target.value };
+                      })
+                    }
+                    placeholder="Telefone"
+                    className="rounded-md bg-[#0f1731] border border-white/15 text-white/90 px-3 py-2 text-sm"
+                  />
+                  <input
+                    value={paymentMethods.join(', ')}
+                    onChange={(e) =>
+                      updateKnowledge((draft) => {
+                        const methods = e.target.value
+                          .split(',')
+                          .map((item) => item.trim())
+                          .filter(Boolean);
+                        draft.business = { ...(draft.business || {}), paymentMethods: methods };
+                      })
+                    }
+                    placeholder="Formas de pagamento separadas por virgula"
+                    className="sm:col-span-2 rounded-md bg-[#0f1731] border border-white/15 text-white/90 px-3 py-2 text-sm"
+                  />
+                  <textarea
+                    value={toText(knowledgeObject?.policies?.latePolicy)}
+                    onChange={(e) =>
+                      updateKnowledge((draft) => {
+                        draft.policies = { ...(draft.policies || {}), latePolicy: e.target.value };
+                      })
+                    }
+                    placeholder="Politica de atraso"
+                    className="rounded-md bg-[#0f1731] border border-white/15 text-white/90 px-3 py-2 text-sm min-h-20"
+                  />
+                  <textarea
+                    value={toText(knowledgeObject?.policies?.cancellationPolicy)}
+                    onChange={(e) =>
+                      updateKnowledge((draft) => {
+                        draft.policies = { ...(draft.policies || {}), cancellationPolicy: e.target.value };
+                      })
+                    }
+                    placeholder="Politica de cancelamento"
+                    className="rounded-md bg-[#0f1731] border border-white/15 text-white/90 px-3 py-2 text-sm min-h-20"
+                  />
+                  <textarea
+                    value={toText(knowledgeObject?.policies?.noShowPolicy)}
+                    onChange={(e) =>
+                      updateKnowledge((draft) => {
+                        draft.policies = { ...(draft.policies || {}), noShowPolicy: e.target.value };
+                      })
+                    }
+                    placeholder="Politica de no-show"
+                    className="sm:col-span-2 rounded-md bg-[#0f1731] border border-white/15 text-white/90 px-3 py-2 text-sm min-h-20"
+                  />
+                </div>
+
+                <div className="flex items-center justify-between gap-3 flex-wrap pt-4">
+                  <h3 className="heading-bold text-base text-white">Servicos</h3>
+                  <button
+                    onClick={() =>
+                      updateKnowledge((draft) => {
+                        const current = Array.isArray(draft.services) ? draft.services : [];
+                        draft.services = [...current, { name: '', durationMinutes: 60, price: '' }];
+                      })
+                    }
+                    className="px-3 py-2 rounded-lg bg-white/10 text-white text-xs uppercase tracking-wider"
+                  >
+                    + Servico
+                  </button>
+                </div>
+                {!services.length && (
+                  <p className="text-white/70 text-sm">Nenhum servico cadastrado. Clique em + Servico.</p>
+                )}
+                <div className="grid sm:grid-cols-2 gap-3">
+                  {services.map((item: any, idx: number) => (
+                    <div key={`${item?.name || 'servico'}-${idx}`} className="rounded-xl bg-white/5 border border-white/10 p-4">
+                      <div className="space-y-2">
+                        <input
+                          value={toText(item?.name)}
+                          onChange={(e) =>
+                            updateKnowledge((draft) => {
+                              const current = Array.isArray(draft.services) ? draft.services : [];
+                              current[idx] = { ...(current[idx] || {}), name: e.target.value };
+                              draft.services = current;
+                            })
+                          }
+                          placeholder="Nome do servico"
+                          className="w-full rounded-md bg-[#0f1731] border border-white/15 text-white/90 px-3 py-2 text-sm"
+                        />
+                        <input
+                          value={String(item?.durationMinutes ?? '')}
+                          onChange={(e) =>
+                            updateKnowledge((draft) => {
+                              const current = Array.isArray(draft.services) ? draft.services : [];
+                              current[idx] = {
+                                ...(current[idx] || {}),
+                                durationMinutes: Number(e.target.value || 0),
+                              };
+                              draft.services = current;
+                            })
+                          }
+                          placeholder="Duracao em minutos"
+                          type="number"
+                          className="w-full rounded-md bg-[#0f1731] border border-white/15 text-white/90 px-3 py-2 text-sm"
+                        />
+                        <input
+                          value={toText(item?.price)}
+                          onChange={(e) =>
+                            updateKnowledge((draft) => {
+                              const current = Array.isArray(draft.services) ? draft.services : [];
+                              current[idx] = { ...(current[idx] || {}), price: e.target.value };
+                              draft.services = current;
+                            })
+                          }
+                          placeholder="Preco (ex: a partir de 180)"
+                          className="w-full rounded-md bg-[#0f1731] border border-white/15 text-white/90 px-3 py-2 text-sm"
+                        />
+                        <button
+                          onClick={() =>
+                            updateKnowledge((draft) => {
+                              const current = Array.isArray(draft.services) ? draft.services : [];
+                              draft.services = current.filter((_: any, currentIdx: number) => currentIdx !== idx);
+                            })
+                          }
+                          className="text-xs text-red-300 hover:text-red-200"
+                        >
+                          Remover servico
+                        </button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+
+                <div className="flex items-center justify-between gap-3 flex-wrap pt-4">
+                  <h3 className="heading-bold text-base text-white">FAQ</h3>
+                  <button
+                    onClick={() =>
+                      updateKnowledge((draft) => {
+                        const current = Array.isArray(draft.faq) ? draft.faq : [];
+                        draft.faq = [...current, { question: '', answer: '' }];
+                      })
+                    }
+                    className="px-3 py-2 rounded-lg bg-white/10 text-white text-xs uppercase tracking-wider"
+                  >
+                    + FAQ
+                  </button>
+                </div>
+                {faq.length > 0 && (
+                  <div className="space-y-2">
+                    {faq.map((item: any, idx: number) => (
+                      <div key={`faq-base-${idx}`} className="rounded-lg bg-white/5 border border-white/10 p-3">
+                        <p className="text-xs uppercase tracking-wider text-brand-blue">Pergunta</p>
+                        <input
+                          value={toText(item?.question)}
+                          onChange={(e) =>
+                            updateKnowledge((draft) => {
+                              const current = Array.isArray(draft.faq) ? draft.faq : [];
+                              current[idx] = { ...(current[idx] || {}), question: e.target.value };
+                              draft.faq = current;
+                            })
+                          }
+                          placeholder="Pergunta frequente"
+                          className="w-full rounded-md bg-[#0f1731] border border-white/15 text-white/90 px-3 py-2 text-sm mt-1"
+                        />
+                        <p className="text-xs uppercase tracking-wider text-brand-green mt-2">Resposta</p>
+                        <textarea
+                          value={toText(item?.answer)}
+                          onChange={(e) =>
+                            updateKnowledge((draft) => {
+                              const current = Array.isArray(draft.faq) ? draft.faq : [];
+                              current[idx] = { ...(current[idx] || {}), answer: e.target.value };
+                              draft.faq = current;
+                            })
+                          }
+                          placeholder="Resposta da pergunta"
+                          className="w-full rounded-md bg-[#0f1731] border border-white/15 text-white/90 px-3 py-2 text-sm mt-1 min-h-20"
+                        />
+                        <button
+                          onClick={() =>
+                            updateKnowledge((draft) => {
+                              const current = Array.isArray(draft.faq) ? draft.faq : [];
+                              draft.faq = current.filter((_: any, currentIdx: number) => currentIdx !== idx);
+                            })
+                          }
+                          className="text-xs text-red-300 hover:text-red-200 mt-2"
+                        >
+                          Remover FAQ
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                )}
+                {!faq.length && <p className="text-white/70 text-sm">Nenhum FAQ cadastrado. Clique em + FAQ.</p>}
               </>
             )}
 
