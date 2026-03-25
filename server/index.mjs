@@ -92,24 +92,76 @@ function firstNonEmpty(values) {
   return "";
 }
 
+function normalizeWhatsappMessage(item) {
+  if (!item || typeof item !== "object") {
+    return null;
+  }
+
+  const role = toNonEmptyString(item.role);
+  const content = toNonEmptyString(item.content || item.text);
+  if (!role || !content) {
+    return null;
+  }
+
+  return {
+    role,
+    content,
+    at: toNonEmptyString(item.at || item.timestamp),
+    senderName: toNonEmptyString(item.senderName),
+  };
+}
+
 function getWhatsappHistory(phone) {
   if (!phone) {
     return [];
   }
 
-  return Array.isArray(whatsappConversations.get(phone))
+  const current = Array.isArray(whatsappConversations.get(phone))
     ? whatsappConversations.get(phone)
     : [];
+
+  return current.map(normalizeWhatsappMessage).filter(Boolean);
 }
 
-function pushWhatsappHistory(phone, role, content) {
+function pushWhatsappHistory(phone, role, content, senderName = "") {
   if (!phone || !role || !content) {
     return;
   }
 
   const current = getWhatsappHistory(phone);
-  const updated = [...current, { role, content: String(content) }].slice(-MAX_WHATSAPP_HISTORY_MESSAGES);
+  const entry = {
+    role,
+    content: String(content),
+    at: new Date().toISOString(),
+    senderName: senderName ? String(senderName) : "",
+  };
+  const updated = [...current, entry].slice(-MAX_WHATSAPP_HISTORY_MESSAGES);
   whatsappConversations.set(phone, updated);
+}
+
+function summarizeWhatsappConversations() {
+  const summaries = [];
+
+  for (const [phone, messages] of whatsappConversations.entries()) {
+    const normalized = Array.isArray(messages) ? messages.map(normalizeWhatsappMessage).filter(Boolean) : [];
+    if (!normalized.length) {
+      continue;
+    }
+
+    const last = normalized[normalized.length - 1];
+    const lastUser = [...normalized].reverse().find((item) => item.role === "user" && item.senderName);
+
+    summaries.push({
+      phone,
+      name: lastUser?.senderName || "",
+      lastMessage: last?.content || "",
+      lastRole: last?.role || "",
+      updatedAt: last?.at || "",
+      count: normalized.length,
+    });
+  }
+
+  return summaries.sort((a, b) => String(b.updatedAt).localeCompare(String(a.updatedAt)));
 }
 
 function normalizeTrinksPhone(phone) {
@@ -2079,6 +2131,21 @@ app.post("/api/trinks/diagnostics/appointment-variants", async (req, res) => {
   }
 });
 
+app.get("/api/whatsapp/inbox", (req, res) => {
+  const conversations = summarizeWhatsappConversations();
+  return res.json({ status: "ok", conversations });
+});
+
+app.get("/api/whatsapp/messages", (req, res) => {
+  const phone = normalizePhone(req.query.phone || "");
+  if (!phone) {
+    return res.status(400).json({ message: "Informe ?phone=numero" });
+  }
+
+  const messages = getWhatsappHistory(phone);
+  return res.json({ status: "ok", phone, messages });
+});
+
 app.post("/api/evolution/send-text", async (req, res) => {
   try {
     const instance = ensureEnv("EVOLUTION_INSTANCE");
@@ -2097,6 +2164,11 @@ app.post("/api/evolution/send-text", async (req, res) => {
       method: "POST",
       body: payload,
     });
+
+    const normalized = normalizePhone(to);
+    if (normalized) {
+      pushWhatsappHistory(normalized, "assistant", text);
+    }
 
     return res.json({ status: "sent", result });
   } catch (error) {
@@ -2139,7 +2211,7 @@ app.post("/webhook/whatsapp", async (req, res) => {
     }
 
     const previousHistory = getWhatsappHistory(incoming.senderNumber);
-    pushWhatsappHistory(incoming.senderNumber, "user", incoming.messageText);
+    pushWhatsappHistory(incoming.senderNumber, "user", incoming.messageText, incoming.senderName);
 
     const answer = await sendChatMessage({
       establishmentId,

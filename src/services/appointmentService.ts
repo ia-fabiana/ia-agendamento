@@ -23,6 +23,22 @@ type EvolutionQrResponse = {
   };
 };
 
+type WhatsappConversation = {
+  phone: string;
+  name?: string;
+  lastMessage?: string;
+  lastRole?: string;
+  updatedAt?: string;
+  count?: number;
+};
+
+type WhatsappMessage = {
+  role: "user" | "assistant";
+  content: string;
+  at?: string;
+  senderName?: string;
+};
+
 export class AppointmentService {
   private backendUrl: string;
   private establishmentId: string;
@@ -182,5 +198,59 @@ export class AppointmentService {
     }
 
     return (await response.json()) as EvolutionStatusResponse;
+  }
+
+  async getWhatsappConversations() {
+    const response = await fetch(this.getBackendEndpoint("/api/whatsapp/inbox"), {
+      method: "GET",
+      headers: { "Content-Type": "application/json" },
+    });
+
+    if (!response.ok) {
+      throw new Error(`Falha ao carregar inbox (${response.status}).`);
+    }
+
+    const data = (await response.json()) as { conversations?: WhatsappConversation[] };
+    return Array.isArray(data.conversations) ? data.conversations : [];
+  }
+
+  async getWhatsappMessages(phone: string) {
+    const response = await fetch(
+      this.getBackendEndpoint(`/api/whatsapp/messages?phone=${encodeURIComponent(phone)}`),
+      {
+        method: "GET",
+        headers: { "Content-Type": "application/json" },
+      },
+    );
+
+    if (!response.ok) {
+      throw new Error(`Falha ao carregar mensagens (${response.status}).`);
+    }
+
+    const data = (await response.json()) as { messages?: WhatsappMessage[] };
+    return Array.isArray(data.messages) ? data.messages : [];
+  }
+
+  async sendWhatsappMessage(to: string, text: string) {
+    const response = await fetch(this.getBackendEndpoint("/api/evolution/send-text"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ to, text }),
+    });
+
+    if (!response.ok) {
+      let message = `Falha ao enviar mensagem (${response.status}).`;
+      try {
+        const payload = (await response.json()) as { message?: string };
+        if (payload?.message) {
+          message = payload.message;
+        }
+      } catch {
+        // Keep fallback message.
+      }
+      throw new Error(message);
+    }
+
+    return response.json();
   }
 }

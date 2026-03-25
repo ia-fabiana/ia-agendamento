@@ -10,7 +10,7 @@ interface Message {
   timestamp: Date;
 }
 
-type TopSection = 'chat' | 'services' | 'salon' | 'contact' | 'knowledge';
+type TopSection = 'chat' | 'services' | 'salon' | 'contact' | 'knowledge' | 'inbox';
 type EvolutionStatus = {
   status?: string;
   instance?: string;
@@ -26,6 +26,22 @@ type EvolutionQr = {
     qrDataUrl?: string | null;
     pairingCode?: string | null;
   };
+};
+
+type WhatsappConversation = {
+  phone: string;
+  name?: string;
+  lastMessage?: string;
+  lastRole?: string;
+  updatedAt?: string;
+  count?: number;
+};
+
+type WhatsappMessage = {
+  role: 'user' | 'assistant';
+  content: string;
+  at?: string;
+  senderName?: string;
 };
 
 const initialKnowledge = {
@@ -81,6 +97,12 @@ export default function App() {
   const [whatsappQr, setWhatsappQr] = useState<EvolutionQr | null>(null);
   const [whatsappError, setWhatsappError] = useState('');
   const [isLoadingWhatsapp, setIsLoadingWhatsapp] = useState(false);
+  const [inboxConversations, setInboxConversations] = useState<WhatsappConversation[]>([]);
+  const [inboxMessages, setInboxMessages] = useState<WhatsappMessage[]>([]);
+  const [selectedWhatsapp, setSelectedWhatsapp] = useState('');
+  const [inboxDraft, setInboxDraft] = useState('');
+  const [isLoadingInbox, setIsLoadingInbox] = useState(false);
+  const [inboxError, setInboxError] = useState('');
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const appointmentService = useRef<AppointmentService | null>(null);
 
@@ -107,6 +129,18 @@ export default function App() {
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
+
+  useEffect(() => {
+    if (activeSection === 'inbox') {
+      loadInbox();
+    }
+  }, [activeSection]);
+
+  useEffect(() => {
+    if (activeSection === 'inbox' && selectedWhatsapp) {
+      loadInboxMessages(selectedWhatsapp);
+    }
+  }, [activeSection, selectedWhatsapp]);
 
   const handleSend = async () => {
     if (!input.trim() || isLoading) return;
@@ -267,6 +301,60 @@ export default function App() {
     }
   };
 
+  const loadInbox = async () => {
+    if (!appointmentService.current || isLoadingInbox) return;
+    setIsLoadingInbox(true);
+    setInboxError('');
+
+    try {
+      const conversations = await appointmentService.current.getWhatsappConversations();
+      setInboxConversations(conversations);
+      if (!selectedWhatsapp && conversations[0]?.phone) {
+        setSelectedWhatsapp(conversations[0].phone);
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Erro ao carregar inbox.';
+      setInboxError(message);
+    } finally {
+      setIsLoadingInbox(false);
+    }
+  };
+
+  const loadInboxMessages = async (phone: string) => {
+    if (!appointmentService.current || isLoadingInbox || !phone) return;
+    setIsLoadingInbox(true);
+    setInboxError('');
+
+    try {
+      const messages = await appointmentService.current.getWhatsappMessages(phone);
+      setInboxMessages(messages);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Erro ao carregar mensagens.';
+      setInboxError(message);
+    } finally {
+      setIsLoadingInbox(false);
+    }
+  };
+
+  const handleSendInboxMessage = async () => {
+    if (!appointmentService.current || !selectedWhatsapp || !inboxDraft.trim() || isLoadingInbox) return;
+    const text = inboxDraft.trim();
+    setInboxDraft('');
+    setIsLoadingInbox(true);
+    setInboxError('');
+
+    try {
+      await appointmentService.current.sendWhatsappMessage(selectedWhatsapp, text);
+      setInboxMessages((prev) => [...prev, { role: 'assistant', content: text, at: new Date().toISOString() }]);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Erro ao enviar mensagem.';
+      setInboxError(message);
+      setInboxDraft(text);
+    } finally {
+      setIsLoadingInbox(false);
+    }
+  };
+
   return (
     <div className="min-h-screen flex flex-col luxury-gradient">
       {/* Header */}
@@ -283,6 +371,7 @@ export default function App() {
         <div className="hidden sm:flex items-center gap-5 text-[11px] uppercase tracking-widest text-white/60">
           <button onClick={() => setActiveSection('services')} className="hover:text-white cursor-pointer transition-colors">Servicos</button>
           <button onClick={() => setActiveSection('salon')} className="hover:text-white cursor-pointer transition-colors">O Salao</button>
+          <button onClick={() => setActiveSection('inbox')} className="hover:text-white cursor-pointer transition-colors">Inbox</button>
           <button onClick={() => setActiveSection('contact')} className="hover:text-white cursor-pointer transition-colors">Contato</button>
           <button onClick={() => setActiveSection('knowledge')} className="hover:text-white cursor-pointer transition-colors">Base</button>
         </div>
@@ -377,6 +466,101 @@ export default function App() {
                       </div>
                     </div>
                   ))}
+                </div>
+              </>
+            )}
+
+            {activeSection === 'inbox' && (
+              <>
+                <div className="flex items-center justify-between gap-3 flex-wrap">
+                  <h2 className="heading-bold text-lg text-white">Inbox WhatsApp</h2>
+                  <button
+                    onClick={() => {
+                      loadInbox();
+                      if (selectedWhatsapp) {
+                        loadInboxMessages(selectedWhatsapp);
+                      }
+                    }}
+                    disabled={isLoadingInbox}
+                    className="px-4 py-2 rounded-lg bg-brand-blue text-white text-xs uppercase tracking-wider disabled:opacity-50"
+                  >
+                    {isLoadingInbox ? 'Atualizando...' : 'Atualizar inbox'}
+                  </button>
+                </div>
+                {inboxError && <p className="text-xs text-red-300">{inboxError}</p>}
+                <div className="grid md:grid-cols-[280px_1fr] gap-4">
+                  <div className="space-y-2 max-h-[520px] overflow-y-auto pr-1">
+                    {!inboxConversations.length && (
+                      <p className="text-white/70 text-sm">Nenhuma conversa recebida ainda.</p>
+                    )}
+                    {inboxConversations.map((item) => (
+                      <button
+                        key={item.phone}
+                        onClick={() => setSelectedWhatsapp(item.phone)}
+                        className={`w-full text-left rounded-xl border p-3 transition-colors ${
+                          selectedWhatsapp === item.phone
+                            ? 'border-brand-blue bg-white/10'
+                            : 'border-white/10 bg-white/5 hover:bg-white/10'
+                        }`}
+                      >
+                        <div className="text-sm text-white">
+                          {item.name || item.phone}
+                        </div>
+                        <div className="text-xs text-white/60 truncate">
+                          {item.lastRole === 'assistant' ? 'IA: ' : ''}{item.lastMessage || 'Sem mensagens'}
+                        </div>
+                      </button>
+                    ))}
+                  </div>
+                  <div className="flex flex-col rounded-2xl bg-white/5 border border-white/10 p-4 min-h-[520px]">
+                    {!selectedWhatsapp && (
+                      <p className="text-white/70 text-sm">Selecione uma conversa para visualizar.</p>
+                    )}
+                    {selectedWhatsapp && (
+                      <>
+                        <div className="text-xs text-white/60 mb-3">
+                          Conversa com <span className="text-white">{selectedWhatsapp}</span>
+                        </div>
+                        <div className="flex-1 space-y-3 overflow-y-auto pr-1">
+                          {!inboxMessages.length && (
+                            <p className="text-white/70 text-sm">Sem mensagens nesta conversa.</p>
+                          )}
+                          {inboxMessages.map((message, idx) => (
+                            <div
+                              key={`${message.role}-${idx}`}
+                              className={`max-w-[80%] rounded-2xl px-4 py-3 text-sm ${
+                                message.role === 'assistant'
+                                  ? 'ml-auto bg-brand-blue/20 text-white'
+                                  : 'bg-white/10 text-white/90'
+                              }`}
+                            >
+                              <div>{message.content}</div>
+                              {message.at && (
+                                <div className="text-[10px] text-white/50 mt-1">
+                                  {new Date(message.at).toLocaleString('pt-BR')}
+                                </div>
+                              )}
+                            </div>
+                          ))}
+                        </div>
+                        <div className="mt-4 flex items-center gap-2">
+                          <input
+                            value={inboxDraft}
+                            onChange={(e) => setInboxDraft(e.target.value)}
+                            placeholder="Responder cliente..."
+                            className="flex-1 rounded-md bg-[#0f1731] border border-white/15 text-white/90 px-3 py-2 text-sm"
+                          />
+                          <button
+                            onClick={handleSendInboxMessage}
+                            disabled={isLoadingInbox || !inboxDraft.trim()}
+                            className="px-4 py-2 rounded-lg bg-brand-blue text-white text-xs uppercase tracking-wider disabled:opacity-50"
+                          >
+                            Enviar
+                          </button>
+                        </div>
+                      </>
+                    )}
+                  </div>
                 </div>
               </>
             )}
