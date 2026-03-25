@@ -204,6 +204,19 @@ export default function App() {
     whatsappStatusRaw && typeof whatsappStatusRaw === 'object'
       ? (whatsappStatusRaw as Record<string, unknown>)?.connectionStatus
       : null;
+  const whatsappOwnerJid =
+    whatsappStatusRaw && typeof whatsappStatusRaw === 'object'
+      ? String((whatsappStatusRaw as Record<string, unknown>)?.ownerJid || '')
+      : '';
+  const whatsappProfileName =
+    whatsappStatusRaw && typeof whatsappStatusRaw === 'object'
+      ? String((whatsappStatusRaw as Record<string, unknown>)?.profileName || '')
+      : '';
+  const whatsappProfilePic =
+    whatsappStatusRaw && typeof whatsappStatusRaw === 'object'
+      ? String((whatsappStatusRaw as Record<string, unknown>)?.profilePicUrl || '')
+      : '';
+  const whatsappPhoneNumber = whatsappOwnerJid ? whatsappOwnerJid.split('@')[0] : '';
   const whatsappStatusLabel = whatsappStatus
     ? String(whatsappConnectionStatus || (whatsappStatus.connected ? 'connected' : 'disconnected'))
     : 'desconhecido';
@@ -558,6 +571,26 @@ export default function App() {
                     </div>
                   </div>
                   {whatsappError && <p className="text-xs text-red-300">{whatsappError}</p>}
+                  {(whatsappPhoneNumber || whatsappProfileName || whatsappProfilePic) && (
+                    <div className="rounded-xl bg-white/5 border border-white/10 p-4 space-y-3">
+                      <div className="flex items-center gap-3">
+                        {whatsappProfilePic ? (
+                          <img
+                            src={whatsappProfilePic}
+                            alt="Perfil WhatsApp"
+                            className="w-12 h-12 rounded-full border border-white/20 object-cover"
+                          />
+                        ) : (
+                          <div className="w-12 h-12 rounded-full border border-white/20 bg-white/5" />
+                        )}
+                        <div>
+                          <p className="text-xs uppercase tracking-wider text-white/60">Conta conectada</p>
+                          {whatsappProfileName && <p className="text-sm text-white">{whatsappProfileName}</p>}
+                          {whatsappPhoneNumber && <p className="text-xs text-white/70">{whatsappPhoneNumber}</p>}
+                        </div>
+                      </div>
+                    </div>
+                  )}
                   <div className="rounded-xl bg-white/5 border border-white/10 p-4 flex items-center justify-center min-h-[220px]">
                     {whatsappQr?.qr?.qrDataUrl ? (
                       <img src={whatsappQr.qr.qrDataUrl} alt="QR Code WhatsApp" className="w-56 h-auto" />
