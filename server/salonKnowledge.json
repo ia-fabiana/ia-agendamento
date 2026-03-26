@@ -1,13 +1,17 @@
 {
   "identity": {
-    "brandName": "Fabiana Luxury Salon",
+    "brandName": "Jacques Janine Vila Leopoldina",
     "toneGuide": "sofisticado, acolhedor, objetivo"
   },
   "business": {
-    "address": "Atualize com o endereco oficial",
-    "phone": "Atualize com o telefone oficial",
-    "openingHours": "Seg a Sab, 09:00-19:00",
-    "paymentMethods": ["PIX", "Cartao de credito", "Cartao de debito"]
+    "address": "Rua Carlos Weber 1048 - Vila Leopoldina - São Paulo ",
+    "phone": "5511917500404",
+    "openingHours": "Ter  a Sab, 09:00-19:00",
+    "paymentMethods": [
+      "PIX",
+      "Cartao de credito",
+      "Cartao de debito"
+    ]
   },
   "policies": {
     "latePolicy": "Tolerancia de 10 minutos; apos isso pode haver ajuste na agenda.",

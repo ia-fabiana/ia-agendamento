@@ -1,3 +1,22 @@
+  // Função para desconectar WhatsApp
+  const handleDisconnectWhatsapp = async () => {
+    if (!appointmentService.current || isLoadingWhatsapp || !ensureWhatsappInstance()) return;
+    setIsLoadingWhatsapp(true);
+    setWhatsappError("");
+    try {
+      await appointmentService.current.disconnectEvolutionInstance(whatsappInstance.trim());
+      setWhatsappStatus(null);
+      setWhatsappQr(null);
+      setInboxConversations([]);
+      setInboxMessages([]);
+      setSelectedWhatsapp("");
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Erro ao desconectar WhatsApp.";
+      setWhatsappError(message);
+    } finally {
+      setIsLoadingWhatsapp(false);
+    }
+  };
 import React, { useState, useEffect, useRef } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
 import { Send, Calendar, Sparkles, Phone } from 'lucide-react';
@@ -735,6 +754,13 @@ export default function App() {
                         className="px-3 py-2 rounded-lg bg-brand-blue text-white text-xs uppercase tracking-wider disabled:opacity-50"
                       >
                         {isLoadingWhatsapp ? 'Carregando...' : 'Gerar QR'}
+                      </button>
+                      <button
+                        onClick={handleDisconnectWhatsapp}
+                        disabled={isLoadingWhatsapp || !whatsappStatus?.connected}
+                        className="px-3 py-2 rounded-lg bg-red-600 text-white text-xs uppercase tracking-wider disabled:opacity-50"
+                      >
+                        {isLoadingWhatsapp ? 'Desconectando...' : 'Desconectar'}
                       </button>
                     </div>
                   </div>

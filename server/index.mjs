@@ -1,7 +1,8 @@
 import express from "express";
 import dotenv from "dotenv";
 import { GoogleGenAI, Type } from "@google/genai";
-import { readFileSync, writeFileSync } from "node:fs";
+import Database from "better-sqlite3";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -13,8 +14,71 @@ dotenv.config({ path: envPath });
 const app = express();
 const port = Number(process.env.PORT || 3001);
 const KNOWLEDGE_FILE_PATH = path.join(__dirname, "salonKnowledge.json");
+const DATA_DIR_PATH = path.join(__dirname, "data");
+const SQLITE_DB_PATH = process.env.IA_DB_PATH?.trim() || path.join(DATA_DIR_PATH, "ia_agendamento.sqlite");
 const MAX_WHATSAPP_HISTORY_MESSAGES = 20;
+const BOOKING_CONFIRMATION_TTL_MS = 20 * 60 * 1000;
 const whatsappConversations = new Map();
+const recentWebhookMessages = new Map();
+const pendingBookingConfirmations = new Map();
+const WEBHOOK_DEDUPE_WINDOW_MS = 30_000;
+const db = initDatabase();
+
+function initDatabase() {
+  mkdirSync(DATA_DIR_PATH, { recursive: true });
+  const database = new Database(SQLITE_DB_PATH);
+  database.pragma("journal_mode = WAL");
+
+  database.exec(`
+    CREATE TABLE IF NOT EXISTS whatsapp_messages (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      phone TEXT NOT NULL,
+      role TEXT NOT NULL,
+      content TEXT NOT NULL,
+      sender_name TEXT DEFAULT '',
+      at TEXT NOT NULL,
+      source TEXT DEFAULT 'runtime'
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_whatsapp_messages_phone_at
+      ON whatsapp_messages(phone, at DESC);
+
+    CREATE TABLE IF NOT EXISTS appointment_audit (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      event_type TEXT NOT NULL,
+      status TEXT NOT NULL,
+      establishment_id INTEGER,
+      appointment_id INTEGER,
+      confirmation_code TEXT,
+      client_phone TEXT,
+      client_name TEXT,
+      service_name TEXT,
+      professional_name TEXT,
+      appointment_date TEXT,
+      appointment_time TEXT,
+      request_payload TEXT,
+      response_payload TEXT,
+      error_message TEXT,
+      created_at TEXT NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_appointment_audit_created_at
+      ON appointment_audit(created_at DESC);
+
+    CREATE INDEX IF NOT EXISTS idx_appointment_audit_phone
+      ON appointment_audit(client_phone);
+  `);
+
+  return database;
+}
+
+function safeJsonStringify(value) {
+  try {
+    return JSON.stringify(value ?? null);
+  } catch {
+    return JSON.stringify({ nonSerializable: true });
+  }
+}
 
 app.use(express.json());
 app.use((req, res, next) => {
@@ -111,6 +175,47 @@ function normalizeWhatsappMessage(item) {
   };
 }
 
+function persistWhatsappMessage({ phone, role, content, at, senderName = "", source = "runtime" }) {
+  if (!phone || !role || !content) {
+    return;
+  }
+
+  db.prepare(
+    `
+      INSERT INTO whatsapp_messages (phone, role, content, sender_name, at, source)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `,
+  ).run(
+    String(phone),
+    String(role),
+    String(content),
+    senderName ? String(senderName) : "",
+    at ? String(at) : new Date().toISOString(),
+    source ? String(source) : "runtime",
+  );
+}
+
+function loadWhatsappMessagesFromDb(phone, limit = MAX_WHATSAPP_HISTORY_MESSAGES) {
+  if (!phone) {
+    return [];
+  }
+
+  const rows = db.prepare(
+    `
+      SELECT role, content, at, sender_name AS senderName
+      FROM whatsapp_messages
+      WHERE phone = ?
+      ORDER BY datetime(at) DESC, id DESC
+      LIMIT ?
+    `,
+  ).all(String(phone), Number(limit));
+
+  return rows
+    .reverse()
+    .map(normalizeWhatsappMessage)
+    .filter(Boolean);
+}
+
 function getWhatsappHistory(phone) {
   if (!phone) {
     return [];
@@ -120,7 +225,16 @@ function getWhatsappHistory(phone) {
     ? whatsappConversations.get(phone)
     : [];
 
-  return current.map(normalizeWhatsappMessage).filter(Boolean);
+  const normalized = current.map(normalizeWhatsappMessage).filter(Boolean);
+  if (normalized.length) {
+    return normalized;
+  }
+
+  const fromDb = loadWhatsappMessagesFromDb(phone, MAX_WHATSAPP_HISTORY_MESSAGES);
+  if (fromDb.length) {
+    whatsappConversations.set(phone, fromDb);
+  }
+  return fromDb;
 }
 
 function pushWhatsappHistory(phone, role, content, senderName = "") {
@@ -137,9 +251,95 @@ function pushWhatsappHistory(phone, role, content, senderName = "") {
   };
   const updated = [...current, entry].slice(-MAX_WHATSAPP_HISTORY_MESSAGES);
   whatsappConversations.set(phone, updated);
+  persistWhatsappMessage({
+    phone,
+    role,
+    content,
+    at: entry.at,
+    senderName: entry.senderName,
+    source: "runtime",
+  });
+}
+
+function cleanupWebhookDedupeCache(now = Date.now()) {
+  for (const [key, value] of recentWebhookMessages.entries()) {
+    if (!value || now - Number(value.at || 0) > WEBHOOK_DEDUPE_WINDOW_MS) {
+      recentWebhookMessages.delete(key);
+    }
+  }
+}
+
+function isDuplicateIncomingWhatsapp(incoming) {
+  const now = Date.now();
+  cleanupWebhookDedupeCache(now);
+
+  const sender = normalizePhone(incoming?.senderNumber || "");
+  const messageId = toNonEmptyString(incoming?.messageId);
+  const text = toNonEmptyString(incoming?.messageText).toLowerCase();
+  const withMessageId = sender && messageId ? `id:${sender}:${messageId}` : "";
+  const withoutMessageId = sender && text ? `txt:${sender}:${text}` : "";
+
+  if (withMessageId) {
+    if (recentWebhookMessages.has(withMessageId)) {
+      return true;
+    }
+    recentWebhookMessages.set(withMessageId, { at: now });
+  }
+
+  if (withoutMessageId) {
+    const previous = recentWebhookMessages.get(withoutMessageId);
+    if (previous && now - Number(previous.at || 0) <= 10_000) {
+      return true;
+    }
+    recentWebhookMessages.set(withoutMessageId, { at: now });
+  }
+
+  return false;
 }
 
 function summarizeWhatsappConversations() {
+  const rows = db.prepare(
+    `
+      SELECT m.phone,
+             m.content AS lastMessage,
+             m.role AS lastRole,
+             m.at AS updatedAt,
+             m.sender_name AS senderName,
+             (
+               SELECT sender_name
+               FROM whatsapp_messages u
+               WHERE u.phone = m.phone
+                 AND u.role = 'user'
+                 AND COALESCE(u.sender_name, '') <> ''
+               ORDER BY datetime(u.at) DESC, u.id DESC
+               LIMIT 1
+             ) AS userSenderName,
+             (
+               SELECT COUNT(*)
+               FROM whatsapp_messages c
+               WHERE c.phone = m.phone
+             ) AS count
+      FROM whatsapp_messages m
+      JOIN (
+        SELECT phone, MAX(id) AS max_id
+        FROM whatsapp_messages
+        GROUP BY phone
+      ) latest ON latest.max_id = m.id
+      ORDER BY datetime(m.at) DESC, m.id DESC
+    `,
+  ).all();
+
+  if (rows.length) {
+    return rows.map((row) => ({
+      phone: String(row.phone || ""),
+      name: String(row.userSenderName || row.senderName || ""),
+      lastMessage: String(row.lastMessage || ""),
+      lastRole: String(row.lastRole || ""),
+      updatedAt: String(row.updatedAt || ""),
+      count: Number(row.count || 0),
+    }));
+  }
+
   const summaries = [];
 
   for (const [phone, messages] of whatsappConversations.entries()) {
@@ -164,6 +364,167 @@ function summarizeWhatsappConversations() {
   return summaries.sort((a, b) => String(b.updatedAt).localeCompare(String(a.updatedAt)));
 }
 
+function cleanupPendingBookingConfirmations(now = Date.now()) {
+  for (const [key, value] of pendingBookingConfirmations.entries()) {
+    if (!value || now > Number(value.expiresAt || 0)) {
+      pendingBookingConfirmations.delete(key);
+    }
+  }
+}
+
+function resolvePendingSessionKey(establishmentId, customerContext = {}, fallback = {}) {
+  const phone = normalizePhone(customerContext?.phone || fallback.clientPhone || "");
+  if (phone) {
+    return `${Number(establishmentId)}:phone:${phone}`;
+  }
+
+  const name = normalizeForMatch(customerContext?.name || fallback.clientName || "").trim();
+  if (name) {
+    return `${Number(establishmentId)}:name:${name}`;
+  }
+
+  return "";
+}
+
+function getPendingBookingConfirmation(sessionKey) {
+  if (!sessionKey) {
+    return null;
+  }
+
+  cleanupPendingBookingConfirmations();
+  return pendingBookingConfirmations.get(sessionKey) || null;
+}
+
+function setPendingBookingConfirmation(sessionKey, payload) {
+  if (!sessionKey) {
+    return null;
+  }
+
+  const now = Date.now();
+  const value = {
+    ...payload,
+    createdAt: now,
+    expiresAt: now + BOOKING_CONFIRMATION_TTL_MS,
+  };
+  pendingBookingConfirmations.set(sessionKey, value);
+  return value;
+}
+
+function clearPendingBookingConfirmation(sessionKey) {
+  if (!sessionKey) {
+    return;
+  }
+  pendingBookingConfirmations.delete(sessionKey);
+}
+
+function detectConfirmationIntent(message) {
+  const normalized = normalizeForMatch(message);
+  if (!normalized) {
+    return "none";
+  }
+
+  if (
+    /\b(nao|não|negativo|melhor nao|melhor nao|cancelar|cancela|desmarcar|desmarca|mudar|trocar|corrigir)\b/.test(
+      normalized,
+    )
+  ) {
+    return "deny";
+  }
+
+  if (
+    /\b(sim|confirmo|confirmar|confirmado|pode|ok|certo|isso|pode agendar|pode marcar|fechado)\b/.test(
+      normalized,
+    )
+  ) {
+    return "confirm";
+  }
+
+  return "none";
+}
+
+function formatBookingItemSummary(item) {
+  const date = toNonEmptyString(item?.date);
+  const brDate = isoToBrDate(date) || date;
+  const time = normalizeTimeValue(item?.time) || toNonEmptyString(item?.time);
+  const professional = professionalDisplayName(item?.professionalName || "");
+  return `servico ${item?.service} com ${professional} em ${brDate} as ${time}`;
+}
+
+function buildBookingConfirmationMessage(items) {
+  if (!Array.isArray(items) || !items.length) {
+    return "Nao encontrei itens para confirmar.";
+  }
+
+  const lines = items.map((item, index) => `${index + 1}) ${formatBookingItemSummary(item)}`);
+  if (items.length === 1) {
+    return `Confirma este agendamento?\n${lines.join("\n")}\n\nSe estiver certo, responda "sim".`;
+  }
+
+  return `Confirma estes agendamentos?\n${lines.join("\n")}\n\nSe estiver certo, responda "sim".`;
+}
+
+function normalizeBookingTime(value) {
+  const normalized = normalizeTimeValue(value);
+  return normalized || "";
+}
+
+function normalizeBookingDate(value, fallbackDate = "") {
+  const raw = toNonEmptyString(value);
+  if (/^\d{4}-\d{2}-\d{2}$/.test(raw)) {
+    return raw;
+  }
+  return toNonEmptyString(fallbackDate);
+}
+
+function recordAppointmentAudit({
+  eventType,
+  status = "success",
+  establishmentId = null,
+  appointmentId = null,
+  confirmationCode = "",
+  clientPhone = "",
+  clientName = "",
+  serviceName = "",
+  professionalName = "",
+  date = "",
+  time = "",
+  requestPayload = null,
+  responsePayload = null,
+  errorMessage = "",
+}) {
+  try {
+    db.prepare(
+      `
+        INSERT INTO appointment_audit (
+          event_type, status, establishment_id, appointment_id, confirmation_code,
+          client_phone, client_name, service_name, professional_name,
+          appointment_date, appointment_time, request_payload, response_payload,
+          error_message, created_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `,
+    ).run(
+      String(eventType || "unknown"),
+      String(status || "success"),
+      establishmentId !== undefined && establishmentId !== null ? Number(establishmentId) : null,
+      appointmentId !== undefined && appointmentId !== null ? Number(appointmentId) : null,
+      String(confirmationCode || ""),
+      normalizePhone(clientPhone || ""),
+      String(clientName || ""),
+      String(serviceName || ""),
+      String(professionalName || ""),
+      String(date || ""),
+      String(time || ""),
+      safeJsonStringify(requestPayload),
+      safeJsonStringify(responsePayload),
+      String(errorMessage || ""),
+      new Date().toISOString(),
+    );
+  } catch (error) {
+    console.error("[audit] failed to persist appointment audit:", error?.message || error);
+  }
+}
+
 function normalizeTrinksPhone(phone) {
   if (!phone || typeof phone !== "object") {
     return normalizePhone(phone);
@@ -172,25 +533,25 @@ function normalizeTrinksPhone(phone) {
   return normalizePhone(`${phone?.ddi || ""}${phone?.ddd || ""}${phone?.telefone || ""}${phone?.numero || ""}`);
 }
 
-// Decompõe um telefone brasileiro em { ddi, ddd, numero } para criação de clientes na Trinks
+// DecompÃµe um telefone brasileiro em { ddi, ddd, numero } para criaÃ§Ã£o de clientes na Trinks
 function parseBrazilianPhone(phone) {
   const digits = normalizePhone(phone);
   if (!digits) return null;
 
-  // Remove DDI 55 se presente no início (55 + 10 ou 11 dígitos = 12 ou 13 dígitos)
+  // Remove DDI 55 se presente no inÃ­cio (55 + 10 ou 11 dÃ­gitos = 12 ou 13 dÃ­gitos)
   let local = digits;
   if (local.length >= 12 && local.startsWith("55")) {
     local = local.slice(2);
   }
 
-  // Extrai DDD (2 dígitos) + número (8 ou 9 dígitos)
+  // Extrai DDD (2 dÃ­gitos) + nÃºmero (8 ou 9 dÃ­gitos)
   if (local.length >= 10) {
     const ddd = local.slice(0, 2);
     const numero = local.slice(2);
     return { ddi: "55", ddd, numero };
   }
 
-  // Sem DDD reconhecível — retorna só o número
+  // Sem DDD reconhecÃ­vel â€” retorna sÃ³ o nÃºmero
   return { ddi: "55", ddd: "", numero: local };
 }
 
@@ -268,6 +629,10 @@ function dedupeClients(items) {
   return result;
 }
 
+function clientDisplayNameFrom(item) {
+  return firstNonEmpty([item?.nome, item?.name, item?.cliente?.nome, item?.clienteNome]);
+}
+
 async function listClients(estabelecimentoId, query = {}) {
   const payload = await trinksRequest("/clientes", {
     method: "GET",
@@ -280,6 +645,29 @@ async function listClients(estabelecimentoId, query = {}) {
   });
 
   return extractItems(payload);
+}
+
+async function findExistingClientByPhone(estabelecimentoId, clientPhone) {
+  const normalizedPhone = normalizePhone(clientPhone);
+  if (!normalizedPhone) {
+    return null;
+  }
+
+  const searches = [
+    listClients(estabelecimentoId, { telefone: normalizedPhone }),
+    listClients(estabelecimentoId, { phone: normalizedPhone }),
+    listClients(estabelecimentoId, { celular: normalizedPhone }),
+    listClients(estabelecimentoId),
+  ];
+
+  const results = await Promise.allSettled(searches);
+  const candidates = dedupeClients(
+    results
+      .filter((item) => item.status === "fulfilled")
+      .flatMap((item) => item.value),
+  );
+
+  return candidates.find((item) => matchesClientPhone(item, normalizedPhone)) || null;
 }
 
 function extractItems(payload) {
@@ -304,6 +692,39 @@ function professionalIdFrom(item) {
 
 function professionalNameFrom(item) {
   return item?.nome ?? item?.name ?? item?.profissional?.nome ?? null;
+}
+
+function professionalDisplayName(name) {
+  const raw = toNonEmptyString(name);
+  if (!raw) {
+    return "";
+  }
+
+  const first = raw.split(/\s+/).filter(Boolean)[0] || raw;
+  return first.charAt(0).toUpperCase() + first.slice(1).toLowerCase();
+}
+
+function professionalHasOpenSchedule(item) {
+  return Array.isArray(item?.availableTimes) && item.availableTimes.length > 0;
+}
+
+function uniqueProfessionalDisplayNames(names) {
+  const seen = new Set();
+  const result = [];
+
+  for (const name of names) {
+    const display = professionalDisplayName(name);
+    if (!display) {
+      continue;
+    }
+    const key = normalizeForMatch(display);
+    if (!seen.has(key)) {
+      seen.add(key);
+      result.push(display);
+    }
+  }
+
+  return result;
 }
 
 function loadSalonKnowledge() {
@@ -367,40 +788,54 @@ function formatKnowledgeForPrompt(knowledge) {
   ].join("\n");
 }
 
-const SYSTEM_INSTRUCTION = `Você é a IA.AGENDAMENTO, uma Concierge Digital de altíssimo padrão desenvolvida para o salão de luxo da Fabiana. Sua missão é gerenciar agendamentos via WhatsApp com elegância, precisão e minimalismo.
+const SYSTEM_INSTRUCTION = `Voce e a IA.AGENDAMENTO, uma concierge digital premium para atendimento e agendamento.
+Seu nome e Jacques.
 
-Diretrizes de Personalidade:
-Identidade: Apresente-se como IA.AGENDAMENTO sempre que necessário.
-Tom de Voz: Extremamente sofisticado, polido e acolhedor. Use frases curtas e diretas. Evite gírias e excesso de emojis; prefira ✨, 📅 ou 🥂.
-Estética: Seu atendimento deve refletir um ambiente de salão high-end e minimalista.
+Diretrizes:
+- Tom sofisticado, acolhedor e objetivo.
+- Frases curtas, sem paragrafos longos.
+- Foco em concluir agendamentos com precisao.
+- Ao mencionar profissionais para a cliente, use apenas o primeiro nome.
 
-Fluxo de Atendimento:
-Reconhecimento: Se for uma cliente nova, dê as boas-vindas ao universo de beleza da Fabiana. Se for recorrente, utilize o histórico para ser mais pessoal.
-Consultoria: Identifique o serviço desejado (ex: mechas, corte, tratamento).
-Agendamento (Trinks): Quando a cliente solicitar um horário, informe que você verificará a disponibilidade em tempo real na agenda oficial.
-Regra de agenda: Antes de sugerir ou confirmar horarios, consulte os agendamentos do dia (listAppointmentsForDate) e evite horarios ocupados.
-Reagendamento: Para alterar horário, solicite código de confirmação (TRK-123) ou ID do agendamento.
-Fechamento: Após a confirmação do horário, solicite o nome completo e telefone para finalizar a reserva no sistema Trinks.
+Fluxo:
+- Identifique o servico desejado.
+- Antes de sugerir horario, consulte disponibilidade real por profissional (checkAvailability).
+- Para agendar, use bookAppointment.
+- Antes de finalizar o agendamento, sempre valide disponibilidade e apresente um resumo completo para confirmacao explicita da cliente.
+- Se houver mais de um servico, monte todos os itens no campo appointments da ferramenta bookAppointment.
+- Para reagendar, use rescheduleAppointment.
+- Para desmarcar sem remarcar, use cancelAppointment.
+- Para desmarcar, priorize pedir codigo de confirmacao (TRK). Se a cliente nao tiver codigo, tente localizar pelo telefone da cliente na base Trinks e prossiga com seguranca.
+- Quando a cliente perguntar nomes de profissionais, consulte a ferramenta listProfessionalsForDate e responda apenas com dados reais.
+- Ao receber preferencia de profissional e/ou horario desejado, use checkAvailability com professionalName e preferredTime para trazer os horarios mais proximos possiveis.
 
-Restrições:
-Nunca invente horários; sempre diga que está consultando o sistema.
-Não escreva parágrafos longos; o atendimento de luxo é ágil e eficiente.
-Mantenha o foco total em converter a conversa em um agendamento finalizado.`;
+Datas:
+- Use obrigatoriamente o contexto temporal oficial enviado no prompt.
+- Interprete "hoje", "amanha" e "depois de amanha" com base nesse contexto.
+- Nunca invente datas.`;
 
 const chatTools = [
   {
     name: "checkAvailability",
     parameters: {
       type: Type.OBJECT,
-      description: "Verifica a disponibilidade de horários para um serviço específico em uma data.",
+      description: "Verifica disponibilidade de horarios para um servico em uma data.",
       properties: {
         service: {
           type: Type.STRING,
-          description: "O nome do serviço (ex: corte, mechas, manicure).",
+          description: "Nome do servico (ex: corte, mechas, manicure).",
         },
         date: {
           type: Type.STRING,
-          description: "A data desejada (formato YYYY-MM-DD).",
+          description: "Data desejada no formato YYYY-MM-DD.",
+        },
+        professionalName: {
+          type: Type.STRING,
+          description: "Nome da profissional preferida pela cliente (opcional).",
+        },
+        preferredTime: {
+          type: Type.STRING,
+          description: "Horario preferido no formato HH:mm (opcional).",
         },
       },
       required: ["service", "date"],
@@ -410,58 +845,427 @@ const chatTools = [
     name: "listAppointmentsForDate",
     parameters: {
       type: Type.OBJECT,
-      description: "Lista os horarios ja ocupados (agendamentos) em uma data.",
+      description: "Lista horarios ocupados em uma data.",
       properties: {
         date: {
           type: Type.STRING,
-          description: "A data desejada (formato YYYY-MM-DD).",
+          description: "Data desejada no formato YYYY-MM-DD.",
         },
       },
       required: ["date"],
     },
   },
   {
+    name: "listProfessionalsForDate",
+    parameters: {
+      type: Type.OBJECT,
+      description: "Lista profissionais disponiveis em uma data, opcionalmente filtrando por servico.",
+      properties: {
+        date: {
+          type: Type.STRING,
+          description: "Data desejada no formato YYYY-MM-DD. Se nao informado, usar hoje.",
+        },
+        service: {
+          type: Type.STRING,
+          description: "Nome do servico para filtrar profissionais (opcional).",
+        },
+      },
+    },
+  },
+  {
     name: "bookAppointment",
     parameters: {
       type: Type.OBJECT,
-      description: "Finaliza a reserva de um horário no sistema.",
+      description: "Prepara um ou mais agendamentos para confirmacao final da cliente.",
       properties: {
         service: { type: Type.STRING },
         date: { type: Type.STRING },
-        time: { type: Type.STRING, description: "Horário escolhido (ex: 14:00)." },
+        time: { type: Type.STRING, description: "Horario escolhido (ex: 14:00)." },
         professionalName: {
           type: Type.STRING,
           description: "Nome da profissional desejada (opcional).",
         },
         clientName: { type: Type.STRING },
         clientPhone: { type: Type.STRING },
+        appointments: {
+          type: Type.ARRAY,
+          description:
+            "Lista de agendamentos quando houver mais de um servico. Se informado, cada item deve conter service, date, time e opcionalmente professionalName.",
+          items: {
+            type: Type.OBJECT,
+            properties: {
+              service: { type: Type.STRING },
+              date: { type: Type.STRING },
+              time: { type: Type.STRING },
+              professionalName: { type: Type.STRING },
+            },
+            required: ["service", "date", "time"],
+          },
+        },
       },
-      required: ["service", "date", "time", "clientName", "clientPhone"],
+      required: [],
     },
   },
   {
     name: "rescheduleAppointment",
     parameters: {
       type: Type.OBJECT,
-      description: "Altera a data e horário de um agendamento existente.",
+      description: "Altera a data e horario de um agendamento existente.",
       properties: {
         confirmationCode: {
           type: Type.STRING,
-          description: "Código de confirmação como TRK-123 (opcional se appointmentId for informado).",
+          description: "Codigo de confirmacao como TRK-123 (opcional se appointmentId for informado).",
         },
         appointmentId: {
           type: Type.STRING,
           description: "ID do agendamento (opcional se confirmationCode for informado).",
         },
         date: { type: Type.STRING, description: "Nova data no formato YYYY-MM-DD." },
-        time: { type: Type.STRING, description: "Novo horário no formato HH:mm." },
+        time: { type: Type.STRING, description: "Novo horario no formato HH:mm." },
       },
       required: ["date", "time"],
     },
   },
+  {
+    name: "cancelAppointment",
+    parameters: {
+      type: Type.OBJECT,
+      description: "Desmarca um agendamento existente sem necessidade de reagendamento.",
+      properties: {
+        confirmationCode: {
+          type: Type.STRING,
+          description: "Codigo de confirmacao como TRK-123 (opcional se appointmentId for informado).",
+        },
+        appointmentId: {
+          type: Type.STRING,
+          description: "ID do agendamento (opcional se confirmationCode for informado).",
+        },
+        reason: {
+          type: Type.STRING,
+          description: "Motivo do cancelamento (opcional).",
+        },
+        clientPhone: {
+          type: Type.STRING,
+          description: "Telefone da cliente para localizar agendamento quando nao houver codigo (opcional).",
+        },
+        clientName: {
+          type: Type.STRING,
+          description: "Nome da cliente para apoiar identificacao (opcional).",
+        },
+        date: {
+          type: Type.STRING,
+          description: "Data do agendamento no formato YYYY-MM-DD (opcional).",
+        },
+        time: {
+          type: Type.STRING,
+          description: "Horario do agendamento no formato HH:mm (opcional).",
+        },
+        service: {
+          type: Type.STRING,
+          description: "Servico do agendamento para filtro (opcional).",
+        },
+        professionalName: {
+          type: Type.STRING,
+          description: "Profissional do agendamento para filtro (opcional).",
+        },
+      },
+    },
+  },
 ];
 
-function buildConversationPrompt(history, message, knowledge) {
+function addDaysToIsoDate(isoDate, days) {
+  const [year, month, day] = String(isoDate || "")
+    .split("-")
+    .map((item) => Number(item));
+
+  if (!year || !month || !day) {
+    return "";
+  }
+
+  const date = new Date(Date.UTC(year, month - 1, day));
+  date.setUTCDate(date.getUTCDate() + Number(days || 0));
+  return date.toISOString().slice(0, 10);
+}
+
+function isoToBrDate(isoDate) {
+  const [year, month, day] = String(isoDate || "").split("-");
+  if (!year || !month || !day) {
+    return "";
+  }
+  return `${day}/${month}/${year}`;
+}
+
+function getSaoPauloDateContext() {
+  const now = new Date();
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "America/Sao_Paulo",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(now);
+
+  const pick = (type) => parts.find((item) => item.type === type)?.value || "";
+  const isoToday = `${pick("year")}-${pick("month")}-${pick("day")}`;
+  const isoTomorrow = addDaysToIsoDate(isoToday, 1);
+  const isoAfterTomorrow = addDaysToIsoDate(isoToday, 2);
+  const weekdayToday = new Intl.DateTimeFormat("pt-BR", {
+    timeZone: "America/Sao_Paulo",
+    weekday: "long",
+  }).format(now);
+
+  return {
+    timeZone: "America/Sao_Paulo",
+    nowIso: now.toISOString(),
+    isoToday,
+    isoTomorrow,
+    isoAfterTomorrow,
+    brToday: isoToBrDate(isoToday),
+    brTomorrow: isoToBrDate(isoTomorrow),
+    brAfterTomorrow: isoToBrDate(isoAfterTomorrow),
+    weekdayToday,
+  };
+}
+
+function normalizeForMatch(value) {
+  return String(value || "")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase();
+}
+
+function detectRelativeDateReference(message, dateContext = getSaoPauloDateContext()) {
+  const normalized = normalizeForMatch(message);
+
+  if (normalized.includes("depois de amanha")) {
+    return {
+      label: "depois de amanha",
+      iso: dateContext.isoAfterTomorrow,
+      br: dateContext.brAfterTomorrow,
+    };
+  }
+
+  if (/\bamanha\b/.test(normalized)) {
+    return {
+      label: "amanha",
+      iso: dateContext.isoTomorrow,
+      br: dateContext.brTomorrow,
+    };
+  }
+
+  if (/\bhoje\b/.test(normalized)) {
+    return {
+      label: "hoje",
+      iso: dateContext.isoToday,
+      br: dateContext.brToday,
+    };
+  }
+
+  return null;
+}
+
+function shouldLookupProfessionalsDirectly(message) {
+  const normalized = normalizeForMatch(message);
+  return (
+    normalized.includes("profissional") ||
+    normalized.includes("profissionais") ||
+    normalized.includes("quem atende") ||
+    normalized.includes("cabeleireira") ||
+    normalized.includes("cabeleireiro")
+  );
+}
+
+const FAQ_TOKEN_STOPWORDS = new Set([
+  "a",
+  "as",
+  "ao",
+  "aos",
+  "de",
+  "da",
+  "das",
+  "do",
+  "dos",
+  "e",
+  "em",
+  "na",
+  "nas",
+  "no",
+  "nos",
+  "o",
+  "os",
+  "ou",
+  "para",
+  "por",
+  "que",
+  "se",
+  "um",
+  "uma",
+  "uns",
+  "umas",
+  "com",
+  "sem",
+  "me",
+  "te",
+  "voces",
+  "voce",
+  "eu",
+]);
+
+const SERVICE_INFERENCE_STOPWORDS = new Set([
+  "agenda",
+  "agendar",
+  "amanha",
+  "atende",
+  "atendem",
+  "cliente",
+  "clientes",
+  "com",
+  "data",
+  "disponibilidade",
+  "disponivel",
+  "fazer",
+  "faz",
+  "fazem",
+  "hoje",
+  "horario",
+  "marcar",
+  "para",
+  "prefiro",
+  "profissional",
+  "profissionais",
+  "qual",
+  "quais",
+  "quero",
+  "servico",
+  "servicos",
+]);
+
+function tokenizeMeaningfulText(value) {
+  return normalizeForMatch(value)
+    .replace(/[^a-z0-9\s]/g, " ")
+    .split(/\s+/)
+    .filter((token) => token && token.length > 2 && !FAQ_TOKEN_STOPWORDS.has(token));
+}
+
+function inferServiceHintFromMessage(message) {
+  const tokens = normalizeForMatch(message)
+    .replace(/[^a-z0-9\s]/g, " ")
+    .split(/\s+/)
+    .filter((token) => token && token.length >= 4 && !SERVICE_INFERENCE_STOPWORDS.has(token));
+
+  if (!tokens.length) {
+    return "";
+  }
+
+  return tokens.join(" ");
+}
+
+function findBestFaqAnswer(knowledge, message) {
+  const faq = Array.isArray(knowledge?.faq) ? knowledge.faq : [];
+  if (!faq.length) {
+    return null;
+  }
+
+  const normalizedMessage = normalizeForMatch(message).trim();
+  if (!normalizedMessage) {
+    return null;
+  }
+
+  const messageTokens = [...new Set(tokenizeMeaningfulText(message))];
+  let best = null;
+
+  for (const item of faq) {
+    const question = toNonEmptyString(item?.question);
+    const answer = toNonEmptyString(item?.answer);
+    if (!question || !answer) {
+      continue;
+    }
+
+    const normalizedQuestion = normalizeForMatch(question).trim();
+    let score = 0;
+
+    if (
+      normalizedQuestion.length >= 8 &&
+      (normalizedQuestion.includes(normalizedMessage) || normalizedMessage.includes(normalizedQuestion))
+    ) {
+      score = 1;
+    } else if (messageTokens.length) {
+      const questionTokens = new Set(tokenizeMeaningfulText(question));
+      if (questionTokens.size) {
+        const overlap = messageTokens.filter((token) => questionTokens.has(token)).length;
+        const coverage = overlap / messageTokens.length;
+        if (overlap >= 2) {
+          score = coverage;
+        }
+      }
+    }
+
+    if (!best || score > best.score) {
+      best = { score, answer };
+    }
+  }
+
+  return best && best.score >= 0.55 ? best.answer : null;
+}
+
+function messageSuggestsSchedulingIntent(message) {
+  const normalized = normalizeForMatch(message);
+  return (
+    normalized.includes("agendar") ||
+    normalized.includes("agendamento") ||
+    normalized.includes("marcar") ||
+    normalized.includes("reserva") ||
+    normalized.includes("horario") ||
+    normalized.includes("disponibilidade")
+  );
+}
+
+function messageSuggestsBookingTimeIntent(message, dateContext = getSaoPauloDateContext()) {
+  const normalized = normalizeForMatch(message);
+  const hasBookingVerb = /(agend|marc|reserv)/.test(normalized);
+  const hasAvailabilityCue = /(tem horario|horario disponivel|qual horario|disponibilid|vaga)/.test(
+    normalized,
+  );
+  const hasClientIntent = /(quero|preciso|gostaria|pode|podemos|consigo)/.test(normalized);
+  const hasDateCue =
+    Boolean(detectRelativeDateReference(message, dateContext)) ||
+    /\b\d{1,2}\/\d{1,2}(?:\/\d{2,4})?\b/.test(normalized) ||
+    /\b\d{1,2}(?::\d{2})?\s*h\b/.test(normalized) ||
+    /\b\d{1,2}:\d{2}\b/.test(normalized) ||
+    /\b(seg|ter|qua|qui|sex|sab|dom)(unda|ca|rta|nta|ta|ado|ingo)?\b/.test(normalized);
+  const isBusinessHoursQuestion =
+    normalized.includes("horario de funcionamento") ||
+    normalized.includes("que horas abre") ||
+    normalized.includes("que horas fecha") ||
+    normalized.includes("abre que horas") ||
+    normalized.includes("fecha que horas");
+
+  if (isBusinessHoursQuestion) {
+    return false;
+  }
+
+  return (hasBookingVerb && (hasClientIntent || hasDateCue)) || (hasAvailabilityCue && hasDateCue);
+}
+
+function historyAlreadyAskedProfessionalPreference(history) {
+  if (!Array.isArray(history)) {
+    return false;
+  }
+
+  return history.some((item) => {
+    if (!item || item.role !== "assistant") {
+      return false;
+    }
+
+    const text = normalizeForMatch(item.content);
+    return text.includes("preferencia") && text.includes("profissional");
+  });
+}
+
+function buildConversationPrompt(history, message, knowledge, customerContext = null) {
+  const dateContext = getSaoPauloDateContext();
+  const relativeDate = detectRelativeDateReference(message, dateContext);
+  const knownClientName = toNonEmptyString(customerContext?.name);
+  const knownClientPhone = normalizePhone(customerContext?.phone || "");
   const transcript = Array.isArray(history)
     ? history
         .filter((item) => item && item.role && item.content)
@@ -474,6 +1278,27 @@ function buildConversationPrompt(history, message, knowledge) {
     transcript || "Sem historico anterior.",
     "",
     formatKnowledgeForPrompt(knowledge),
+    "",
+    "Contexto temporal oficial (usar como verdade):",
+    `- Fuso horario: ${dateContext.timeZone}`,
+    `- Agora (ISO): ${dateContext.nowIso}`,
+    `- Hoje: ${dateContext.isoToday} (${dateContext.brToday}, ${dateContext.weekdayToday})`,
+    `- Amanha: ${dateContext.isoTomorrow} (${dateContext.brTomorrow})`,
+    `- Depois de amanha: ${dateContext.isoAfterTomorrow} (${dateContext.brAfterTomorrow})`,
+    relativeDate
+      ? `- Data absoluta para "${relativeDate.label}": ${relativeDate.iso} (${relativeDate.br})`
+      : "- Data absoluta para termos relativos: nao aplicavel na mensagem atual.",
+    "- Regra: interpretar 'hoje/amanha/depois de amanha' exclusivamente com base neste contexto.",
+    knownClientName
+      ? `- Cliente identificada na base Trinks: ${knownClientName}.`
+      : "- Cliente identificada na base Trinks: nao identificada.",
+    knownClientPhone
+      ? `- Telefone da cliente (WhatsApp): ${knownClientPhone}.`
+      : "- Telefone da cliente (WhatsApp): nao informado.",
+    "- Regra: pergunte sobre preferencia de profissional somente quando a cliente estiver tentando agendar horario.",
+    "- Regra: antes de efetivar qualquer agendamento, sempre apresente resumo completo e aguarde confirmacao explicita da cliente.",
+    "- Regra: para desmarcacao, prefira solicitar codigo TRK; se nao houver codigo e houver telefone de cliente identificada, tente localizar e continuar com seguranca.",
+    "- Regra: antes de responder perguntas comerciais, valide primeiro a FAQ da base de conhecimento.",
     "",
     `Mensagem mais recente da cliente: ${message}`,
     "",
@@ -524,18 +1349,65 @@ async function trinksRequest(path, { method = "GET", estabelecimentoId, body, qu
   return json;
 }
 
-async function evolutionRequest(path, { method = "POST", body } = {}) {
-  const baseUrl = ensureEnv("EVOLUTION_API_BASE_URL").replace(/\/$/, "");
-  const apiKey = ensureEnv("EVOLUTION_API_KEY");
+function resolveEvolutionBaseUrl() {
+  const baseUrl = firstNonEmpty([
+    process.env.EVOLUTION_API_BASE_URL,
+    process.env.EVOLUTION_URL,
+    process.env._EVOLUTION_URL,
+  ]);
 
-  const response = await fetch(`${baseUrl}${path}`, {
-    method,
-    headers: {
-      "Content-Type": "application/json",
-      apikey: apiKey,
-    },
-    body: body ? JSON.stringify(body) : undefined,
-  });
+  if (!baseUrl) {
+    throw new Error(
+      "Variavel obrigatoria ausente: EVOLUTION_API_BASE_URL (ou EVOLUTION_URL/_EVOLUTION_URL).",
+    );
+  }
+
+  return String(baseUrl).replace(/\/$/, "");
+}
+
+function resolveEvolutionTimeoutMs() {
+  const raw = Number(process.env.EVOLUTION_TIMEOUT_MS || 8000);
+  if (!Number.isFinite(raw) || raw < 1000) {
+    return 8000;
+  }
+  return Math.floor(raw);
+}
+
+async function evolutionRequest(path, { method = "POST", body } = {}) {
+  const baseUrl = resolveEvolutionBaseUrl();
+  const apiKey = ensureEnv("EVOLUTION_API_KEY");
+  const timeoutMs = resolveEvolutionTimeoutMs();
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+
+  let response;
+  try {
+    response = await fetch(`${baseUrl}${path}`, {
+      method,
+      headers: {
+        "Content-Type": "application/json",
+        apikey: apiKey,
+      },
+      body: body ? JSON.stringify(body) : undefined,
+      signal: controller.signal,
+    });
+  } catch (error) {
+    const isTimeout = error?.name === "AbortError";
+    const failure = new Error(
+      isTimeout
+        ? `Evolution: timeout apos ${timeoutMs}ms em ${path}`
+        : `Evolution: falha de conexao em ${path}`,
+    );
+    failure.status = isTimeout ? 504 : 502;
+    failure.details = {
+      path,
+      timeoutMs,
+      reason: error?.message || "Erro de rede",
+    };
+    throw failure;
+  } finally {
+    clearTimeout(timeout);
+  }
 
   const text = await response.text();
   const json = text ? safeJsonParse(text) : null;
@@ -727,11 +1599,31 @@ async function fetchEvolutionQr(instanceName) {
 
 function extractIncomingWhatsapp(body) {
   const data = body?.data && typeof body.data === "object" ? body.data : body;
-  const key = data?.key && typeof data.key === "object" ? data.key : body?.key || {};
-  const message = data?.message && typeof data.message === "object" ? data.message : body?.message || {};
+  const firstMessage =
+    (Array.isArray(data?.messages) ? data.messages.find((item) => item && typeof item === "object") : null) ||
+    (Array.isArray(body?.messages) ? body.messages.find((item) => item && typeof item === "object") : null) ||
+    (Array.isArray(data?.data?.messages)
+      ? data.data.messages.find((item) => item && typeof item === "object")
+      : null);
+
+  const key = (data?.key && typeof data.key === "object" ? data.key : null) || firstMessage?.key || body?.key || {};
+  const message =
+    (data?.message && typeof data.message === "object" ? data.message : null) ||
+    firstMessage?.message ||
+    body?.message ||
+    {};
+
+  const nestedMessage =
+    message?.ephemeralMessage?.message ||
+    message?.viewOnceMessage?.message ||
+    message?.viewOnceMessageV2?.message ||
+    message?.viewOnceMessageV2Extension?.message ||
+    {};
 
   const senderRaw = firstNonEmpty([
     key?.remoteJid,
+    firstMessage?.key?.remoteJid,
+    firstMessage?.remoteJid,
     data?.sender,
     data?.from,
     body?.sender,
@@ -744,8 +1636,23 @@ function extractIncomingWhatsapp(body) {
     message?.imageMessage?.caption,
     message?.videoMessage?.caption,
     message?.documentMessage?.caption,
+    message?.buttonsResponseMessage?.selectedDisplayText,
+    message?.listResponseMessage?.title,
+    message?.templateButtonReplyMessage?.selectedDisplayText,
+    nestedMessage?.conversation,
+    nestedMessage?.extendedTextMessage?.text,
+    message?.imageMessage?.caption,
+    message?.videoMessage?.caption,
+    message?.documentMessage?.caption,
+    nestedMessage?.imageMessage?.caption,
+    nestedMessage?.videoMessage?.caption,
+    nestedMessage?.documentMessage?.caption,
+    firstMessage?.message?.conversation,
+    firstMessage?.message?.extendedTextMessage?.text,
     data?.text,
     data?.body,
+    firstMessage?.text,
+    firstMessage?.body,
     body?.text,
     body?.body,
   ]);
@@ -903,21 +1810,122 @@ function safeJsonParse(value) {
   }
 }
 
+function scoreServiceMatch(serviceName, candidate) {
+  const target = normalizeForMatch(serviceName).trim();
+  const candidateName = normalizeForMatch(candidate?.nome).trim();
+  if (!target || !candidateName) {
+    return 0;
+  }
+
+  if (target === candidateName) {
+    return 1;
+  }
+
+  if (candidateName.includes(target) || target.includes(candidateName)) {
+    return 0.92;
+  }
+
+  const targetTokens = tokenizeMeaningfulText(target);
+  const candidateTokens = tokenizeMeaningfulText(candidateName);
+  if (!targetTokens.length || !candidateTokens.length) {
+    return 0;
+  }
+
+  const candidateSet = new Set(candidateTokens);
+  const overlap = targetTokens.filter((token) => candidateSet.has(token)).length;
+  const coverage = overlap / targetTokens.length;
+  const precision = overlap / candidateTokens.length;
+  const combined = (coverage * 0.7) + (precision * 0.3);
+
+  if (overlap >= 2) {
+    return combined;
+  }
+
+  return 0;
+}
+
+function findBestServiceMatch(serviceName, services) {
+  let best = null;
+  for (const service of services) {
+    const score = scoreServiceMatch(serviceName, service);
+    if (!best || score > best.score) {
+      best = { score, service };
+    }
+  }
+
+  if (!best || best.score < 0.55) {
+    return null;
+  }
+
+  return best.service;
+}
+
 async function findServiceByName(estabelecimentoId, serviceName) {
-  const payload = await trinksRequest("/servicos", {
+  const normalizedInput = toNonEmptyString(serviceName);
+  if (!normalizedInput) {
+    return null;
+  }
+
+  const directPayload = await trinksRequest("/servicos", {
     method: "GET",
     estabelecimentoId,
     query: {
-      nome: serviceName,
+      nome: normalizedInput,
       page: 1,
-      pageSize: 50,
+      pageSize: 100,
     },
   });
 
-  const items = extractItems(payload);
-  const normalized = String(serviceName).toLowerCase().trim();
-  const exact = items.find((item) => String(item?.nome || "").toLowerCase().trim() === normalized);
-  return exact || items[0] || null;
+  const directItems = extractItems(directPayload);
+  const directMatch = findBestServiceMatch(normalizedInput, directItems);
+  if (directMatch) {
+    return directMatch;
+  }
+
+  // Segunda tentativa: busca por termos importantes da frase (ex.: "pedicure").
+  const tokenQueries = [...new Set(tokenizeMeaningfulText(normalizedInput).filter((token) => token.length >= 4))].slice(
+    0,
+    6,
+  );
+
+  for (const token of tokenQueries) {
+    const tokenPayload = await trinksRequest("/servicos", {
+      method: "GET",
+      estabelecimentoId,
+      query: {
+        nome: token,
+        page: 1,
+        pageSize: 100,
+      },
+    });
+
+    const tokenItems = extractItems(tokenPayload);
+    const tokenMatch = findBestServiceMatch(normalizedInput, tokenItems);
+    if (tokenMatch) {
+      return tokenMatch;
+    }
+  }
+
+  // Fallback: varre algumas paginas para cobrir nomes com acento/variacoes.
+  const fallbackItems = [];
+  const maxPages = 6;
+  for (let page = 1; page <= maxPages; page += 1) {
+    const payload = await trinksRequest("/servicos", {
+      method: "GET",
+      estabelecimentoId,
+      query: {
+        page,
+        pageSize: 100,
+      },
+    });
+    const items = extractItems(payload);
+    fallbackItems.push(...items);
+    if (items.length < 100) {
+      break;
+    }
+  }
+
+  return findBestServiceMatch(normalizedInput, fallbackItems);
 }
 
 function collectProfessionalsFromPayload(payload) {
@@ -951,6 +1959,253 @@ function collectProfessionalsFromPayload(payload) {
   return result;
 }
 
+function normalizeTimeValue(value) {
+  const raw = toNonEmptyString(value).replace(/\./g, ":").toLowerCase();
+  if (!raw) {
+    return "";
+  }
+
+  let match = raw.match(/^(\d{1,2}):(\d{2})$/);
+  if (!match) {
+    match = raw.match(/^(\d{1,2})h(?:\s*(\d{2}))?$/);
+  }
+  if (!match) {
+    match = raw.match(/^(\d{1,2})$/);
+  }
+  if (!match) {
+    return "";
+  }
+
+  const hours = Number(match[1]);
+  const minutes = Number(match[2] || "00");
+  if (!Number.isInteger(hours) || !Number.isInteger(minutes) || hours < 0 || hours > 23 || minutes < 0 || minutes > 59) {
+    return "";
+  }
+
+  return `${String(hours).padStart(2, "0")}:${String(minutes).padStart(2, "0")}`;
+}
+
+function parseTimeToMinutes(value) {
+  const normalized = normalizeTimeValue(value);
+  if (!normalized) {
+    return null;
+  }
+  const [hours, minutes] = normalized.split(":").map((part) => Number(part));
+  return hours * 60 + minutes;
+}
+
+function uniqueSortedTimes(values) {
+  const set = new Set(
+    (Array.isArray(values) ? values : [])
+      .map((item) => normalizeTimeValue(item))
+      .filter(Boolean),
+  );
+
+  return [...set].sort((a, b) => parseTimeToMinutes(a) - parseTimeToMinutes(b));
+}
+
+function extractAvailableTimesFromProfessional(item) {
+  const candidates = [
+    item?.horariosVagos,
+    item?.horariosDisponiveis,
+    item?.horariosLivres,
+    item?.availableTimes,
+  ];
+
+  for (const list of candidates) {
+    if (Array.isArray(list) && list.length) {
+      return uniqueSortedTimes(list);
+    }
+  }
+
+  return [];
+}
+
+function extractAvailableIntervalsFromProfessional(item) {
+  const candidates = [
+    item?.intervalosVagos,
+    item?.intervalosDisponiveis,
+    item?.intervalosLivres,
+    item?.availableIntervals,
+  ];
+
+  for (const list of candidates) {
+    if (!Array.isArray(list) || !list.length) {
+      continue;
+    }
+
+    const normalized = list
+      .map((interval) => {
+        const start = normalizeTimeValue(interval?.inicio || interval?.start);
+        const end = normalizeTimeValue(interval?.fim || interval?.end);
+        if (!start || !end) {
+          return null;
+        }
+        return { inicio: start, fim: end };
+      })
+      .filter(Boolean);
+
+    if (normalized.length) {
+      const unique = new Map();
+      for (const interval of normalized) {
+        unique.set(`${interval.inicio}|${interval.fim}`, interval);
+      }
+      return [...unique.values()].sort((a, b) => parseTimeToMinutes(a.inicio) - parseTimeToMinutes(b.inicio));
+    }
+  }
+
+  return [];
+}
+
+function isSlotCompatibleWithIntervals(startTime, durationMinutes, intervals) {
+  const start = parseTimeToMinutes(startTime);
+  if (!Number.isFinite(start)) {
+    return false;
+  }
+
+  const duration = Number(durationMinutes);
+  const safeDuration = Number.isFinite(duration) && duration > 0 ? duration : 0;
+  const end = start + safeDuration;
+  const availableIntervals = Array.isArray(intervals) ? intervals : [];
+
+  if (!availableIntervals.length) {
+    return true;
+  }
+
+  return availableIntervals.some((interval) => {
+    const intervalStart = parseTimeToMinutes(interval?.inicio);
+    const intervalEnd = parseTimeToMinutes(interval?.fim);
+    if (!Number.isFinite(intervalStart) || !Number.isFinite(intervalEnd)) {
+      return false;
+    }
+    return start >= intervalStart && end <= intervalEnd;
+  });
+}
+
+function rankTimesByPreferredTime(times, preferredTime) {
+  const normalizedPreferred = normalizeTimeValue(preferredTime);
+  const preferredMinutes = parseTimeToMinutes(normalizedPreferred);
+  const normalizedTimes = uniqueSortedTimes(times);
+
+  if (!Number.isFinite(preferredMinutes)) {
+    return normalizedTimes;
+  }
+
+  return [...normalizedTimes].sort((left, right) => {
+    const leftMinutes = parseTimeToMinutes(left);
+    const rightMinutes = parseTimeToMinutes(right);
+    const leftDiff = Math.abs(leftMinutes - preferredMinutes);
+    const rightDiff = Math.abs(rightMinutes - preferredMinutes);
+    if (leftDiff !== rightDiff) {
+      return leftDiff - rightDiff;
+    }
+    return leftMinutes - rightMinutes;
+  });
+}
+
+function extractPreferredTimeFromMessage(message) {
+  const normalized = normalizeForMatch(message);
+  if (!normalized) {
+    return "";
+  }
+
+  const patterns = [
+    /(?:as|a|às)\s*(\d{1,2})(?::(\d{2}))?/i,
+    /\b(\d{1,2})h(?:\s*(\d{2}))?\b/i,
+    /\b(\d{1,2}):(\d{2})\b/,
+  ];
+
+  for (const pattern of patterns) {
+    const match = normalized.match(pattern);
+    if (!match) {
+      continue;
+    }
+    const candidate = `${match[1]}:${match[2] || "00"}`;
+    const normalizedTime = normalizeTimeValue(candidate);
+    if (normalizedTime) {
+      return normalizedTime;
+    }
+  }
+
+  return "";
+}
+
+function findProfessionalByName(professionals, professionalName) {
+  const normalized = normalizeForMatch(professionalName).trim();
+  if (!normalized) {
+    return null;
+  }
+
+  const normalizeName = (item) => normalizeForMatch(item?.name || "").trim();
+  const firstName = (item) => normalizeForMatch(item?.name || "").split(/\s+/).filter(Boolean)[0] || "";
+  const rank = (items) =>
+    [...items].sort((left, right) => {
+      const leftSlots = Array.isArray(left?.availableTimes) ? left.availableTimes.length : 0;
+      const rightSlots = Array.isArray(right?.availableTimes) ? right.availableTimes.length : 0;
+      return rightSlots - leftSlots;
+    });
+
+  const exactMatches = rank(professionals.filter((item) => normalizeName(item) === normalized));
+  if (exactMatches.length) {
+    return exactMatches[0];
+  }
+
+  const firstNameMatches = rank(professionals.filter((item) => firstName(item) === normalized));
+  if (firstNameMatches.length) {
+    return firstNameMatches[0];
+  }
+
+  const partialMatches = rank(professionals.filter((item) => normalizeName(item).includes(normalized)));
+  if (partialMatches.length) {
+    return partialMatches[0];
+  }
+
+  return null;
+}
+
+function buildGlobalSuggestedSlots(professionals, preferredTime, maxSuggestions = 8) {
+  const candidates = [];
+  for (const professional of professionals) {
+    const displayName = professionalDisplayName(professional.name);
+    const ranked = rankTimesByPreferredTime(professional.availableTimes, preferredTime);
+    for (const time of ranked) {
+      candidates.push({
+        time,
+        professionalName: displayName || professional.name,
+        distance: Math.abs((parseTimeToMinutes(time) || 0) - (parseTimeToMinutes(preferredTime) || 0)),
+      });
+    }
+  }
+
+  candidates.sort((left, right) => {
+    if (normalizeTimeValue(preferredTime)) {
+      if (left.distance !== right.distance) {
+        return left.distance - right.distance;
+      }
+    }
+    const leftMinutes = parseTimeToMinutes(left.time) || 0;
+    const rightMinutes = parseTimeToMinutes(right.time) || 0;
+    if (leftMinutes !== rightMinutes) {
+      return leftMinutes - rightMinutes;
+    }
+    return left.professionalName.localeCompare(right.professionalName, "pt-BR");
+  });
+
+  const grouped = new Map();
+  for (const item of candidates) {
+    const entry = grouped.get(item.time) || { time: item.time, professionals: [] };
+    if (!entry.professionals.includes(item.professionalName)) {
+      entry.professionals.push(item.professionalName);
+    }
+    grouped.set(item.time, entry);
+    if (grouped.size >= maxSuggestions) {
+      break;
+    }
+  }
+
+  return [...grouped.values()];
+}
+
 function formatTimeFromDateTime(value) {
   const text = toNonEmptyString(value);
   if (!text) {
@@ -963,6 +2218,24 @@ function formatTimeFromDateTime(value) {
   }
 
   return split.slice(0, 5);
+}
+
+function formatDateFromDateTime(value) {
+  const text = toNonEmptyString(value);
+  if (!text) {
+    return "";
+  }
+
+  if (text.includes("T")) {
+    return text.slice(0, 10);
+  }
+
+  const firstToken = text.split(" ")[0];
+  if (/^\d{4}-\d{2}-\d{2}$/.test(firstToken)) {
+    return firstToken;
+  }
+
+  return "";
 }
 
 function extractServiceNames(item) {
@@ -1003,6 +2276,7 @@ function normalizeAppointmentItem(item) {
   return {
     id: item?.id ?? item?.agendamentoId ?? null,
     dateTime: start || null,
+    date: formatDateFromDateTime(start) || null,
     time: time || null,
     professional: professional || null,
     client: client || null,
@@ -1069,7 +2343,52 @@ async function getProfessionals({ establishmentId, date, serviceId }) {
     },
   });
 
-  return collectProfessionalsFromPayload(payload);
+  const items = extractItems(payload);
+  if (!items.length) {
+    return collectProfessionalsFromPayload(payload).map((item) => ({
+      ...item,
+      availableTimes: [],
+      availableIntervals: [],
+      raw: null,
+    }));
+  }
+
+  const aggregated = new Map();
+  for (const item of items) {
+    const id = Number(professionalIdFrom(item));
+    const name = toNonEmptyString(professionalNameFrom(item));
+    if (!id || !name) {
+      continue;
+    }
+
+    const key = `${id}:${normalizeForMatch(name)}`;
+    const previous = aggregated.get(key) || {
+      id,
+      name,
+      availableTimes: [],
+      availableIntervals: [],
+      raw: item,
+    };
+
+    previous.availableTimes = uniqueSortedTimes([
+      ...previous.availableTimes,
+      ...extractAvailableTimesFromProfessional(item),
+    ]);
+
+    const intervalMap = new Map();
+    for (const interval of [...previous.availableIntervals, ...extractAvailableIntervalsFromProfessional(item)]) {
+      intervalMap.set(`${interval.inicio}|${interval.fim}`, interval);
+    }
+    previous.availableIntervals = [...intervalMap.values()].sort(
+      (left, right) => parseTimeToMinutes(left.inicio) - parseTimeToMinutes(right.inicio),
+    );
+
+    aggregated.set(key, previous);
+  }
+
+  return [...aggregated.values()].sort((left, right) =>
+    left.name.localeCompare(right.name, "pt-BR"),
+  );
 }
 
 async function findProfessionalForBooking({ establishmentId, date, professionalName, serviceId }) {
@@ -1081,18 +2400,13 @@ async function findProfessionalForBooking({ establishmentId, date, professionalN
   }
 
   if (!professionalName) {
-    return professionals[0];
+    const withOpenSchedule = professionals.filter((item) => item.availableTimes.length > 0);
+    return withOpenSchedule[0] || professionals[0];
   }
 
-  const normalized = String(professionalName).toLowerCase().trim();
-  const exact = professionals.find((item) => item.name.toLowerCase().trim() === normalized);
-  if (exact) {
-    return exact;
-  }
-
-  const partial = professionals.find((item) => item.name.toLowerCase().includes(normalized));
-  if (partial) {
-    return partial;
+  const matched = findProfessionalByName(professionals, professionalName);
+  if (matched) {
+    return matched;
   }
 
   const error = new Error(`Profissional nao encontrada para: ${professionalName}`);
@@ -1150,54 +2464,256 @@ async function findOrCreateClient(estabelecimentoId, clientName, clientPhone) {
   return created;
 }
 
-async function getAvailability(establishmentId, service, date) {
+async function getAvailability(
+  establishmentId,
+  service,
+  date,
+  { professionalName = "", preferredTime = "" } = {},
+) {
   const foundService = await findServiceByName(establishmentId, service);
   if (!foundService) {
     return {
       availableTimes: [],
-      occupiedTimes: [],
+      professionals: [],
+      suggestions: [],
       message: `Servico nao encontrado para: ${service}`,
     };
   }
 
-  let availableTimes = [];
+  const serviceId = Number(serviceIdFrom(foundService));
+  const duration = Number(
+    foundService?.duracaoEmMinutos || foundService?.duracao || foundService?.duracaoMinutos || 60,
+  );
+  const durationMinutes = Number.isFinite(duration) ? duration : 60;
 
-  try {
-    const professionalsPayload = await trinksRequest(`/agendamentos/profissionais/${date}`, {
-      method: "GET",
-      estabelecimentoId: establishmentId,
-    });
+  const professionals = await getProfessionals({
+    establishmentId,
+    date,
+    serviceId: Number.isFinite(serviceId) ? serviceId : undefined,
+  });
 
-    const all = JSON.stringify(professionalsPayload);
-    const matches = all.match(/\b([01]\d|2[0-3]):[0-5]\d\b/g) || [];
-    availableTimes = [...new Set(matches)].sort();
-  } catch {
-    // If the date/professional endpoint is unavailable for this account, keep fallback below.
-  }
+  const requestedProfessional = toNonEmptyString(professionalName);
+  const normalizedPreferredTime = normalizeTimeValue(preferredTime);
 
-  if (!availableTimes.length) {
-    availableTimes = ["09:00", "10:00", "11:00", "14:00", "15:00", "16:00"];
-  }
+  const byProfessional = professionals.map((professional) => {
+    const compatibleTimes = uniqueSortedTimes(
+      professional.availableTimes.filter((time) =>
+        isSlotCompatibleWithIntervals(time, durationMinutes, professional.availableIntervals),
+      ),
+    );
+    return {
+      id: professional.id,
+      name: professional.name,
+      availableTimes: compatibleTimes,
+      availableIntervals: professional.availableIntervals,
+    };
+  });
 
-  let occupiedTimes = [];
-  try {
-    const response = await getAppointmentsForDate(establishmentId, date);
-    const normalized = response.items.map(normalizeAppointmentItem).filter(Boolean);
-    const times = normalized.map((item) => item.time).filter(Boolean);
-    occupiedTimes = [...new Set(times)].sort();
-    if (occupiedTimes.length) {
-      const occupiedSet = new Set(occupiedTimes);
-      availableTimes = availableTimes.filter((time) => !occupiedSet.has(time));
+  let scopedProfessionals = byProfessional.filter(professionalHasOpenSchedule);
+  if (requestedProfessional) {
+    const matched = findProfessionalByName(byProfessional, requestedProfessional);
+    if (!matched) {
+      const error = new Error(`Profissional nao encontrada para: ${requestedProfessional}`);
+      error.status = 404;
+      error.details = {
+        requestedProfessional,
+        availableProfessionals: byProfessional.map((item) => item.name),
+      };
+      throw error;
     }
-  } catch {
-    // If appointments query fails, keep availability as-is.
+    if (!professionalHasOpenSchedule(matched)) {
+      const error = new Error(
+        `${professionalDisplayName(matched.name)} nao possui agenda aberta para este servico nesta data.`,
+      );
+      error.status = 409;
+      error.details = {
+        requestedProfessional: professionalDisplayName(matched.name),
+        requestedDate: date,
+      };
+      throw error;
+    }
+    scopedProfessionals = [matched];
+  }
+
+  const flattenedTimes = uniqueSortedTimes(scopedProfessionals.flatMap((item) => item.availableTimes));
+  const scopedWithNearest = scopedProfessionals.map((item) => ({
+    ...item,
+    nearestTimes: rankTimesByPreferredTime(item.availableTimes, normalizedPreferredTime).slice(0, 8),
+  }));
+  const suggestions = buildGlobalSuggestedSlots(scopedWithNearest, normalizedPreferredTime, 12);
+
+  const responseProfessionals = scopedWithNearest.map((item) => ({
+    id: item.id,
+    name: professionalDisplayName(item.name),
+    availableTimes: item.availableTimes,
+    availableIntervals: item.availableIntervals,
+    nearestTimes: item.nearestTimes,
+  }));
+
+  return {
+    serviceId: Number.isFinite(serviceId) ? serviceId : null,
+    durationMinutes,
+    availableTimes: flattenedTimes,
+    occupiedTimes: [],
+    professionals: responseProfessionals,
+    suggestions,
+    requestedProfessional: requestedProfessional ? professionalDisplayName(requestedProfessional) : null,
+    preferredTime: normalizedPreferredTime || null,
+    message: `Horarios consultados para ${service} em ${date}`,
+  };
+}
+
+async function upsertAppointmentConfirmationNote({ establishmentId, appointmentId, confirmationCode }) {
+  if (!appointmentId || !confirmationCode) {
+    return { updated: false, reason: "missingData" };
+  }
+
+  const note = `Codigo de confirmacao: ${confirmationCode} | Origem: IA.AGENDAMENTO`;
+  const attempts = [
+    { method: "PATCH", body: { observacoesDoEstabelecimento: note } },
+    { method: "PATCH", body: { observacoes: note } },
+    { method: "PUT", body: { observacoesDoEstabelecimento: note } },
+    { method: "PUT", body: { observacoes: note } },
+  ];
+
+  const errors = [];
+  for (const attempt of attempts) {
+    try {
+      const response = await trinksRequest(`/agendamentos/${appointmentId}`, {
+        method: attempt.method,
+        estabelecimentoId: establishmentId,
+        body: attempt.body,
+      });
+      return { updated: true, note, method: attempt.method, body: attempt.body, response };
+    } catch (error) {
+      errors.push({
+        method: attempt.method,
+        body: attempt.body,
+        message: error.message || "Erro desconhecido",
+      });
+    }
   }
 
   return {
-    availableTimes,
-    occupiedTimes,
-    serviceId: serviceIdFrom(foundService),
-    message: `Horarios consultados para ${service} em ${date}`,
+    updated: false,
+    note,
+    errors,
+  };
+}
+
+async function resolveBookingPreviewItem({
+  establishmentId,
+  service,
+  date,
+  time,
+  professionalName,
+}) {
+  const normalizedService = toNonEmptyString(service);
+  const normalizedDate = normalizeBookingDate(date);
+  const normalizedTime = normalizeBookingTime(time);
+  const requestedProfessional = toNonEmptyString(professionalName);
+
+  if (!normalizedService || !normalizedDate || !normalizedTime) {
+    const error = new Error("Cada item do agendamento precisa de servico, data e horario validos.");
+    error.status = 400;
+    throw error;
+  }
+
+  const availability = await getAvailability(
+    establishmentId,
+    normalizedService,
+    normalizedDate,
+    {
+      professionalName: requestedProfessional,
+      preferredTime: normalizedTime,
+    },
+  );
+
+  const professionals = Array.isArray(availability?.professionals) ? availability.professionals : [];
+  if (!professionals.length) {
+    const error = new Error(
+      `Nao encontrei profissionais com agenda aberta para ${normalizedService} em ${normalizedDate}.`,
+    );
+    error.status = 409;
+    throw error;
+  }
+
+  let selected = null;
+  if (requestedProfessional) {
+    selected = professionals.find(
+      (item) => normalizeForMatch(item.name) === normalizeForMatch(professionalDisplayName(requestedProfessional)),
+    );
+    if (!selected) {
+      const error = new Error(`Profissional nao encontrada para: ${requestedProfessional}.`);
+      error.status = 404;
+      throw error;
+    }
+  } else {
+    selected = professionals.find((item) => Array.isArray(item.availableTimes) && item.availableTimes.includes(normalizedTime));
+    if (!selected) {
+      selected = professionals[0] || null;
+    }
+  }
+
+  if (!selected || !Array.isArray(selected.availableTimes) || !selected.availableTimes.includes(normalizedTime)) {
+    const nearest = Array.isArray(selected?.nearestTimes) ? selected.nearestTimes.slice(0, 5) : [];
+    const display = professionalDisplayName(selected?.name || requestedProfessional || "");
+    const error = new Error(
+      nearest.length
+        ? `${display} nao possui agenda livre as ${normalizedTime}. Horarios proximos: ${nearest.join(", ")}.`
+        : `Nao encontrei agenda livre as ${normalizedTime} para ${normalizedService}.`,
+    );
+    error.status = 409;
+    error.details = {
+      service: normalizedService,
+      date: normalizedDate,
+      time: normalizedTime,
+      professionalName: display || null,
+      nearestTimes: nearest,
+      suggestions: availability?.suggestions || [],
+    };
+    throw error;
+  }
+
+  return {
+    service: normalizedService,
+    date: normalizedDate,
+    time: normalizedTime,
+    professionalName: professionalDisplayName(selected.name),
+  };
+}
+
+async function executeConfirmedBookings({ establishmentId, clientName, clientPhone, items }) {
+  const successes = [];
+  const failures = [];
+
+  for (const item of items) {
+    try {
+      const created = await createAppointment({
+        establishmentId,
+        service: item.service,
+        date: item.date,
+        time: item.time,
+        professionalName: item.professionalName,
+        clientName,
+        clientPhone,
+      });
+
+      successes.push({
+        ...item,
+        confirmationCode: created?.confirmationCode || "",
+      });
+    } catch (error) {
+      failures.push({
+        ...item,
+        message: error?.message || "Erro ao criar agendamento.",
+      });
+    }
+  }
+
+  return {
+    successes,
+    failures,
   };
 }
 
@@ -1210,84 +2726,195 @@ async function createAppointment({
   clientName,
   clientPhone,
 }) {
-  const foundService = await findServiceByName(establishmentId, service);
-  if (!foundService) {
-    const error = new Error(`Servico nao encontrado para: ${service}`);
-    error.status = 404;
-    throw error;
-  }
+  const normalizedClientPhone = normalizePhone(clientPhone);
+  const normalizedClientName = toNonEmptyString(clientName);
+  const normalizedRequestedProfessional = toNonEmptyString(professionalName);
+  const requestedTime = normalizeTimeValue(time);
+  let payload = null;
+  let resolvedProfessionalDisplay = "";
 
-  const serviceId = serviceIdFrom(foundService);
-  if (!serviceId) {
-    const error = new Error("Servico sem ID valido no retorno da API Trinks.");
-    error.status = 422;
-    throw error;
-  }
-
-  const client = await findOrCreateClient(establishmentId, clientName, clientPhone);
-  const clientId = clientIdFrom(client);
-
-  const professional = await findProfessionalForBooking({
-    establishmentId,
-    date,
-    professionalName,
-    serviceId,
-  });
-
-  if (!clientId) {
-    const error = new Error("Cliente sem ID valido no retorno da API Trinks.");
-    error.status = 422;
-    throw error;
-  }
-
-  const duration = Number(
-    foundService?.duracaoEmMinutos || foundService?.duracao || foundService?.duracaoMinutos || 60,
-  );
-  const amount = Number(foundService?.valor || foundService?.preco || 0);
-
-  const payload = {
-    servicoId: Number(serviceId),
-    clienteId: Number(clientId),
-    profissionalId: Number(professional.id),
-    dataHoraInicio: toIsoDateTime(date, time),
-    duracaoEmMinutos: Number.isFinite(duration) ? duration : 60,
-    valor: Number.isFinite(amount) ? amount : 0,
-    observacoes: "Agendamento criado via IA.AGENDAMENTO",
-    confirmado: true,
-  };
-
-  let created;
   try {
-    created = await trinksRequest("/agendamentos", {
+    const foundService = await findServiceByName(establishmentId, service);
+    if (!foundService) {
+      const error = new Error(`Servico nao encontrado para: ${service}`);
+      error.status = 404;
+      throw error;
+    }
+
+    if (!requestedTime) {
+      const error = new Error(`Horario invalido: ${time}. Use o formato HH:mm.`);
+      error.status = 400;
+      throw error;
+    }
+
+    const serviceId = serviceIdFrom(foundService);
+    if (!serviceId) {
+      const error = new Error("Servico sem ID valido no retorno da API Trinks.");
+      error.status = 422;
+      throw error;
+    }
+
+    const duration = Number(
+      foundService?.duracaoEmMinutos || foundService?.duracao || foundService?.duracaoMinutos || 60,
+    );
+    const amount = Number(foundService?.valor || foundService?.preco || 0);
+    const durationMinutes = Number.isFinite(duration) ? duration : 60;
+
+    const professionals = await getProfessionals({
+      establishmentId,
+      date,
+      serviceId: Number(serviceId),
+    });
+
+    if (!professionals.length) {
+      const error = new Error("Nao ha profissionais com agenda aberta para este servico nesta data.");
+      error.status = 422;
+      throw error;
+    }
+
+    const normalizedProfessionals = professionals.map((item) => ({
+      id: item.id,
+      name: item.name,
+      availableTimes: uniqueSortedTimes(
+        item.availableTimes.filter((slot) =>
+          isSlotCompatibleWithIntervals(slot, durationMinutes, item.availableIntervals),
+        ),
+      ),
+      availableIntervals: item.availableIntervals,
+    }));
+
+    let professional = null;
+    if (normalizedRequestedProfessional) {
+      professional = findProfessionalByName(normalizedProfessionals, normalizedRequestedProfessional);
+      if (!professional) {
+        const error = new Error(`Profissional nao encontrada para: ${normalizedRequestedProfessional}`);
+        error.status = 404;
+        error.details = {
+          requestedProfessional: normalizedRequestedProfessional,
+          availableProfessionals: normalizedProfessionals.map((item) => item.name),
+        };
+        throw error;
+      }
+
+      if (!professional.availableTimes.includes(requestedTime)) {
+        const nearestTimes = rankTimesByPreferredTime(professional.availableTimes, requestedTime).slice(0, 6);
+        const displayName = professionalDisplayName(professional.name);
+        const error = new Error(
+          nearestTimes.length
+            ? `${displayName} nao possui agenda livre as ${requestedTime}. Horarios proximos: ${nearestTimes.join(", ")}.`
+            : `${displayName} nao possui agenda livre na data informada para este servico.`,
+        );
+        error.status = 409;
+        error.details = {
+          requestedProfessional: displayName,
+          requestedTime,
+          nearestTimes,
+        };
+        throw error;
+      }
+    } else {
+      professional =
+        normalizedProfessionals.find((item) => item.availableTimes.includes(requestedTime)) || null;
+
+      if (!professional) {
+        const suggestions = buildGlobalSuggestedSlots(normalizedProfessionals, requestedTime, 8);
+        const suggestionText = suggestions
+          .map((item) => `${item.time} (${item.professionals.join(", ")})`)
+          .join("; ");
+        const error = new Error(
+          suggestions.length
+            ? `Nao encontrei agenda livre as ${requestedTime}. Opcoes proximas: ${suggestionText}.`
+            : `Nao encontrei agenda livre na data informada para este servico.`,
+        );
+        error.status = 409;
+        error.details = {
+          requestedTime,
+          suggestions,
+        };
+        throw error;
+      }
+    }
+
+    resolvedProfessionalDisplay = professionalDisplayName(professional.name);
+    const client = await findOrCreateClient(establishmentId, normalizedClientName, normalizedClientPhone);
+    const clientId = clientIdFrom(client);
+
+    if (!clientId) {
+      const error = new Error("Cliente sem ID valido no retorno da API Trinks.");
+      error.status = 422;
+      throw error;
+    }
+
+    payload = {
+      servicoId: Number(serviceId),
+      clienteId: Number(clientId),
+      profissionalId: Number(professional.id),
+      dataHoraInicio: toIsoDateTime(date, requestedTime),
+      duracaoEmMinutos: durationMinutes,
+      valor: Number.isFinite(amount) ? amount : 0,
+      observacoes: "Agendamento criado via IA.AGENDAMENTO",
+      confirmado: true,
+    };
+
+    const created = await trinksRequest("/agendamentos", {
       method: "POST",
       estabelecimentoId: establishmentId,
       body: payload,
     });
-  } catch (error) {
-    error.details = {
-      ...(typeof error.details === "object" && error.details ? error.details : {}),
-      requestPayload: payload,
-      resolved: {
-        establishmentId: Number(establishmentId),
-        serviceId: Number(serviceId),
-        clientId: Number(clientId),
-        professionalId: Number(professional.id),
-        professionalName: professional.name,
-      },
+
+    const appointmentId =
+      created?.id || created?.agendamentoId || created?.data?.id || created?.item?.id || null;
+    const confirmationCode = appointmentId ? `TRK-${appointmentId}` : "TRK-PENDENTE";
+    const noteUpdate = await upsertAppointmentConfirmationNote({
+      establishmentId,
+      appointmentId,
+      confirmationCode,
+    });
+
+    const result = {
+      status: "success",
+      confirmationCode,
+      message: `Agendamento enviado ao Trinks com sucesso com ${resolvedProfessionalDisplay}.`,
+      professional,
+      raw: created,
+      noteUpdate,
     };
+
+    recordAppointmentAudit({
+      eventType: "create",
+      status: "success",
+      establishmentId,
+      appointmentId,
+      confirmationCode,
+      clientPhone: normalizedClientPhone,
+      clientName: normalizedClientName,
+      serviceName: service,
+      professionalName: resolvedProfessionalDisplay,
+      date,
+      time: requestedTime,
+      requestPayload: payload,
+      responsePayload: result,
+    });
+
+    return result;
+  } catch (error) {
+    recordAppointmentAudit({
+      eventType: "create",
+      status: "error",
+      establishmentId,
+      confirmationCode: "",
+      clientPhone: normalizedClientPhone,
+      clientName: normalizedClientName,
+      serviceName: service,
+      professionalName: resolvedProfessionalDisplay || normalizedRequestedProfessional,
+      date,
+      time: requestedTime || String(time || ""),
+      requestPayload: payload,
+      responsePayload: error?.details || null,
+      errorMessage: error?.message || "Erro desconhecido no createAppointment",
+    });
     throw error;
   }
-
-  const appointmentId =
-    created?.id || created?.agendamentoId || created?.data?.id || created?.item?.id || null;
-
-  return {
-    status: "success",
-    confirmationCode: appointmentId ? `TRK-${appointmentId}` : "TRK-PENDENTE",
-    message: `Agendamento enviado ao Trinks com sucesso com ${professional.name}.`,
-    professional,
-    raw: created,
-  };
 }
 
 async function resolveAppointmentContext({
@@ -1312,6 +2939,7 @@ async function resolveAppointmentContext({
     establishmentId,
     date,
     professionalName,
+    serviceId,
   });
 
   const duration = Number(
@@ -1424,6 +3052,17 @@ async function tryCreateAppointmentVariants({
 }
 
 function parseAppointmentId({ confirmationCode, appointmentId }) {
+  const parsed = parseAppointmentIdOrNull({ confirmationCode, appointmentId });
+  if (parsed) {
+    return parsed;
+  }
+
+  const error = new Error("Informe um codigo TRK valido ou ID numerico do agendamento.");
+  error.status = 400;
+  throw error;
+}
+
+function parseAppointmentIdOrNull({ confirmationCode, appointmentId }) {
   const directId = String(appointmentId || "").trim();
   if (/^\d+$/.test(directId)) {
     return Number(directId);
@@ -1434,14 +3073,384 @@ function parseAppointmentId({ confirmationCode, appointmentId }) {
     return Number(fromCode[1]);
   }
 
-  const error = new Error("Informe um codigo TRK valido ou ID numerico do agendamento.");
-  error.status = 400;
+  return null;
+}
+
+function appointmentClientIdFrom(item) {
+  return item?.clienteId ?? item?.cliente?.id ?? item?.clientId ?? item?.cliente?.clienteId ?? null;
+}
+
+function appointmentLooksCanceled(item) {
+  if (!item || typeof item !== "object") {
+    return false;
+  }
+
+  if (item?.cancelado === true || item?.cancelada === true || item?.isCanceled === true) {
+    return true;
+  }
+
+  const statusText = normalizeForMatch(firstNonEmpty([item?.status, item?.situacao, item?.state, item?.estado]));
+  return statusText.includes("cancel");
+}
+
+function appointmentMatchesServiceFilter(appointment, requestedService) {
+  const target = normalizeForMatch(requestedService);
+  if (!target) {
+    return true;
+  }
+
+  const names = Array.isArray(appointment?.services) ? appointment.services : [];
+  if (!names.length) {
+    return false;
+  }
+
+  return names.some((name) => {
+    const candidate = normalizeForMatch(name);
+    return candidate.includes(target) || target.includes(candidate);
+  });
+}
+
+function appointmentMatchesProfessionalFilter(appointment, requestedProfessional) {
+  const target = normalizeForMatch(requestedProfessional);
+  if (!target) {
+    return true;
+  }
+
+  const candidate = normalizeForMatch(appointment?.professional);
+  if (!candidate) {
+    return false;
+  }
+
+  return candidate.includes(target) || target.includes(candidate);
+}
+
+function appointmentSortDateTime(appointment) {
+  const date = toNonEmptyString(appointment?.date);
+  const time = normalizeTimeValue(appointment?.time) || "00:00";
+  if (!date) {
+    return "9999-12-31T23:59";
+  }
+  return `${date}T${time}`;
+}
+
+function buildCancellationOption(appointment) {
+  return {
+    appointmentId: appointment?.id || null,
+    confirmationCode: appointment?.id ? `TRK-${appointment.id}` : null,
+    date: appointment?.date || null,
+    time: appointment?.time || null,
+    professional: professionalDisplayName(appointment?.professional || ""),
+    services: appointment?.services || [],
+    client: appointment?.client || null,
+  };
+}
+
+async function listAppointmentsByClientId(establishmentId, clientId, { dateFrom, dateTo } = {}) {
+  if (!clientId) {
+    return [];
+  }
+
+  const attempts = [
+    {
+      label: "clienteId-dateRange",
+      query: {
+        clienteId: clientId,
+        dataInicial: `${dateFrom}T00:00:00`,
+        dataFinal: `${dateTo}T23:59:59`,
+      },
+    },
+    {
+      label: "clientId-dateRange",
+      query: {
+        clientId: clientId,
+        dataInicial: `${dateFrom}T00:00:00`,
+        dataFinal: `${dateTo}T23:59:59`,
+      },
+    },
+    {
+      label: "idCliente-dateRange",
+      query: {
+        idCliente: clientId,
+        dataInicial: dateFrom,
+        dataFinal: dateTo,
+      },
+    },
+    {
+      label: "clienteId-noRange",
+      query: {
+        clienteId: clientId,
+      },
+    },
+  ];
+
+  const allItems = [];
+  const seenIds = new Set();
+  const errors = [];
+
+  for (const attempt of attempts) {
+    try {
+      for (let page = 1; page <= 8; page += 1) {
+        const payload = await trinksRequest("/agendamentos", {
+          method: "GET",
+          estabelecimentoId: establishmentId,
+          query: {
+            ...attempt.query,
+            page,
+            pageSize: 200,
+          },
+        });
+        const items = extractItems(payload);
+        if (!items.length) {
+          break;
+        }
+
+        for (const item of items) {
+          const id = item?.id ?? item?.agendamentoId ?? null;
+          const key = id ? `id:${id}` : JSON.stringify(item);
+          if (seenIds.has(key)) {
+            continue;
+          }
+          seenIds.add(key);
+          allItems.push(item);
+        }
+
+        if (items.length < 200) {
+          break;
+        }
+      }
+    } catch (error) {
+      errors.push({
+        label: attempt.label,
+        message: error?.message || "Erro ao listar agendamentos da cliente.",
+        status: error?.status || null,
+      });
+    }
+  }
+
+  if (!allItems.length && errors.length) {
+    const aggregate = new Error("Nao foi possivel listar agendamentos da cliente na Trinks.");
+    aggregate.status = errors[0]?.status || 500;
+    aggregate.details = errors;
+    throw aggregate;
+  }
+
+  return allItems;
+}
+
+async function resolveAppointmentForCancellationWithoutCode({
+  establishmentId,
+  clientPhone,
+  clientName,
+  date,
+  time,
+  service,
+  professionalName,
+}) {
+  const normalizedPhone = normalizePhone(clientPhone);
+  const normalizedClientName = toNonEmptyString(clientName);
+  if (!normalizedPhone) {
+    const error = new Error("Sem codigo TRK, preciso do telefone da cliente para localizar o agendamento.");
+    error.status = 400;
+    throw error;
+  }
+
+  const knownClient = await findExistingClientByPhone(establishmentId, normalizedPhone);
+  if (!knownClient) {
+    const error = new Error("Nao encontrei essa cliente na base Trinks. Envie o codigo TRK para desmarcar.");
+    error.status = 404;
+    throw error;
+  }
+
+  const knownClientId = Number(clientIdFrom(knownClient));
+  const knownClientLabel = clientDisplayNameFrom(knownClient) || normalizedClientName || "Cliente";
+  const today = getSaoPauloDateContext().isoToday;
+  const dateFrom = today;
+  const dateTo = addDaysToIsoDate(today, 90);
+  const requestedDate = toNonEmptyString(date);
+  const requestedTime = normalizeTimeValue(time);
+  const requestedService = toNonEmptyString(service);
+  const requestedProfessional = toNonEmptyString(professionalName);
+
+  const items = await listAppointmentsByClientId(establishmentId, knownClientId, { dateFrom, dateTo });
+  const normalized = items
+    .map(normalizeAppointmentItem)
+    .filter(Boolean)
+    .filter((appointment) => Number.isFinite(Number(appointment?.id)) && Number(appointment.id) > 0)
+    .filter((appointment) => {
+      const candidateClientId = Number(appointmentClientIdFrom(appointment.raw));
+      if (Number.isFinite(candidateClientId) && candidateClientId > 0) {
+        return candidateClientId === knownClientId;
+      }
+
+      const candidateClientName = normalizeForMatch(appointment.client || "");
+      const expectedClientName = normalizeForMatch(knownClientLabel);
+      return Boolean(candidateClientName && expectedClientName && candidateClientName === expectedClientName);
+    })
+    .filter((appointment) => !appointmentLooksCanceled(appointment.raw))
+    .filter((appointment) => toNonEmptyString(appointment.date) >= today)
+    .sort((left, right) => appointmentSortDateTime(left).localeCompare(appointmentSortDateTime(right)));
+
+  if (!normalized.length) {
+    const error = new Error(`Nao encontrei agendamentos futuros para ${knownClientLabel}.`);
+    error.status = 404;
+    throw error;
+  }
+
+  const filtered = normalized.filter((appointment) => {
+    if (requestedDate && appointment.date !== requestedDate) {
+      return false;
+    }
+    if (requestedTime && normalizeTimeValue(appointment.time) !== requestedTime) {
+      return false;
+    }
+    if (!appointmentMatchesServiceFilter(appointment, requestedService)) {
+      return false;
+    }
+    if (!appointmentMatchesProfessionalFilter(appointment, requestedProfessional)) {
+      return false;
+    }
+    return true;
+  });
+
+  const candidatePool = filtered.length ? filtered : normalized;
+
+  if (candidatePool.length === 1) {
+    return {
+      appointmentId: Number(candidatePool[0].id),
+      resolution: "clientPhoneAuto",
+      client: {
+        id: knownClientId,
+        name: knownClientLabel,
+        phone: normalizedPhone,
+      },
+      matchedFilters: {
+        date: requestedDate || null,
+        time: requestedTime || null,
+        service: requestedService || null,
+        professionalName: requestedProfessional || null,
+      },
+      matchedAppointment: buildCancellationOption(candidatePool[0]),
+    };
+  }
+
+  const error = new Error(
+    "Encontrei mais de um agendamento para esta cliente. Informe o codigo TRK ou confirme data/horario para desmarcar com seguranca.",
+  );
+  error.status = 409;
+  error.details = {
+    totalFound: candidatePool.length,
+    options: candidatePool.slice(0, 5).map(buildCancellationOption),
+  };
   throw error;
+}
+
+async function cancelAppointmentById({ establishmentId, appointmentId, reason, requestPayload }) {
+  const normalizedReason = toNonEmptyString(reason);
+  const cancellationNote = normalizedReason
+    ? `Cancelado via IA.AGENDAMENTO | Motivo: ${normalizedReason}`
+    : "Cancelado via IA.AGENDAMENTO";
+
+  const parsedId = Number(appointmentId);
+  const attempts = [
+    {
+      method: "DELETE",
+      path: `/agendamentos/${parsedId}`,
+      body: undefined,
+      mode: "DELETE",
+    },
+    {
+      method: "PATCH",
+      path: `/agendamentos/${parsedId}/cancelar`,
+      body: { observacoes: cancellationNote, confirmado: false },
+      mode: "PATCH_CANCELAR",
+    },
+    {
+      method: "PATCH",
+      path: `/agendamentos/${parsedId}`,
+      body: { cancelado: true, observacoes: cancellationNote, confirmado: false },
+      mode: "PATCH_CANCELADO",
+    },
+    {
+      method: "PUT",
+      path: `/agendamentos/${parsedId}`,
+      body: { cancelado: true, observacoes: cancellationNote, confirmado: false },
+      mode: "PUT_CANCELADO",
+    },
+  ];
+
+  const attemptErrors = [];
+  let lastError = null;
+
+  for (const attempt of attempts) {
+    try {
+      const response = await trinksRequest(attempt.path, {
+        method: attempt.method,
+        estabelecimentoId: establishmentId,
+        body: attempt.body,
+      });
+
+      const result = {
+        status: "success",
+        appointmentId: parsedId,
+        confirmationCode: `TRK-${parsedId}`,
+        message: "Agendamento desmarcado com sucesso.",
+        method: attempt.mode,
+        raw: response,
+      };
+
+      recordAppointmentAudit({
+        eventType: "cancel",
+        status: "success",
+        establishmentId,
+        appointmentId: parsedId,
+        confirmationCode: `TRK-${parsedId}`,
+        requestPayload: {
+          ...requestPayload,
+          reason: normalizedReason,
+          attemptsTried: attempts.map((item) => item.mode),
+          successMode: attempt.mode,
+          requestBody: attempt.body || null,
+        },
+        responsePayload: result,
+      });
+
+      return result;
+    } catch (error) {
+      lastError = error;
+      attemptErrors.push({
+        mode: attempt.mode,
+        method: attempt.method,
+        path: attempt.path,
+        requestBody: attempt.body || null,
+        status: error?.status || null,
+        message: error?.message || "Erro desconhecido",
+        details: error?.details || null,
+      });
+    }
+  }
+
+  recordAppointmentAudit({
+    eventType: "cancel",
+    status: "error",
+    establishmentId,
+    appointmentId: parsedId,
+    confirmationCode: `TRK-${parsedId}`,
+    requestPayload: {
+      ...requestPayload,
+      reason: normalizedReason,
+      attemptsTried: attempts.map((item) => item.mode),
+    },
+    responsePayload: attemptErrors,
+    errorMessage: lastError?.message || "Erro ao cancelar agendamento",
+  });
+
+  throw lastError || new Error("Nao foi possivel cancelar o agendamento.");
 }
 
 async function rescheduleAppointment({ establishmentId, confirmationCode, appointmentId, date, time }) {
   const parsedId = parseAppointmentId({ confirmationCode, appointmentId });
-  const dataHoraInicio = toIsoDateTime(date, time);
+  const requestedTime = normalizeTimeValue(time) || String(time || "");
+  const dataHoraInicio = toIsoDateTime(date, requestedTime);
   const payload = { dataHoraInicio };
 
   try {
@@ -1451,32 +3460,240 @@ async function rescheduleAppointment({ establishmentId, confirmationCode, appoin
       body: payload,
     });
 
-    return {
+    const result = {
       status: "success",
       confirmationCode: `TRK-${parsedId}`,
-      message: `Horario alterado para ${date} as ${time}.`,
+      message: `Horario alterado para ${date} as ${requestedTime}.`,
       raw: updated,
     };
-  } catch (patchError) {
-    const updated = await trinksRequest(`/agendamentos/${parsedId}`, {
-      method: "PUT",
-      estabelecimentoId: establishmentId,
-      body: payload,
+
+    recordAppointmentAudit({
+      eventType: "reschedule",
+      status: "success",
+      establishmentId,
+      appointmentId: parsedId,
+      confirmationCode: `TRK-${parsedId}`,
+      date,
+      time: requestedTime,
+      requestPayload: payload,
+      responsePayload: result,
     });
 
-    return {
-      status: "success",
-      confirmationCode: `TRK-${parsedId}`,
-      message: `Horario alterado para ${date} as ${time}.`,
-      raw: updated,
-      fallbackMethod: "PUT",
-      patchError: patchError?.message || null,
-    };
+    return result;
+  } catch (patchError) {
+    try {
+      const updated = await trinksRequest(`/agendamentos/${parsedId}`, {
+        method: "PUT",
+        estabelecimentoId: establishmentId,
+        body: payload,
+      });
+
+      const result = {
+        status: "success",
+        confirmationCode: `TRK-${parsedId}`,
+        message: `Horario alterado para ${date} as ${requestedTime}.`,
+        raw: updated,
+        fallbackMethod: "PUT",
+        patchError: patchError?.message || null,
+      };
+
+      recordAppointmentAudit({
+        eventType: "reschedule",
+        status: "success",
+        establishmentId,
+        appointmentId: parsedId,
+        confirmationCode: `TRK-${parsedId}`,
+        date,
+        time: requestedTime,
+        requestPayload: payload,
+        responsePayload: result,
+      });
+
+      return result;
+    } catch (putError) {
+      recordAppointmentAudit({
+        eventType: "reschedule",
+        status: "error",
+        establishmentId,
+        appointmentId: parsedId,
+        confirmationCode: `TRK-${parsedId}`,
+        date,
+        time: requestedTime,
+        requestPayload: payload,
+        responsePayload: {
+          patchError: patchError?.message || null,
+          putError: putError?.details || null,
+        },
+        errorMessage: putError?.message || patchError?.message || "Erro ao reagendar",
+      });
+      throw putError;
+    }
   }
 }
 
-async function sendChatMessage({ establishmentId, message, history }) {
+async function cancelAppointment({
+  establishmentId,
+  confirmationCode,
+  appointmentId,
+  reason,
+  clientPhone,
+  clientName,
+  date,
+  time,
+  service,
+  professionalName,
+}) {
+  const parsedId = parseAppointmentIdOrNull({ confirmationCode, appointmentId });
+
+  if (parsedId) {
+    return cancelAppointmentById({
+      establishmentId,
+      appointmentId: parsedId,
+      reason,
+      requestPayload: {
+        resolution: "confirmationCodeOrId",
+        confirmationCode: toNonEmptyString(confirmationCode),
+      },
+    });
+  }
+
+  const resolved = await resolveAppointmentForCancellationWithoutCode({
+    establishmentId,
+    clientPhone,
+    clientName,
+    date,
+    time,
+    service,
+    professionalName,
+  });
+
+  return cancelAppointmentById({
+    establishmentId,
+    appointmentId: resolved.appointmentId,
+    reason,
+    requestPayload: {
+      resolution: resolved.resolution,
+      matchedFilters: resolved.matchedFilters,
+      client: resolved.client,
+      matchedAppointment: resolved.matchedAppointment,
+    },
+  });
+}
+
+async function sendChatMessage({ establishmentId, message, history, customerContext }) {
   const knowledge = loadSalonKnowledge();
+  const dateContext = getSaoPauloDateContext();
+  const relativeDate = detectRelativeDateReference(message, dateContext);
+  const knownClientName = toNonEmptyString(customerContext?.name);
+  const normalizedMessageForGate = normalizeForMatch(message);
+  const inferredPreferredTime = extractPreferredTimeFromMessage(message);
+  const hasBookingTimeIntent = messageSuggestsBookingTimeIntent(message, dateContext);
+  const hasSchedulingIntent = messageSuggestsSchedulingIntent(message);
+  const asksProfessionals = /(profission|quem atende|cabeleireir)/.test(normalizedMessageForGate);
+  const pendingSessionKey = resolvePendingSessionKey(establishmentId, customerContext);
+  const pendingConfirmation = getPendingBookingConfirmation(pendingSessionKey);
+
+  if (pendingConfirmation) {
+    const confirmationIntent = detectConfirmationIntent(message);
+
+    if (confirmationIntent === "confirm") {
+      const execution = await executeConfirmedBookings({
+        establishmentId,
+        clientName: pendingConfirmation.clientName,
+        clientPhone: pendingConfirmation.clientPhone,
+        items: pendingConfirmation.items,
+      });
+      clearPendingBookingConfirmation(pendingSessionKey);
+
+      const successLines = execution.successes.map((item) => {
+        const codeSuffix = item.confirmationCode ? ` | codigo ${item.confirmationCode}` : "";
+        return `- ${formatBookingItemSummary(item)}${codeSuffix}`;
+      });
+      const failureLines = execution.failures.map((item) => `- ${formatBookingItemSummary(item)} | erro: ${item.message}`);
+
+      if (execution.successes.length && !execution.failures.length) {
+        return `Perfeito, agendamento confirmado com sucesso:\n${successLines.join("\n")}`;
+      }
+
+      if (execution.successes.length && execution.failures.length) {
+        return [
+          "Consegui confirmar parte dos agendamentos.",
+          "",
+          "Confirmados:",
+          successLines.join("\n"),
+          "",
+          "Nao confirmados:",
+          failureLines.join("\n"),
+        ].join("\n");
+      }
+
+      return `Nao consegui confirmar os agendamentos solicitados:\n${failureLines.join("\n")}`;
+    }
+
+    if (confirmationIntent === "deny") {
+      clearPendingBookingConfirmation(pendingSessionKey);
+      return "Perfeito, nao vou confirmar ainda. Me diga o que deseja ajustar (servico, profissional, data ou horario).";
+    }
+
+    return `${buildBookingConfirmationMessage(pendingConfirmation.items)}\n\nSe quiser ajustar algo, me diga o que devo alterar.`;
+  }
+
+  const shouldAskPreferenceFirst =
+    hasBookingTimeIntent &&
+    !asksProfessionals &&
+    !historyAlreadyAskedProfessionalPreference(history);
+
+  if (shouldAskPreferenceFirst) {
+    const salutation = knownClientName ? `Perfeito, ${knownClientName}. ` : "Perfeito. ";
+    return `${salutation}Antes de eu sugerir os horarios, voce tem preferencia por alguma profissional?`;
+  }
+
+  if (shouldLookupProfessionalsDirectly(message)) {
+    const targetDate = relativeDate?.iso || dateContext.isoToday;
+    let serviceId;
+    try {
+      const maybeService = await findServiceByName(establishmentId, message);
+      serviceId = Number(serviceIdFrom(maybeService)) || undefined;
+    } catch {
+      serviceId = undefined;
+    }
+
+    if (!serviceId) {
+      const hintedService = inferServiceHintFromMessage(message);
+      if (hintedService) {
+        try {
+          const hinted = await findServiceByName(establishmentId, hintedService);
+          serviceId = Number(serviceIdFrom(hinted)) || undefined;
+        } catch {
+          serviceId = undefined;
+        }
+      }
+    }
+
+    const professionals = await getProfessionals({
+      establishmentId,
+      date: targetDate,
+      serviceId,
+    });
+
+    const names = uniqueProfessionalDisplayNames(
+      professionals
+        .filter(professionalHasOpenSchedule)
+        .map((item) => toNonEmptyString(item?.name || professionalNameFrom(item))),
+    );
+
+    if (!names.length) {
+      return `No momento, nao encontrei profissionais disponiveis para ${isoToBrDate(targetDate)}. Posso consultar outra data para voce.`;
+    }
+
+    return `Para ${isoToBrDate(targetDate)}, as profissionais disponiveis sao: ${names.join(", ")}.`;
+  }
+
+  const faqAnswer = findBestFaqAnswer(knowledge, message);
+  if (faqAnswer && !hasSchedulingIntent) {
+    return faqAnswer;
+  }
+
   const ai = new GoogleGenAI({ apiKey: ensureEnv("GEMINI_API_KEY") });
   const chat = ai.chats.create({
     model: "gemini-3-flash-preview",
@@ -1488,60 +3705,251 @@ async function sendChatMessage({ establishmentId, message, history }) {
   });
 
   let response = await chat.sendMessage({
-    message: buildConversationPrompt(history, message, knowledge),
+    message: buildConversationPrompt(history, message, knowledge, customerContext || null),
   });
 
   for (let attempt = 0; attempt < 3; attempt += 1) {
     const calls = response.functionCalls || [];
     if (!calls.length) {
-      return response.text;
+      const text = String(response.text || "");
+      if (
+        relativeDate &&
+        /(\d{1,2}\/\d{1,2}(?:\/\d{2,4})?|\d{4}-\d{2}-\d{2})/.test(text) &&
+        !text.includes(relativeDate.br) &&
+        !text.includes(relativeDate.iso)
+      ) {
+        const corrected = await chat.sendMessage({
+          message: `Correcao obrigatoria: para esta conversa, "${relativeDate.label}" = ${relativeDate.iso} (${relativeDate.br}). Reescreva a ultima resposta com a data correta, sem alterar o restante do sentido.`,
+        });
+        return String(corrected.text || text);
+      }
+      return text;
     }
 
     const results = [];
     for (const call of calls) {
       if (call.name === "checkAvailability") {
+        const requestedDate = relativeDate?.iso || toNonEmptyString(call.args?.date);
+        const requestedProfessional = toNonEmptyString(call.args?.professionalName);
+        const requestedPreferredTime =
+          normalizeTimeValue(call.args?.preferredTime) || inferredPreferredTime;
         const availability = await getAvailability(
           establishmentId,
           String(call.args.service),
-          String(call.args.date),
+          requestedDate,
+          {
+            professionalName: requestedProfessional,
+            preferredTime: requestedPreferredTime,
+          },
         );
         results.push({ name: call.name, result: availability });
         continue;
       }
 
       if (call.name === "listAppointmentsForDate") {
+        const requestedDate =
+          relativeDate?.iso || toNonEmptyString(call.args?.date) || dateContext.isoToday;
         const { items, source } = await getAppointmentsForDate(
           establishmentId,
-          String(call.args.date),
+          requestedDate,
         );
         const normalized = items.map(normalizeAppointmentItem).filter(Boolean);
         results.push({ name: call.name, result: { source, appointments: normalized } });
         continue;
       }
 
-      if (call.name === "bookAppointment") {
-        const booking = await createAppointment({
+      if (call.name === "listProfessionalsForDate") {
+        const requestedDate =
+          relativeDate?.iso || toNonEmptyString(call.args?.date) || dateContext.isoToday;
+        const requestedService = toNonEmptyString(call.args?.service);
+
+        let serviceId;
+        if (requestedService) {
+          try {
+            const service = await findServiceByName(establishmentId, requestedService);
+            serviceId = Number(serviceIdFrom(service)) || undefined;
+          } catch {
+            serviceId = undefined;
+          }
+        }
+
+        const professionals = await getProfessionals({
           establishmentId,
-          service: String(call.args.service),
-          date: String(call.args.date),
-          time: String(call.args.time),
-          professionalName: String(call.args.professionalName || ""),
-          clientName: String(call.args.clientName),
-          clientPhone: String(call.args.clientPhone),
+          date: requestedDate,
+          serviceId,
         });
-        results.push({ name: call.name, result: booking });
+
+        const names = uniqueProfessionalDisplayNames(
+          professionals
+            .filter(professionalHasOpenSchedule)
+            .map((item) => toNonEmptyString(item?.name || professionalNameFrom(item))),
+        );
+
+        results.push({
+          name: call.name,
+          result: {
+            date: requestedDate,
+            service: requestedService || null,
+            total: names.length,
+            professionals: names,
+          },
+        });
+        continue;
+      }
+
+      if (call.name === "bookAppointment") {
+        const resolvedClientName =
+          toNonEmptyString(call.args?.clientName) ||
+          toNonEmptyString(customerContext?.name);
+        const resolvedClientPhone =
+          normalizePhone(call.args?.clientPhone) ||
+          normalizePhone(customerContext?.phone);
+
+        if (!resolvedClientName || !resolvedClientPhone) {
+          results.push({
+            name: call.name,
+            result: {
+              status: "error",
+              message:
+                "Nao foi possivel confirmar os dados da cliente para agendamento (nome e telefone).",
+              missing: {
+                clientName: !resolvedClientName,
+                clientPhone: !resolvedClientPhone,
+              },
+            },
+          });
+          continue;
+        }
+
+        const requestedDateFallback = relativeDate?.iso || toNonEmptyString(call.args?.date);
+        const rawItems =
+          Array.isArray(call.args?.appointments) && call.args.appointments.length
+            ? call.args.appointments
+            : [call.args];
+
+        const normalizedItems = rawItems.map((item) => ({
+          service: toNonEmptyString(item?.service || call.args?.service),
+          date: normalizeBookingDate(item?.date || call.args?.date, requestedDateFallback),
+          time: normalizeBookingTime(item?.time || call.args?.time),
+          professionalName: toNonEmptyString(item?.professionalName || call.args?.professionalName),
+        }));
+
+        const invalidItem = normalizedItems.find(
+          (item) => !item.service || !item.date || !item.time,
+        );
+        if (invalidItem) {
+          results.push({
+            name: call.name,
+            result: {
+              status: "error",
+              message:
+                "Para agendar, preciso de servico, data e horario em cada item solicitado.",
+              invalidItem,
+            },
+          });
+          continue;
+        }
+
+        const previewItems = [];
+        let previewError = null;
+        for (const item of normalizedItems) {
+          try {
+            const preview = await resolveBookingPreviewItem({
+              establishmentId,
+              service: item.service,
+              date: item.date,
+              time: item.time,
+              professionalName: item.professionalName,
+            });
+            previewItems.push(preview);
+          } catch (error) {
+            previewError = error;
+            break;
+          }
+        }
+
+        if (previewError) {
+          results.push({
+            name: call.name,
+            result: {
+              status: "error",
+              message: previewError?.message || "Nao foi possivel validar disponibilidade.",
+              details: previewError?.details || null,
+            },
+          });
+          continue;
+        }
+
+        const sessionKey = resolvePendingSessionKey(
+          establishmentId,
+          customerContext,
+          { clientPhone: resolvedClientPhone, clientName: resolvedClientName },
+        );
+
+        if (!sessionKey) {
+          results.push({
+            name: call.name,
+            result: {
+              status: "error",
+              message: "Nao consegui identificar a sessao da cliente para confirmar o agendamento.",
+            },
+          });
+          continue;
+        }
+
+        const pending = setPendingBookingConfirmation(sessionKey, {
+          establishmentId,
+          clientName: resolvedClientName,
+          clientPhone: resolvedClientPhone,
+          items: previewItems,
+        });
+
+        results.push({
+          name: call.name,
+          result: {
+            status: "pending_confirmation",
+            clientName: resolvedClientName,
+            clientPhone: resolvedClientPhone,
+            total: previewItems.length,
+            items: previewItems,
+            expiresAt: new Date(pending.expiresAt).toISOString(),
+            message: buildBookingConfirmationMessage(previewItems),
+          },
+        });
         continue;
       }
 
       if (call.name === "rescheduleAppointment") {
+        const requestedDate = relativeDate?.iso || toNonEmptyString(call.args?.date);
         const rescheduled = await rescheduleAppointment({
           establishmentId,
           confirmationCode: String(call.args.confirmationCode || ""),
           appointmentId: String(call.args.appointmentId || ""),
-          date: String(call.args.date),
+          date: requestedDate,
           time: String(call.args.time),
         });
         results.push({ name: call.name, result: rescheduled });
+        continue;
+      }
+
+      if (call.name === "cancelAppointment") {
+        const cancelled = await cancelAppointment({
+          establishmentId,
+          confirmationCode: String(call.args?.confirmationCode || ""),
+          appointmentId: String(call.args?.appointmentId || ""),
+          reason: String(call.args?.reason || ""),
+          clientPhone:
+            normalizePhone(call.args?.clientPhone) ||
+            normalizePhone(customerContext?.phone),
+          clientName:
+            toNonEmptyString(call.args?.clientName) ||
+            toNonEmptyString(customerContext?.name),
+          date: relativeDate?.iso || toNonEmptyString(call.args?.date),
+          time: String(call.args?.time || ""),
+          service: String(call.args?.service || ""),
+          professionalName: String(call.args?.professionalName || ""),
+        });
+        results.push({ name: call.name, result: cancelled });
         continue;
       }
 
@@ -1610,8 +4018,12 @@ app.get("/", (req, res) => {
       trinksAppointmentsDay: "POST /api/trinks/appointments/day",
       trinksProfessionals: "POST /api/trinks/professionals",
       trinksReschedule: "POST /api/trinks/appointments/reschedule",
+      trinksCancel: "POST /api/trinks/appointments/cancel",
       evolutionSendText: "POST /api/evolution/send-text",
       evolutionQrPage: "GET /api/evolution/instance/connect?instance=SEU_NOME",
+      dbConversations: "GET /api/db/conversations?limit=50",
+      dbMessages: "GET /api/db/messages?phone=5511999999999&limit=100",
+      dbAppointmentAudit: "GET /api/db/appointments-audit?limit=100",
     },
   });
 });
@@ -1737,12 +4149,15 @@ app.get("/api/evolution/instance/connect", async (req, res) => {
 
 app.post("/api/trinks/availability", async (req, res) => {
   try {
-    const { establishmentId, service, date } = req.body || {};
+    const { establishmentId, service, date, professionalName, preferredTime } = req.body || {};
     if (!establishmentId || !service || !date) {
       return res.status(400).json({ message: "Campos obrigatorios: establishmentId, service, date" });
     }
 
-    const availability = await getAvailability(establishmentId, service, date);
+    const availability = await getAvailability(establishmentId, service, date, {
+      professionalName: professionalName ? String(professionalName) : "",
+      preferredTime: preferredTime ? String(preferredTime) : "",
+    });
 
     return res.json(availability);
   } catch (error) {
@@ -1834,7 +4249,15 @@ app.post("/api/trinks/professionals", async (req, res) => {
       serviceId: req.body?.serviceId ? Number(req.body.serviceId) : undefined,
     });
 
-    return res.json({ professionals });
+    const normalized = professionals
+      .filter(professionalHasOpenSchedule)
+      .map((item) => ({
+        id: item.id,
+        name: professionalDisplayName(item.name),
+        availableTimes: item.availableTimes,
+      }));
+
+    return res.json({ professionals: normalized });
   } catch (error) {
     return res.status(error.status || 500).json({
       status: "error",
@@ -1875,7 +4298,7 @@ app.post("/api/trinks/diagnostics/professionals-raw", async (req, res) => {
 
 app.post("/api/chat", async (req, res) => {
   try {
-    const { establishmentId, message, history } = req.body || {};
+    const { establishmentId, message, history, customerContext } = req.body || {};
 
     if (!establishmentId || !message) {
       return res.status(400).json({
@@ -1887,6 +4310,7 @@ app.post("/api/chat", async (req, res) => {
       establishmentId: Number(establishmentId),
       message: String(message),
       history: Array.isArray(history) ? history : [],
+      customerContext: customerContext && typeof customerContext === "object" ? customerContext : null,
     });
 
     return res.json({ text });
@@ -2131,6 +4555,168 @@ app.post("/api/trinks/diagnostics/appointment-variants", async (req, res) => {
   }
 });
 
+app.post("/api/trinks/appointments/cancel", async (req, res) => {
+  try {
+    const {
+      establishmentId,
+      confirmationCode,
+      appointmentId,
+      reason,
+      clientPhone,
+      clientName,
+      date,
+      time,
+      service,
+      professionalName,
+    } = req.body || {};
+
+    if (!establishmentId || (!confirmationCode && !appointmentId && !clientPhone)) {
+      return res.status(400).json({
+        message:
+          "Campos obrigatorios: establishmentId e (confirmationCode ou appointmentId ou clientPhone)",
+      });
+    }
+
+    const result = await cancelAppointment({
+      establishmentId: Number(establishmentId),
+      confirmationCode: confirmationCode ? String(confirmationCode) : "",
+      appointmentId: appointmentId ? String(appointmentId) : "",
+      reason: reason ? String(reason) : "",
+      clientPhone: clientPhone ? String(clientPhone) : "",
+      clientName: clientName ? String(clientName) : "",
+      date: date ? String(date) : "",
+      time: time ? String(time) : "",
+      service: service ? String(service) : "",
+      professionalName: professionalName ? String(professionalName) : "",
+    });
+
+    return res.json(result);
+  } catch (error) {
+    return res.status(error.status || 500).json({
+      status: "error",
+      message: error.message || "Erro ao cancelar horario.",
+      details: error.details || null,
+    });
+  }
+});
+
+app.get("/api/db/conversations", (req, res) => {
+  try {
+    const limit = Math.min(Math.max(Number(req.query.limit || 50), 1), 500);
+    const rows = db.prepare(
+      `
+        SELECT m.phone,
+               m.content AS lastMessage,
+               m.role AS lastRole,
+               m.at AS updatedAt,
+               (
+                 SELECT sender_name
+                 FROM whatsapp_messages u
+                 WHERE u.phone = m.phone
+                   AND u.role = 'user'
+                   AND COALESCE(u.sender_name, '') <> ''
+                 ORDER BY datetime(u.at) DESC, u.id DESC
+                 LIMIT 1
+               ) AS name,
+               (
+                 SELECT COUNT(*)
+                 FROM whatsapp_messages c
+                 WHERE c.phone = m.phone
+               ) AS count
+        FROM whatsapp_messages m
+        JOIN (
+          SELECT phone, MAX(id) AS max_id
+          FROM whatsapp_messages
+          GROUP BY phone
+        ) latest ON latest.max_id = m.id
+        ORDER BY datetime(m.at) DESC, m.id DESC
+        LIMIT ?
+      `,
+    ).all(limit);
+
+    return res.json({ status: "ok", data: rows });
+  } catch (error) {
+    return res.status(500).json({
+      status: "error",
+      message: error.message || "Erro ao consultar conversas no banco.",
+    });
+  }
+});
+
+app.get("/api/db/messages", (req, res) => {
+  try {
+    const phone = normalizePhone(req.query.phone || "");
+    if (!phone) {
+      return res.status(400).json({ message: "Informe ?phone=numero" });
+    }
+
+    const limit = Math.min(Math.max(Number(req.query.limit || 100), 1), 1000);
+    const rows = db.prepare(
+      `
+        SELECT id, phone, role, content, sender_name AS senderName, at, source
+        FROM whatsapp_messages
+        WHERE phone = ?
+        ORDER BY datetime(at) DESC, id DESC
+        LIMIT ?
+      `,
+    ).all(phone, limit);
+
+    return res.json({ status: "ok", phone, messages: rows.reverse() });
+  } catch (error) {
+    return res.status(500).json({
+      status: "error",
+      message: error.message || "Erro ao consultar mensagens no banco.",
+    });
+  }
+});
+
+app.get("/api/db/appointments-audit", (req, res) => {
+  try {
+    const limit = Math.min(Math.max(Number(req.query.limit || 100), 1), 1000);
+    const phone = normalizePhone(req.query.phone || "");
+    const status = toNonEmptyString(req.query.status);
+
+    let query = `
+      SELECT id, event_type AS eventType, status, establishment_id AS establishmentId,
+             appointment_id AS appointmentId, confirmation_code AS confirmationCode,
+             client_phone AS clientPhone, client_name AS clientName, service_name AS serviceName,
+             professional_name AS professionalName, appointment_date AS date, appointment_time AS time,
+             request_payload AS requestPayload, response_payload AS responsePayload,
+             error_message AS errorMessage, created_at AS createdAt
+      FROM appointment_audit
+    `;
+
+    const params = [];
+    const conditions = [];
+    if (phone) {
+      conditions.push("client_phone = ?");
+      params.push(phone);
+    }
+    if (status) {
+      conditions.push("status = ?");
+      params.push(status);
+    }
+    if (conditions.length) {
+      query += ` WHERE ${conditions.join(" AND ")}`;
+    }
+    query += " ORDER BY datetime(created_at) DESC, id DESC LIMIT ?";
+    params.push(limit);
+
+    const rows = db.prepare(query).all(...params).map((row) => ({
+      ...row,
+      requestPayload: row.requestPayload ? safeJsonParse(row.requestPayload) : null,
+      responsePayload: row.responsePayload ? safeJsonParse(row.responsePayload) : null,
+    }));
+
+    return res.json({ status: "ok", data: rows });
+  } catch (error) {
+    return res.status(500).json({
+      status: "error",
+      message: error.message || "Erro ao consultar auditoria de agendamentos.",
+    });
+  }
+});
+
 app.get("/api/whatsapp/inbox", (req, res) => {
   const conversations = summarizeWhatsappConversations();
   return res.json({ status: "ok", conversations });
@@ -2193,11 +4779,29 @@ app.post("/webhook/whatsapp", async (req, res) => {
     }
 
     if (!incoming.senderNumber || !incoming.messageText) {
+      console.warn("[webhook] ignored missingSenderOrText", {
+        event: incoming.event || null,
+        fromMe: incoming.fromMe,
+        senderRaw: incoming.senderRaw || null,
+        senderNumber: incoming.senderNumber || null,
+        hasText: Boolean(incoming.messageText),
+        messageId: incoming.messageId || null,
+        instance: incoming.instanceName || null,
+      });
       return res.status(200).json({
         received: true,
         ignored: true,
         reason: "missingSenderOrText",
         event: incoming.event || null,
+      });
+    }
+
+    if (isDuplicateIncomingWhatsapp(incoming)) {
+      return res.status(200).json({
+        received: true,
+        ignored: true,
+        reason: "duplicateMessage",
+        messageId: incoming.messageId || null,
       });
     }
 
@@ -2210,13 +4814,22 @@ app.post("/webhook/whatsapp", async (req, res) => {
       throw configError;
     }
 
+    const knownClient = await findExistingClientByPhone(establishmentId, incoming.senderNumber).catch(() => null);
+    const knownClientName = toNonEmptyString(clientDisplayNameFrom(knownClient));
+    const effectiveClientName = knownClientName || incoming.senderName;
+
     const previousHistory = getWhatsappHistory(incoming.senderNumber);
-    pushWhatsappHistory(incoming.senderNumber, "user", incoming.messageText, incoming.senderName);
+    pushWhatsappHistory(incoming.senderNumber, "user", incoming.messageText, effectiveClientName);
 
     const answer = await sendChatMessage({
       establishmentId,
       message: incoming.messageText,
       history: previousHistory,
+      customerContext: {
+        name: effectiveClientName,
+        phone: incoming.senderNumber,
+        fromTrinks: Boolean(knownClientName),
+      },
     });
 
     const instance = resolveEvolutionInstance(incoming.instanceName);
@@ -2258,3 +4871,4 @@ app.post("/webhook/whatsapp", async (req, res) => {
 app.listen(port, () => {
   console.log(`Backend online em http://localhost:${port}`);
 });
+

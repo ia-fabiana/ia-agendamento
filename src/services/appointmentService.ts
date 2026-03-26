@@ -1,4 +1,4 @@
-type ChatHistoryItem = {
+﻿type ChatHistoryItem = {
   role: "user" | "assistant";
   content: string;
 };
@@ -150,6 +150,30 @@ export class AppointmentService {
     return response.json();
   }
 
+  async disconnectEvolutionInstance(instance: string) {
+    const response = await fetch(
+      this.getBackendEndpoint(`/api/evolution/instance/disconnect?instance=${encodeURIComponent(instance)}`),
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+      },
+    );
+
+    if (!response.ok) {
+      let message = `Falha ao desconectar (${response.status}).`;
+      try {
+        const payload = (await response.json()) as { message?: string };
+        if (payload?.message) {
+          message = payload.message;
+        }
+      } catch {
+        // Keep fallback message.
+      }
+      throw new Error(message);
+    }
+
+    return (await response.json()) as { success: boolean; message?: string };
+  }
   async getEvolutionQr(instance: string) {
     const response = await fetch(
       this.getBackendEndpoint(`/api/evolution/instance/qr?instance=${encodeURIComponent(instance)}`),
@@ -254,3 +278,4 @@ export class AppointmentService {
     return response.json();
   }
 }
+
