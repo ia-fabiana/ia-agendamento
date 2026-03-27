@@ -1976,37 +1976,54 @@ function safeJsonParse(value) {
 }
 
 function scoreServiceMatch(serviceName, candidate) {
-  const target = normalizeForMatch(serviceName).trim();
-  const candidateName = normalizeForMatch(candidate?.nome).trim();
-  if (!target || !candidateName) {
+  const normalizeServiceText = (value) =>
+    normalizeForMatch(value)
+      .replace(/[^a-z0-9\s]/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+
+  const targetRaw = normalizeForMatch(serviceName).trim();
+  const candidateRaw = normalizeForMatch(candidate?.nome).trim();
+  const target = normalizeServiceText(serviceName);
+  const candidateName = normalizeServiceText(candidate?.nome);
+
+  if (!targetRaw || !candidateRaw || !target || !candidateName) {
     return 0;
   }
 
-  if (target === candidateName) {
+  if (target === candidateName || targetRaw === candidateRaw) {
     return 1;
   }
 
-  if (candidateName.includes(target) || target.includes(candidateName)) {
-    return 0.92;
-  }
-
-  const targetTokens = tokenizeMeaningfulText(target);
-  const candidateTokens = tokenizeMeaningfulText(candidateName);
+  const targetTokens = target.split(" ").filter(Boolean);
+  const candidateTokens = candidateName.split(" ").filter(Boolean);
   if (!targetTokens.length || !candidateTokens.length) {
     return 0;
   }
 
   const candidateSet = new Set(candidateTokens);
   const overlap = targetTokens.filter((token) => candidateSet.has(token)).length;
+  if (!overlap) {
+    return 0;
+  }
+
+  // Caso comum: cliente digita apenas o nome base do servico ("escova")
+  // e a Trinks retorna variantes ("escova definitiva", "escova*"). Aqui
+  // privilegiamos o match mais direto para evitar mudar o servico no meio do fluxo.
+  const allTargetTokensPresent = overlap === targetTokens.length;
+  if (allTargetTokensPresent) {
+    const extraTokens = Math.max(0, candidateTokens.length - targetTokens.length);
+    return Math.max(0.6, 0.98 - (extraTokens * 0.08));
+  }
+
+  if (candidateName.includes(target) || target.includes(candidateName)) {
+    return 0.75;
+  }
+
   const coverage = overlap / targetTokens.length;
   const precision = overlap / candidateTokens.length;
   const combined = (coverage * 0.7) + (precision * 0.3);
-
-  if (overlap >= 2) {
-    return combined;
-  }
-
-  return 0;
+  return combined >= 0.5 ? combined : 0;
 }
 
 function findBestServiceMatch(serviceName, services) {
@@ -2730,6 +2747,7 @@ async function getAvailability(
   if (requestedProfessional) {
     const matched = findProfessionalByName(byProfessional, requestedProfessional);
     if (!matched) {
+      requestedProfessionalDisplay = professionalDisplayName(requestedProfessional);
       if (!strictProfessional) {
         preferredProfessionalUnavailable = true;
         const matchedAllDay = findProfessionalByName(byProfessionalAllDay, requestedProfessional);
@@ -2749,10 +2767,12 @@ async function getAvailability(
             )
           : otherOpenDisplayNames;
       } else {
-        const error = new Error(`Profissional nao encontrada para: ${requestedProfessional}`);
+        const error = new Error(
+          `${requestedProfessionalDisplay} nao possui disponibilidade para este servico nessa data. Caso queira, posso verificar com outras profissionais.`,
+        );
         error.status = 404;
         error.details = {
-          requestedProfessional,
+          requestedProfessional: requestedProfessionalDisplay,
           availableProfessionals: byProfessional.map((item) => item.name),
         };
         throw error;
@@ -2780,11 +2800,8 @@ async function getAvailability(
       if (!professionalHasOpenSchedule(matched)) {
         preferredProfessionalUnavailable = true;
         if (strictProfessional) {
-          const preferredTimesText = preferredProfessionalGeneralTimes.length
-            ? `Horarios de ${requestedProfessionalDisplay} no dia ${isoToBrDate(date) || date}: ${preferredProfessionalGeneralTimes.join(", ")}. `
-            : "";
           const error = new Error(
-            `${requestedProfessionalDisplay} nao possui agenda aberta para este servico nesta data. ${preferredTimesText}Caso esses horarios nao sirvam para voce, quer saber a disponibilidade de outros profissionais?`,
+            `${requestedProfessionalDisplay} nao possui agenda aberta para este servico nesta data. Caso queira, posso verificar com outras profissionais.`,
           );
           error.status = 409;
           error.details = {
@@ -2804,7 +2821,7 @@ async function getAvailability(
           if (strictProfessional) {
             const preferredTimesList = preferredProfessionalNearestTimes.length
               ? preferredProfessionalNearestTimes
-              : preferredProfessionalGeneralTimes;
+              : preferredProfessionalTimes;
             const error = new Error(
               preferredTimesList.length
                 ? `${requestedProfessionalDisplay} nao possui agenda livre as ${normalizedPreferredTime}. Horarios de ${requestedProfessionalDisplay} no dia ${isoToBrDate(date) || date}: ${preferredTimesList.join(", ")}. Caso esses horarios nao sirvam para voce, quer saber a disponibilidade de outros profissionais?`
@@ -2867,26 +2884,26 @@ async function getAvailability(
     message:
       requestedProfessional
         ? preferredProfessionalUnavailable
-          ? preferredProfessionalNearestTimes.length || preferredProfessionalGeneralTimes.length
-            ? `${requestedProfessionalDisplay} tem disponibilidade no dia ${isoToBrDate(date) || date} em: ${
+          ? preferredProfessionalNearestTimes.length || preferredProfessionalTimes.length
+            ? `${requestedProfessionalDisplay} tem disponibilidade para este servico no dia ${isoToBrDate(date) || date} em: ${
                 (preferredProfessionalNearestTimes.length
                   ? preferredProfessionalNearestTimes
-                  : preferredProfessionalGeneralTimes).join(", ")
+                  : preferredProfessionalTimes).join(", ")
               }. Caso esses horarios nao sirvam para voce, quer saber a disponibilidade de outros profissionais?`
-            : `${requestedProfessionalDisplay} nao tem agenda disponivel para este servico no dia ${isoToBrDate(date) || date}. Quer que eu verifique a disponibilidade de outros profissionais?`
+            : `${requestedProfessionalDisplay} nao tem disponibilidade para este servico no dia ${isoToBrDate(date) || date}. Quer que eu verifique a disponibilidade de outros profissionais?`
           : `Horarios com ${requestedProfessionalDisplay} em ${isoToBrDate(date) || date}.`
         : normalizedPreferredTime
           ? professionalsAtPreferredTime.length
             ? `Para ${service} em ${date} as ${normalizedPreferredTime}, profissionais disponiveis: ${professionalsAtPreferredTime.join(", ")}.${
                 professionalsAtPreferredTimeDay.length &&
                 normalizeForMatch(professionalsAtPreferredTimeDay.join(",")) !== normalizeForMatch(professionalsAtPreferredTime.join(","))
-                  ? ` No salao, em agenda geral no mesmo horario, tambem aparecem: ${professionalsAtPreferredTimeDay.join(", ")}.`
+                  ? ` No salao, em agenda geral no mesmo horario, tambem aparecem: ${professionalsAtPreferredTimeDay.join(", ")} (nem todas atendem este servico).`
                   : ""
               }`
             : `Nao encontrei profissionais disponiveis para ${service} em ${date} as ${normalizedPreferredTime}. Profissionais com agenda neste dia: ${allOpenDisplayNames.join(", ") || "nenhuma"}.${
                 allOpenDisplayNamesDay.length &&
                 normalizeForMatch(allOpenDisplayNamesDay.join(",")) !== normalizeForMatch(allOpenDisplayNames.join(","))
-                  ? ` Em agenda geral do salao no dia, tambem aparecem: ${allOpenDisplayNamesDay.join(", ")}.`
+                  ? ` Em agenda geral do salao no dia, tambem aparecem: ${allOpenDisplayNamesDay.join(", ")} (nem todas atendem este servico).`
                   : ""
               }`
           : `Horarios consultados para ${service} em ${date}`,
