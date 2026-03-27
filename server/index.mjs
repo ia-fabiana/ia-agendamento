@@ -1336,7 +1336,7 @@ Diretrizes:
 Fluxo:
 - Identifique o servico desejado.
 - Antes de sugerir horario, consulte disponibilidade real por profissional (checkAvailability).
-- Se a cliente nao tiver preferencia de profissional e informar horario desejado, mostre todas as profissionais que executam o servico e estao livres naquele horario.
+- Se a cliente nao tiver preferência de profissional e informar horario desejado, mostre todas as profissionais que executam o servico e estao livres naquele horario.
 - Para agendar, use bookAppointment.
 - Antes de finalizar o agendamento, sempre valide disponibilidade e apresente um resumo completo para confirmacao explicita da cliente.
 - Se houver mais de um servico, monte todos os itens no campo appointments da ferramenta bookAppointment.
@@ -1345,7 +1345,7 @@ Fluxo:
 - Regra critica: se a cliente pedir alteracao ou cancelamento, nao use bookAppointment antes de concluir reschedule/cancel.
 - Para desmarcar, priorize pedir codigo de confirmacao (TRK). Se a cliente nao tiver codigo, tente localizar pelo telefone da cliente na base Trinks e prossiga com seguranca.
 - Quando a cliente perguntar nomes de profissionais, consulte a ferramenta listProfessionalsForDate e responda apenas com dados reais.
-- Ao receber preferencia de profissional e/ou horario desejado, use checkAvailability com professionalName e preferredTime para trazer os horarios mais proximos possiveis.
+- Ao receber preferência de profissional e/ou horario desejado, use checkAvailability com professionalName e preferredTime para trazer os horarios mais proximos possiveis.
 - Se a profissional preferida nao estiver livre no horario desejado, primeiro mostre os horarios que ela tem no dia e depois pergunte: "Caso esses horarios nao sirvam para voce, quer saber a disponibilidade de outros profissionais?".
 
 Datas:
@@ -1890,8 +1890,8 @@ function buildConversationPrompt(history, message, knowledge, customerContext = 
     knownClientPhone
       ? `- Telefone da cliente (WhatsApp): ${knownClientPhone}.`
       : "- Telefone da cliente (WhatsApp): nao informado.",
-    "- Regra: pergunte sobre preferencia de profissional somente quando a cliente estiver tentando agendar horario.",
-    "- Regra: se nao houver preferencia de profissional e houver horario desejado, liste todas as profissionais disponiveis naquele horario.",
+    "- Regra: pergunte sobre preferência de profissional somente quando a cliente estiver tentando agendar horario.",
+    "- Regra: se nao houver preferência de profissional e houver horario desejado, liste todas as profissionais disponiveis naquele horario.",
     "- Regra: se a profissional preferida estiver indisponivel no horario pedido, primeiro mostre os horarios que ela tem no dia e so depois pergunte se a cliente quer disponibilidade de outros profissionais.",
     "- Regra: antes de efetivar qualquer agendamento, sempre apresente resumo completo e aguarde confirmacao explicita da cliente.",
     "- Regra: se o pedido atual for para cancelar ou alterar, nao abrir novo agendamento ate concluir o cancelamento/alteracao.",
@@ -4828,7 +4828,7 @@ async function sendChatMessage({ establishmentId, message, history, customerCont
 
   if (shouldAskPreferenceFirst) {
     const salutation = knownClientName ? `Perfeito, ${knownClientName}. ` : "Perfeito. ";
-    return `${salutation}Antes de eu sugerir os horarios, voce tem preferencia por alguma profissional?`;
+    return `${salutation}Antes de eu sugerir os horarios, voce tem preferência por alguma profissional?`;
   }
 
   if (shouldLookupProfessionalsDirectly(message)) {
