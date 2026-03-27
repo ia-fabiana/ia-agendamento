@@ -2709,10 +2709,14 @@ async function getAvailability(
   }
 
   const serviceId = Number(serviceIdFrom(foundService));
+  const resolvedServiceName = toNonEmptyString(
+    foundService?.nome || foundService?.name || foundService?.servicoNome || service,
+  ) || toNonEmptyString(service);
   const duration = Number(
     foundService?.duracaoEmMinutos || foundService?.duracao || foundService?.duracaoMinutos || 60,
   );
   const durationMinutes = Number.isFinite(duration) ? duration : 60;
+  const serviceAmount = Number(foundService?.valor || foundService?.preco || 0);
 
   const professionals = await getProfessionals({
     establishmentId,
@@ -2910,7 +2914,9 @@ async function getAvailability(
 
   return {
     serviceId: Number.isFinite(serviceId) ? serviceId : null,
+    serviceName: resolvedServiceName,
     durationMinutes,
+    serviceAmount: Number.isFinite(serviceAmount) ? serviceAmount : 0,
     availableTimes: flattenedTimes,
     occupiedTimes: [],
     professionals: responseProfessionals,
@@ -3080,8 +3086,17 @@ async function resolveBookingPreviewItem({
 
   return {
     service: normalizedService,
+    serviceResolvedName: toNonEmptyString(availability?.serviceName) || normalizedService,
+    serviceId: Number.isFinite(Number(availability?.serviceId)) ? Number(availability.serviceId) : null,
+    durationMinutes: Number.isFinite(Number(availability?.durationMinutes))
+      ? Number(availability.durationMinutes)
+      : null,
+    serviceAmount: Number.isFinite(Number(availability?.serviceAmount))
+      ? Number(availability.serviceAmount)
+      : 0,
     date: normalizedDate,
     time: normalizedTime,
+    professionalId: Number.isFinite(Number(selected?.id)) ? Number(selected.id) : null,
     professionalName: professionalDisplayName(selected.name),
   };
 }
@@ -3095,8 +3110,13 @@ async function executeConfirmedBookings({ establishmentId, clientName, clientPho
       const created = await createAppointment({
         establishmentId,
         service: item.service,
+        serviceResolvedName: item.serviceResolvedName,
+        serviceId: item.serviceId,
+        durationMinutes: item.durationMinutes,
+        serviceAmount: item.serviceAmount,
         date: item.date,
         time: item.time,
+        professionalId: item.professionalId,
         professionalName: item.professionalName,
         clientName,
         clientPhone,
@@ -3123,8 +3143,13 @@ async function executeConfirmedBookings({ establishmentId, clientName, clientPho
 async function createAppointment({
   establishmentId,
   service,
+  serviceResolvedName = "",
+  serviceId = null,
+  durationMinutes = null,
+  serviceAmount = null,
   date,
   time,
+  professionalId = null,
   professionalName,
   clientName,
   clientPhone,
@@ -3132,41 +3157,56 @@ async function createAppointment({
   const normalizedClientPhone = normalizePhone(clientPhone);
   const normalizedClientName = toNonEmptyString(clientName);
   const normalizedRequestedProfessional = toNonEmptyString(professionalName);
+  const resolvedServiceName = toNonEmptyString(serviceResolvedName) || toNonEmptyString(service);
+  const resolvedServiceId = Number(serviceId);
+  const resolvedDurationMinutes = Number(durationMinutes);
+  const resolvedServiceAmount = Number(serviceAmount);
+  const resolvedProfessionalId = Number(professionalId);
   const requestedTime = normalizeTimeValue(time);
   let payload = null;
   let resolvedProfessionalDisplay = "";
 
   try {
-    const foundService = await findServiceByName(establishmentId, service);
-    if (!foundService) {
-      const error = new Error(`Servico nao encontrado para: ${service}`);
-      error.status = 404;
-      throw error;
-    }
-
     if (!requestedTime) {
       const error = new Error(`Horario invalido: ${time}. Use o formato HH:mm.`);
       error.status = 400;
       throw error;
     }
 
-    const serviceId = serviceIdFrom(foundService);
-    if (!serviceId) {
-      const error = new Error("Servico sem ID valido no retorno da API Trinks.");
-      error.status = 422;
-      throw error;
-    }
+    let selectedServiceId = Number.isFinite(resolvedServiceId) ? resolvedServiceId : null;
+    let selectedDurationMinutes = Number.isFinite(resolvedDurationMinutes)
+      ? resolvedDurationMinutes
+      : 60;
+    let selectedAmount = Number.isFinite(resolvedServiceAmount) ? resolvedServiceAmount : 0;
 
-    const duration = Number(
-      foundService?.duracaoEmMinutos || foundService?.duracao || foundService?.duracaoMinutos || 60,
-    );
-    const amount = Number(foundService?.valor || foundService?.preco || 0);
-    const durationMinutes = Number.isFinite(duration) ? duration : 60;
+    if (!selectedServiceId) {
+      const foundService = await findServiceByName(establishmentId, service);
+      if (!foundService) {
+        const error = new Error(`Servico nao encontrado para: ${service}`);
+        error.status = 404;
+        throw error;
+      }
+
+      const foundServiceId = Number(serviceIdFrom(foundService));
+      if (!Number.isFinite(foundServiceId) || foundServiceId <= 0) {
+        const error = new Error("Servico sem ID valido no retorno da API Trinks.");
+        error.status = 422;
+        throw error;
+      }
+
+      selectedServiceId = foundServiceId;
+      const duration = Number(
+        foundService?.duracaoEmMinutos || foundService?.duracao || foundService?.duracaoMinutos || 60,
+      );
+      const amount = Number(foundService?.valor || foundService?.preco || 0);
+      selectedDurationMinutes = Number.isFinite(duration) ? duration : 60;
+      selectedAmount = Number.isFinite(amount) ? amount : 0;
+    }
 
     const professionals = await getProfessionals({
       establishmentId,
       date,
-      serviceId: Number(serviceId),
+      serviceId: selectedServiceId,
     });
 
     if (!professionals.length) {
@@ -3180,14 +3220,19 @@ async function createAppointment({
       name: item.name,
       availableTimes: uniqueSortedTimes(
         item.availableTimes.filter((slot) =>
-          isSlotCompatibleWithIntervals(slot, durationMinutes, item.availableIntervals),
+          isSlotCompatibleWithIntervals(slot, selectedDurationMinutes, item.availableIntervals),
         ),
       ),
       availableIntervals: item.availableIntervals,
     }));
 
     let professional = null;
-    if (normalizedRequestedProfessional) {
+    if (Number.isFinite(resolvedProfessionalId) && resolvedProfessionalId > 0) {
+      professional =
+        normalizedProfessionals.find((item) => Number(item.id) === resolvedProfessionalId) || null;
+    }
+
+    if (!professional && normalizedRequestedProfessional) {
       professional = findProfessionalByName(normalizedProfessionals, normalizedRequestedProfessional);
       if (!professional) {
         const error = new Error(`Profissional nao encontrada para: ${normalizedRequestedProfessional}`);
@@ -3222,7 +3267,7 @@ async function createAppointment({
         };
         throw error;
       }
-    } else {
+    } else if (!professional) {
       professional =
         normalizedProfessionals.find((item) => item.availableTimes.includes(requestedTime)) || null;
 
@@ -3256,12 +3301,12 @@ async function createAppointment({
     }
 
     payload = {
-      servicoId: Number(serviceId),
+      servicoId: Number(selectedServiceId),
       clienteId: Number(clientId),
       profissionalId: Number(professional.id),
       dataHoraInicio: toIsoDateTime(date, requestedTime),
-      duracaoEmMinutos: durationMinutes,
-      valor: Number.isFinite(amount) ? amount : 0,
+      duracaoEmMinutos: selectedDurationMinutes,
+      valor: Number.isFinite(selectedAmount) ? selectedAmount : 0,
       observacoes: "Agendamento criado via IA.AGENDAMENTO",
       confirmado: true,
     };
@@ -3298,7 +3343,7 @@ async function createAppointment({
       confirmationCode,
       clientPhone: normalizedClientPhone,
       clientName: normalizedClientName,
-      serviceName: service,
+      serviceName: resolvedServiceName || service,
       professionalName: resolvedProfessionalDisplay,
       date,
       time: requestedTime,
@@ -3315,7 +3360,7 @@ async function createAppointment({
       confirmationCode: "",
       clientPhone: normalizedClientPhone,
       clientName: normalizedClientName,
-      serviceName: service,
+      serviceName: resolvedServiceName || service,
       professionalName: resolvedProfessionalDisplay || normalizedRequestedProfessional,
       date,
       time: requestedTime || String(time || ""),
