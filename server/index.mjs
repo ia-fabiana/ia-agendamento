@@ -2633,7 +2633,7 @@ async function getAvailability(
   establishmentId,
   service,
   date,
-  { professionalName = "", preferredTime = "" } = {},
+  { professionalName = "", preferredTime = "", strictProfessional = false } = {},
 ) {
   const foundService = await findServiceByName(establishmentId, service);
   if (!foundService) {
@@ -2673,45 +2673,165 @@ async function getAvailability(
       availableIntervals: professional.availableIntervals,
     };
   });
+
+  let byProfessionalAllDay = byProfessional;
+  if (!strictProfessional) {
+    try {
+      const allDayProfessionalsRaw = await getProfessionals({
+        establishmentId,
+        date,
+      });
+      byProfessionalAllDay = allDayProfessionalsRaw.map((professional) => {
+        const compatibleTimes = uniqueSortedTimes(
+          professional.availableTimes.filter((time) =>
+            isSlotCompatibleWithIntervals(time, durationMinutes, professional.availableIntervals),
+          ),
+        );
+        return {
+          id: professional.id,
+          name: professional.name,
+          availableTimes: compatibleTimes,
+          availableIntervals: professional.availableIntervals,
+        };
+      });
+    } catch {
+      byProfessionalAllDay = byProfessional;
+    }
+  }
+
+  const allOpenProfessionals = byProfessional.filter(professionalHasOpenSchedule);
+  const allOpenDisplayNames = uniqueProfessionalDisplayNames(allOpenProfessionals.map((item) => item.name));
+  const allOpenProfessionalsDay = byProfessionalAllDay.filter(professionalHasOpenSchedule);
+  const allOpenDisplayNamesDay = uniqueProfessionalDisplayNames(allOpenProfessionalsDay.map((item) => item.name));
   const professionalsAtPreferredTime = normalizedPreferredTime
     ? uniqueProfessionalDisplayNames(
-        byProfessional
+        allOpenProfessionals
+          .filter((item) => Array.isArray(item.availableTimes) && item.availableTimes.includes(normalizedPreferredTime))
+          .map((item) => item.name),
+      )
+    : [];
+  const professionalsAtPreferredTimeDay = normalizedPreferredTime
+    ? uniqueProfessionalDisplayNames(
+        allOpenProfessionalsDay
           .filter((item) => Array.isArray(item.availableTimes) && item.availableTimes.includes(normalizedPreferredTime))
           .map((item) => item.name),
       )
     : [];
 
-  let scopedProfessionals = byProfessional.filter(professionalHasOpenSchedule);
+  let scopedProfessionals = allOpenProfessionals;
+  let requestedProfessionalDisplay = requestedProfessional ? professionalDisplayName(requestedProfessional) : null;
+  let preferredProfessionalUnavailable = false;
+  let preferredProfessionalTimes = [];
+  let preferredProfessionalGeneralTimes = [];
+  let preferredProfessionalNearestTimes = [];
+  let otherOpenDisplayNames = allOpenDisplayNames;
+  let otherProfessionalsAtPreferredTime = professionalsAtPreferredTime;
+
   if (requestedProfessional) {
     const matched = findProfessionalByName(byProfessional, requestedProfessional);
     if (!matched) {
-      const error = new Error(`Profissional nao encontrada para: ${requestedProfessional}`);
-      error.status = 404;
-      error.details = {
-        requestedProfessional,
-        availableProfessionals: byProfessional.map((item) => item.name),
-      };
-      throw error;
-    }
-    if (!professionalHasOpenSchedule(matched)) {
-      const otherOpenNames = uniqueProfessionalDisplayNames(
-        byProfessional.filter(professionalHasOpenSchedule).map((item) => item.name),
+      if (!strictProfessional) {
+        preferredProfessionalUnavailable = true;
+        const matchedAllDay = findProfessionalByName(byProfessionalAllDay, requestedProfessional);
+        preferredProfessionalGeneralTimes = matchedAllDay?.availableTimes ? uniqueSortedTimes(matchedAllDay.availableTimes) : [];
+        const normalizedRequested = normalizeForMatch(requestedProfessional);
+        otherOpenDisplayNames = uniqueProfessionalDisplayNames(
+          allOpenProfessionals
+            .filter((item) => normalizeForMatch(item.name) !== normalizedRequested)
+            .map((item) => item.name),
+        );
+        otherProfessionalsAtPreferredTime = normalizedPreferredTime
+          ? uniqueProfessionalDisplayNames(
+              allOpenProfessionals
+                .filter((item) => normalizeForMatch(item.name) !== normalizedRequested)
+                .filter((item) => item.availableTimes.includes(normalizedPreferredTime))
+                .map((item) => item.name),
+            )
+          : otherOpenDisplayNames;
+      } else {
+        const error = new Error(`Profissional nao encontrada para: ${requestedProfessional}`);
+        error.status = 404;
+        error.details = {
+          requestedProfessional,
+          availableProfessionals: byProfessional.map((item) => item.name),
+        };
+        throw error;
+      }
+    } else {
+      requestedProfessionalDisplay = professionalDisplayName(matched.name);
+      preferredProfessionalTimes = uniqueSortedTimes(matched.availableTimes);
+      preferredProfessionalNearestTimes = rankTimesByPreferredTime(matched.availableTimes, normalizedPreferredTime).slice(0, 8);
+      const matchedAllDay = findProfessionalByName(byProfessionalAllDay, requestedProfessional);
+      preferredProfessionalGeneralTimes = matchedAllDay?.availableTimes ? uniqueSortedTimes(matchedAllDay.availableTimes) : [];
+      otherOpenDisplayNames = uniqueProfessionalDisplayNames(
+        allOpenProfessionals
+          .filter((item) => normalizeForMatch(item.name) !== normalizeForMatch(matched.name))
+          .map((item) => item.name),
       );
-      const displayPreferred = professionalDisplayName(matched.name);
-      const error = new Error(
-        otherOpenNames.length
-          ? `${displayPreferred} nao possui agenda aberta para este servico nesta data. Deseja que eu continue buscando outro horario com ${displayPreferred} ou prefere ver opcoes com outras profissionais (${otherOpenNames.join(", ")})?`
-          : `${displayPreferred} nao possui agenda aberta para este servico nesta data. Deseja que eu continue buscando outro horario com ${displayPreferred}?`,
-      );
-      error.status = 409;
-      error.details = {
-        requestedProfessional: displayPreferred,
-        requestedDate: date,
-        otherProfessionals: otherOpenNames,
-      };
-      throw error;
+      otherProfessionalsAtPreferredTime = normalizedPreferredTime
+        ? uniqueProfessionalDisplayNames(
+            allOpenProfessionals
+              .filter((item) => normalizeForMatch(item.name) !== normalizeForMatch(matched.name))
+              .filter((item) => item.availableTimes.includes(normalizedPreferredTime))
+              .map((item) => item.name),
+          )
+        : otherOpenDisplayNames;
+
+      if (!professionalHasOpenSchedule(matched)) {
+        preferredProfessionalUnavailable = true;
+        if (strictProfessional) {
+          const error = new Error(
+            otherOpenDisplayNames.length
+              ? `${requestedProfessionalDisplay} nao possui agenda aberta para este servico nesta data. Deseja que eu continue buscando outro horario com ${requestedProfessionalDisplay} ou prefere ver opcoes com outras profissionais (${otherOpenDisplayNames.join(", ")})?`
+              : `${requestedProfessionalDisplay} nao possui agenda aberta para este servico nesta data. Deseja que eu continue buscando outro horario com ${requestedProfessionalDisplay}?`,
+          );
+          error.status = 409;
+          error.details = {
+            requestedProfessional: requestedProfessionalDisplay,
+            requestedDate: date,
+            preferredProfessionalTimes,
+            preferredProfessionalGeneralTimes,
+            preferredProfessionalNearestTimes,
+            otherProfessionals: otherOpenDisplayNames,
+            otherProfessionalsAtPreferredTime,
+          };
+          throw error;
+        }
+      } else {
+        if (normalizedPreferredTime && !matched.availableTimes.includes(normalizedPreferredTime)) {
+          preferredProfessionalUnavailable = true;
+          if (strictProfessional) {
+            const error = new Error(
+              preferredProfessionalNearestTimes.length
+                ? `${requestedProfessionalDisplay} nao possui agenda livre as ${normalizedPreferredTime}. Horarios com ${requestedProfessionalDisplay}: ${preferredProfessionalNearestTimes.join(", ")}. ${
+                    otherProfessionalsAtPreferredTime.length
+                      ? `Deseja continuar buscando com ${requestedProfessionalDisplay} ou prefere opcoes no mesmo horario com outras profissionais (${otherProfessionalsAtPreferredTime.join(", ")})?`
+                      : `Deseja continuar buscando com ${requestedProfessionalDisplay} ou prefere opcoes com outras profissionais (${otherOpenDisplayNames.join(", ")})?`
+                  }`
+                : `${requestedProfessionalDisplay} nao possui agenda livre as ${normalizedPreferredTime}. ${
+                    otherOpenDisplayNames.length
+                      ? `Deseja continuar buscando com ${requestedProfessionalDisplay} ou prefere opcoes com outras profissionais (${otherOpenDisplayNames.join(", ")})?`
+                      : `Deseja continuar buscando com ${requestedProfessionalDisplay}?`
+                  }`,
+            );
+            error.status = 409;
+            error.details = {
+              requestedProfessional: requestedProfessionalDisplay,
+              requestedDate: date,
+              requestedTime: normalizedPreferredTime,
+              preferredProfessionalTimes,
+              preferredProfessionalGeneralTimes,
+              preferredProfessionalNearestTimes,
+              otherProfessionals: otherOpenDisplayNames,
+              otherProfessionalsAtPreferredTime,
+            };
+            throw error;
+          }
+        } else {
+          scopedProfessionals = [matched];
+        }
+      }
     }
-    scopedProfessionals = [matched];
   }
 
   const flattenedTimes = uniqueSortedTimes(scopedProfessionals.flatMap((item) => item.availableTimes));
@@ -2737,14 +2857,61 @@ async function getAvailability(
     professionals: responseProfessionals,
     suggestions,
     professionalsAtPreferredTime,
-    requestedProfessional: requestedProfessional ? professionalDisplayName(requestedProfessional) : null,
+    allOpenProfessionals: allOpenDisplayNames,
+    allOpenProfessionalsDay: allOpenDisplayNamesDay,
+    requestedProfessional: requestedProfessionalDisplay,
+    preferredProfessionalUnavailable,
+    preferredProfessionalTimes,
+    preferredProfessionalGeneralTimes,
+    preferredProfessionalNearestTimes,
+    otherProfessionals: otherOpenDisplayNames,
+    otherProfessionalsAtPreferredTime,
+    professionalsAtPreferredTimeDay,
     preferredTime: normalizedPreferredTime || null,
     message:
-      normalizedPreferredTime && !requestedProfessional
-        ? professionalsAtPreferredTime.length
-          ? `Para ${service} em ${date} as ${normalizedPreferredTime}, profissionais disponiveis: ${professionalsAtPreferredTime.join(", ")}.`
-          : `Nao encontrei profissionais disponiveis para ${service} em ${date} as ${normalizedPreferredTime}.`
-        : `Horarios consultados para ${service} em ${date}`,
+      requestedProfessional
+        ? preferredProfessionalUnavailable
+          ? preferredProfessionalNearestTimes.length || preferredProfessionalGeneralTimes.length
+            ? `${requestedProfessionalDisplay} nao esta livre no horario solicitado para este servico. Horarios de ${requestedProfessionalDisplay} no dia: ${
+                (preferredProfessionalNearestTimes.length
+                  ? preferredProfessionalNearestTimes
+                  : preferredProfessionalGeneralTimes).join(", ")
+              }. ${
+                otherOpenDisplayNames.length
+                  ? `Outras profissionais para este servico no dia: ${otherOpenDisplayNames.join(", ")}.`
+                  : ""
+              }${
+                allOpenDisplayNamesDay.length &&
+                normalizeForMatch(allOpenDisplayNamesDay.join(",")) !== normalizeForMatch(allOpenDisplayNames.join(","))
+                  ? ` Em agenda geral do salao no dia, tambem aparecem: ${allOpenDisplayNamesDay.join(", ")}.`
+                  : ""
+              }`
+            : `${requestedProfessionalDisplay} nao esta disponivel para este servico neste dia. ${
+                otherOpenDisplayNames.length
+                  ? `Outras profissionais disponiveis: ${otherOpenDisplayNames.join(", ")}.`
+                  : ""
+              }${
+                allOpenDisplayNamesDay.length &&
+                normalizeForMatch(allOpenDisplayNamesDay.join(",")) !== normalizeForMatch(allOpenDisplayNames.join(","))
+                  ? ` Em agenda geral do salao no dia, tambem aparecem: ${allOpenDisplayNamesDay.join(", ")}.`
+                  : ""
+              }`
+          : `Horarios com ${requestedProfessionalDisplay} em ${date}.`
+        : normalizedPreferredTime
+          ? professionalsAtPreferredTime.length
+            ? `Para ${service} em ${date} as ${normalizedPreferredTime}, profissionais disponiveis: ${professionalsAtPreferredTime.join(", ")}.${
+                professionalsAtPreferredTimeDay.length &&
+                normalizeForMatch(professionalsAtPreferredTimeDay.join(",")) !== normalizeForMatch(professionalsAtPreferredTime.join(","))
+                  ? ` No salao, em agenda geral no mesmo horario, tambem aparecem: ${professionalsAtPreferredTimeDay.join(", ")}.`
+                  : ""
+              }`
+            : `Nao encontrei profissionais disponiveis para ${service} em ${date} as ${normalizedPreferredTime}. Profissionais com agenda neste dia: ${allOpenDisplayNames.join(", ") || "nenhuma"}.${
+                allOpenDisplayNamesDay.length &&
+                normalizeForMatch(allOpenDisplayNamesDay.join(",")) !== normalizeForMatch(allOpenDisplayNames.join(","))
+                  ? ` Em agenda geral do salao no dia, tambem aparecem: ${allOpenDisplayNamesDay.join(", ")}.`
+                  : ""
+              }`
+          : `Horarios consultados para ${service} em ${date}`,
   };
 }
 
@@ -2811,6 +2978,7 @@ async function resolveBookingPreviewItem({
     {
       professionalName: requestedProfessional,
       preferredTime: normalizedTime,
+      strictProfessional: true,
     },
   );
 
