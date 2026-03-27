@@ -1,22 +1,3 @@
-  // Função para desconectar WhatsApp
-  const handleDisconnectWhatsapp = async () => {
-    if (!appointmentService.current || isLoadingWhatsapp || !ensureWhatsappInstance()) return;
-    setIsLoadingWhatsapp(true);
-    setWhatsappError("");
-    try {
-      await appointmentService.current.disconnectEvolutionInstance(whatsappInstance.trim());
-      setWhatsappStatus(null);
-      setWhatsappQr(null);
-      setInboxConversations([]);
-      setInboxMessages([]);
-      setSelectedWhatsapp("");
-    } catch (error) {
-      const message = error instanceof Error ? error.message : "Erro ao desconectar WhatsApp.";
-      setWhatsappError(message);
-    } finally {
-      setIsLoadingWhatsapp(false);
-    }
-  };
 import React, { useState, useEffect, useRef } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
 import { Send, Calendar, Sparkles, Phone } from 'lucide-react';
@@ -29,7 +10,7 @@ interface Message {
   timestamp: Date;
 }
 
-type TopSection = 'chat' | 'services' | 'salon' | 'contact' | 'knowledge' | 'inbox';
+type TopSection = 'chat' | 'services' | 'salon' | 'contact' | 'knowledge' | 'inbox' | 'history';
 type EvolutionStatus = {
   status?: string;
   instance?: string;
@@ -61,6 +42,44 @@ type WhatsappMessage = {
   content: string;
   at?: string;
   senderName?: string;
+};
+
+type DbConversation = {
+  phone: string;
+  name?: string;
+  lastMessage?: string;
+  lastRole?: string;
+  updatedAt?: string;
+  count?: number;
+};
+
+type DbMessage = {
+  id?: number;
+  phone?: string;
+  role: 'user' | 'assistant';
+  content: string;
+  senderName?: string;
+  at?: string;
+  source?: string;
+};
+
+type AuditItem = {
+  id?: number;
+  eventType?: string;
+  status?: string;
+  establishmentId?: number;
+  appointmentId?: number;
+  confirmationCode?: string;
+  clientPhone?: string;
+  clientName?: string;
+  serviceName?: string;
+  professionalName?: string;
+  date?: string;
+  time?: string;
+  requestPayload?: Record<string, any> | null;
+  responsePayload?: Record<string, any> | null;
+  errorMessage?: string;
+  createdAt?: string;
 };
 
 const initialKnowledge = {
@@ -95,6 +114,16 @@ function toText(value: unknown) {
   return typeof value === 'string' ? value : '';
 }
 
+function normalizeDigits(value: string) {
+  return String(value || '').replace(/\D/g, '');
+}
+
+function csvEscape(value: unknown) {
+  const text = typeof value === 'string' ? value : value === null || value === undefined ? '' : String(value);
+  const escaped = text.replace(/"/g, '""');
+  return `"${escaped}"`;
+}
+
 export default function App() {
   const [messages, setMessages] = useState<Message[]>([
     {
@@ -122,6 +151,15 @@ export default function App() {
   const [inboxDraft, setInboxDraft] = useState('');
   const [isLoadingInbox, setIsLoadingInbox] = useState(false);
   const [inboxError, setInboxError] = useState('');
+  const [historyConversations, setHistoryConversations] = useState<DbConversation[]>([]);
+  const [historyMessages, setHistoryMessages] = useState<DbMessage[]>([]);
+  const [historyAudit, setHistoryAudit] = useState<AuditItem[]>([]);
+  const [selectedHistoryPhone, setSelectedHistoryPhone] = useState('');
+  const [historyPhoneFilter, setHistoryPhoneFilter] = useState('');
+  const [historyStatusFilter, setHistoryStatusFilter] = useState<'all' | 'success' | 'error'>('all');
+  const [historyLimit, setHistoryLimit] = useState(200);
+  const [isLoadingHistory, setIsLoadingHistory] = useState(false);
+  const [historyError, setHistoryError] = useState('');
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const appointmentService = useRef<AppointmentService | null>(null);
 
@@ -160,6 +198,18 @@ export default function App() {
       loadInboxMessages(selectedWhatsapp);
     }
   }, [activeSection, selectedWhatsapp]);
+
+  useEffect(() => {
+    if (activeSection === 'history') {
+      loadHistory();
+    }
+  }, [activeSection]);
+
+  useEffect(() => {
+    if (activeSection === 'history' && selectedHistoryPhone) {
+      loadHistoryMessages(selectedHistoryPhone);
+    }
+  }, [activeSection, selectedHistoryPhone]);
 
   const handleSend = async () => {
     if (!input.trim() || isLoading) return;
@@ -320,6 +370,129 @@ export default function App() {
     }
   };
 
+  const handleDisconnectWhatsapp = async () => {
+    if (!appointmentService.current || isLoadingWhatsapp || !ensureWhatsappInstance()) return;
+    setIsLoadingWhatsapp(true);
+    setWhatsappError('');
+    try {
+      await appointmentService.current.disconnectEvolutionInstance(whatsappInstance.trim());
+      setWhatsappStatus(null);
+      setWhatsappQr(null);
+      setInboxConversations([]);
+      setInboxMessages([]);
+      setSelectedWhatsapp('');
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Erro ao desconectar WhatsApp.';
+      setWhatsappError(message);
+    } finally {
+      setIsLoadingWhatsapp(false);
+    }
+  };
+
+  const loadHistoryMessages = async (phone: string) => {
+    if (!appointmentService.current || !phone) return;
+
+    try {
+      const messages = await appointmentService.current.getDbMessages(normalizeDigits(phone), historyLimit);
+      setHistoryMessages(messages);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Erro ao carregar mensagens do historico.';
+      setHistoryError(message);
+    }
+  };
+
+  const loadHistory = async (forcedPhone = '') => {
+    if (!appointmentService.current || isLoadingHistory) return;
+    setIsLoadingHistory(true);
+    setHistoryError('');
+
+    try {
+      const phoneCandidate = normalizeDigits(forcedPhone || historyPhoneFilter || selectedHistoryPhone);
+      const statusCandidate = historyStatusFilter === 'all' ? '' : historyStatusFilter;
+
+      const [conversations, audit] = await Promise.all([
+        appointmentService.current.getDbConversations(200),
+        appointmentService.current.getAppointmentsAudit({
+          phone: phoneCandidate || undefined,
+          status: statusCandidate || undefined,
+          limit: historyLimit,
+        }),
+      ]);
+
+      setHistoryConversations(conversations);
+      setHistoryAudit(audit);
+
+      if (phoneCandidate) {
+        setSelectedHistoryPhone(phoneCandidate);
+      } else if (!selectedHistoryPhone && conversations[0]?.phone) {
+        setSelectedHistoryPhone(normalizeDigits(conversations[0].phone));
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Erro ao carregar historico.';
+      setHistoryError(message);
+    } finally {
+      setIsLoadingHistory(false);
+    }
+  };
+
+  const handleApplyHistoryFilters = async () => {
+    await loadHistory(historyPhoneFilter);
+  };
+
+  const handleExportAuditCsv = () => {
+    if (!historyAudit.length) {
+      setHistoryError('Nao ha dados de auditoria para exportar.');
+      return;
+    }
+
+    const header = [
+      'id',
+      'createdAt',
+      'eventType',
+      'status',
+      'clientName',
+      'clientPhone',
+      'serviceName',
+      'professionalName',
+      'date',
+      'time',
+      'confirmationCode',
+      'appointmentId',
+      'requestReference',
+      'errorMessage',
+    ];
+
+    const rows = historyAudit.map((item) => {
+      const requestReference = toText(item?.requestPayload?.requestReference);
+      return [
+        item.id ?? '',
+        item.createdAt ?? '',
+        item.eventType ?? '',
+        item.status ?? '',
+        item.clientName ?? '',
+        item.clientPhone ?? '',
+        item.serviceName ?? '',
+        item.professionalName ?? '',
+        item.date ?? '',
+        item.time ?? '',
+        item.confirmationCode ?? '',
+        item.appointmentId ?? '',
+        requestReference,
+        item.errorMessage ?? '',
+      ].map(csvEscape).join(',');
+    });
+
+    const csv = [header.map(csvEscape).join(','), ...rows].join('\n');
+    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-');
+    a.href = url;
+    a.download = `historico-agendamentos-${stamp}.csv`;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
   const loadInbox = async () => {
     if (!appointmentService.current || isLoadingInbox) return;
     setIsLoadingInbox(true);
@@ -391,6 +564,7 @@ export default function App() {
           <button onClick={() => setActiveSection('services')} className="hover:text-white cursor-pointer transition-colors">Servicos</button>
           <button onClick={() => setActiveSection('salon')} className="hover:text-white cursor-pointer transition-colors">O Salao</button>
           <button onClick={() => setActiveSection('inbox')} className="hover:text-white cursor-pointer transition-colors">Inbox</button>
+          <button onClick={() => setActiveSection('history')} className="hover:text-white cursor-pointer transition-colors">Historico</button>
           <button onClick={() => setActiveSection('contact')} className="hover:text-white cursor-pointer transition-colors">Contato</button>
           <button onClick={() => setActiveSection('knowledge')} className="hover:text-white cursor-pointer transition-colors">Base</button>
         </div>
@@ -579,6 +753,178 @@ export default function App() {
                         </div>
                       </>
                     )}
+                  </div>
+                </div>
+              </>
+            )}
+
+            {activeSection === 'history' && (
+              <>
+                <div className="flex items-center justify-between gap-3 flex-wrap">
+                  <h2 className="heading-bold text-lg text-white">Historico e Auditoria</h2>
+                  <div className="flex items-center gap-2">
+                    <button
+                      onClick={handleApplyHistoryFilters}
+                      disabled={isLoadingHistory}
+                      className="px-4 py-2 rounded-lg bg-brand-blue text-white text-xs uppercase tracking-wider disabled:opacity-50"
+                    >
+                      {isLoadingHistory ? 'Atualizando...' : 'Atualizar'}
+                    </button>
+                    <button
+                      onClick={handleExportAuditCsv}
+                      disabled={isLoadingHistory || !historyAudit.length}
+                      className="px-4 py-2 rounded-lg bg-white/10 text-white text-xs uppercase tracking-wider disabled:opacity-50"
+                    >
+                      Exportar CSV
+                    </button>
+                  </div>
+                </div>
+
+                <div className="grid sm:grid-cols-[1fr_180px_120px] gap-3">
+                  <input
+                    value={historyPhoneFilter}
+                    onChange={(e) => setHistoryPhoneFilter(normalizeDigits(e.target.value))}
+                    placeholder="Filtrar por telefone (somente numeros)"
+                    className="rounded-md bg-[#0f1731] border border-white/15 text-white/90 px-3 py-2 text-sm"
+                  />
+                  <select
+                    value={historyStatusFilter}
+                    onChange={(e) => setHistoryStatusFilter(e.target.value as 'all' | 'success' | 'error')}
+                    className="rounded-md bg-[#0f1731] border border-white/15 text-white/90 px-3 py-2 text-sm"
+                  >
+                    <option value="all">Status: Todos</option>
+                    <option value="success">Status: Sucesso</option>
+                    <option value="error">Status: Erro</option>
+                  </select>
+                  <input
+                    type="number"
+                    min={10}
+                    max={1000}
+                    value={historyLimit}
+                    onChange={(e) => {
+                      const next = Number(e.target.value || 200);
+                      const bounded = Number.isFinite(next) ? Math.min(1000, Math.max(10, next)) : 200;
+                      setHistoryLimit(bounded);
+                    }}
+                    className="rounded-md bg-[#0f1731] border border-white/15 text-white/90 px-3 py-2 text-sm"
+                    title="Quantidade maxima de registros"
+                  />
+                </div>
+
+                {historyError && <p className="text-xs text-red-300">{historyError}</p>}
+
+                <div className="grid lg:grid-cols-[280px_1fr] gap-4">
+                  <div className="rounded-2xl bg-white/5 border border-white/10 p-3 max-h-[420px] overflow-y-auto">
+                    <p className="text-xs uppercase tracking-widest text-white/60 mb-2">Conversas</p>
+                    {!historyConversations.length && (
+                      <p className="text-white/70 text-sm">Sem conversas registradas.</p>
+                    )}
+                    <div className="space-y-2">
+                      {historyConversations.map((item) => (
+                        <button
+                          key={`history-conv-${item.phone}`}
+                          onClick={() => {
+                            const phone = normalizeDigits(item.phone || '');
+                            setSelectedHistoryPhone(phone);
+                            setHistoryPhoneFilter(phone);
+                            loadHistory(phone);
+                          }}
+                          className={`w-full text-left rounded-xl border p-3 transition-colors ${
+                            selectedHistoryPhone === normalizeDigits(item.phone || '')
+                              ? 'border-brand-blue bg-white/10'
+                              : 'border-white/10 bg-white/5 hover:bg-white/10'
+                          }`}
+                        >
+                          <div className="text-sm text-white">{item.name || item.phone}</div>
+                          <div className="text-[11px] text-white/60 truncate">
+                            {item.lastRole === 'assistant' ? 'IA: ' : ''}{item.lastMessage || 'Sem mensagens'}
+                          </div>
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  <div className="rounded-2xl bg-white/5 border border-white/10 p-4 min-h-[420px]">
+                    <p className="text-xs uppercase tracking-widest text-white/60 mb-2">Mensagens</p>
+                    {!selectedHistoryPhone && (
+                      <p className="text-white/70 text-sm">Selecione um telefone para visualizar as mensagens.</p>
+                    )}
+                    {selectedHistoryPhone && (
+                      <>
+                        <p className="text-xs text-white/60 mb-3">
+                          Telefone: <span className="text-white">{selectedHistoryPhone}</span>
+                        </p>
+                        <div className="space-y-2 max-h-[320px] overflow-y-auto pr-1">
+                          {!historyMessages.length && (
+                            <p className="text-white/70 text-sm">Sem mensagens para este telefone.</p>
+                          )}
+                          {historyMessages.map((msg, idx) => (
+                            <div
+                              key={`history-msg-${msg.id || msg.at || idx}`}
+                              className={`rounded-xl px-3 py-2 text-sm ${
+                                msg.role === 'assistant' ? 'bg-brand-blue/20 text-white' : 'bg-white/10 text-white/90'
+                              }`}
+                            >
+                              <div>{msg.content}</div>
+                              <div className="text-[10px] text-white/50 mt-1">
+                                {(msg.at && new Date(msg.at).toLocaleString('pt-BR')) || 'Sem data'}
+                                {msg.source ? ` | origem: ${msg.source}` : ''}
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      </>
+                    )}
+                  </div>
+                </div>
+
+                <div className="rounded-2xl bg-white/5 border border-white/10 p-4">
+                  <p className="text-xs uppercase tracking-widest text-white/60 mb-3">
+                    Auditoria de Agendamentos ({historyAudit.length})
+                  </p>
+                  <div className="overflow-x-auto">
+                    <table className="w-full text-left text-xs text-white/85">
+                      <thead className="text-white/60">
+                        <tr>
+                          <th className="py-2 pr-4">Data</th>
+                          <th className="py-2 pr-4">Status</th>
+                          <th className="py-2 pr-4">Cliente</th>
+                          <th className="py-2 pr-4">Servico</th>
+                          <th className="py-2 pr-4">Profissional</th>
+                          <th className="py-2 pr-4">Horario</th>
+                          <th className="py-2 pr-4">TRK</th>
+                          <th className="py-2 pr-4">REQ</th>
+                          <th className="py-2 pr-0">Erro</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {!historyAudit.length && (
+                          <tr>
+                            <td colSpan={9} className="py-3 text-white/60">
+                              Nenhum registro de auditoria para os filtros atuais.
+                            </td>
+                          </tr>
+                        )}
+                        {historyAudit.map((item) => {
+                          const requestReference = toText(item?.requestPayload?.requestReference);
+                          return (
+                            <tr key={`audit-${item.id || `${item.createdAt}-${item.appointmentId}`}`} className="border-t border-white/10">
+                              <td className="py-2 pr-4 whitespace-nowrap">
+                                {item.createdAt ? new Date(item.createdAt).toLocaleString('pt-BR') : '-'}
+                              </td>
+                              <td className="py-2 pr-4 uppercase">{item.status || '-'}</td>
+                              <td className="py-2 pr-4">{item.clientName || item.clientPhone || '-'}</td>
+                              <td className="py-2 pr-4">{item.serviceName || '-'}</td>
+                              <td className="py-2 pr-4">{item.professionalName || '-'}</td>
+                              <td className="py-2 pr-4 whitespace-nowrap">{item.date || '-'} {item.time || ''}</td>
+                              <td className="py-2 pr-4 whitespace-nowrap">{item.confirmationCode || '-'}</td>
+                              <td className="py-2 pr-4 whitespace-nowrap">{requestReference || '-'}</td>
+                              <td className="py-2 pr-0 text-red-200">{item.errorMessage || '-'}</td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
                   </div>
                 </div>
               </>
@@ -1222,6 +1568,12 @@ export default function App() {
             className="px-4 py-2 rounded-full glass label-micro text-white/60 hover:text-white hover:border-white/30 transition-all flex items-center gap-2"
           >
             <Sparkles className="w-3 h-3 text-white/70" /> Editar Base
+          </button>
+          <button
+            onClick={() => setActiveSection('history')}
+            className="px-4 py-2 rounded-full glass label-micro text-white/60 hover:text-white hover:border-white/30 transition-all flex items-center gap-2"
+          >
+            <Calendar className="w-3 h-3 text-white/70" /> Historico
           </button>
         </div>
       </main>

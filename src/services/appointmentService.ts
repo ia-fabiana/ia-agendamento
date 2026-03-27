@@ -39,6 +39,44 @@ type WhatsappMessage = {
   senderName?: string;
 };
 
+type DbConversation = {
+  phone: string;
+  name?: string;
+  lastMessage?: string;
+  lastRole?: string;
+  updatedAt?: string;
+  count?: number;
+};
+
+type DbMessage = {
+  id?: number;
+  phone?: string;
+  role: "user" | "assistant";
+  content: string;
+  senderName?: string;
+  at?: string;
+  source?: string;
+};
+
+type AppointmentAuditItem = {
+  id?: number;
+  eventType?: string;
+  status?: string;
+  establishmentId?: number;
+  appointmentId?: number;
+  confirmationCode?: string;
+  clientPhone?: string;
+  clientName?: string;
+  serviceName?: string;
+  professionalName?: string;
+  date?: string;
+  time?: string;
+  requestPayload?: Record<string, unknown> | null;
+  responsePayload?: Record<string, unknown> | null;
+  errorMessage?: string;
+  createdAt?: string;
+};
+
 export class AppointmentService {
   private backendUrl: string;
   private establishmentId: string;
@@ -276,6 +314,68 @@ export class AppointmentService {
     }
 
     return response.json();
+  }
+
+  async getDbConversations(limit = 100) {
+    const response = await fetch(
+      this.getBackendEndpoint(`/api/db/conversations?limit=${encodeURIComponent(String(limit))}`),
+      {
+        method: "GET",
+        headers: { "Content-Type": "application/json" },
+      },
+    );
+
+    if (!response.ok) {
+      throw new Error(`Falha ao carregar conversas do banco (${response.status}).`);
+    }
+
+    const data = (await response.json()) as { data?: DbConversation[] };
+    return Array.isArray(data.data) ? data.data : [];
+  }
+
+  async getDbMessages(phone: string, limit = 300) {
+    const response = await fetch(
+      this.getBackendEndpoint(
+        `/api/db/messages?phone=${encodeURIComponent(phone)}&limit=${encodeURIComponent(String(limit))}`,
+      ),
+      {
+        method: "GET",
+        headers: { "Content-Type": "application/json" },
+      },
+    );
+
+    if (!response.ok) {
+      throw new Error(`Falha ao carregar mensagens do banco (${response.status}).`);
+    }
+
+    const data = (await response.json()) as { messages?: DbMessage[] };
+    return Array.isArray(data.messages) ? data.messages : [];
+  }
+
+  async getAppointmentsAudit(options: { phone?: string; status?: string; limit?: number } = {}) {
+    const params = new URLSearchParams();
+    params.set("limit", String(options.limit ?? 300));
+    if (options.phone) {
+      params.set("phone", options.phone);
+    }
+    if (options.status) {
+      params.set("status", options.status);
+    }
+
+    const response = await fetch(
+      this.getBackendEndpoint(`/api/db/appointments-audit?${params.toString()}`),
+      {
+        method: "GET",
+        headers: { "Content-Type": "application/json" },
+      },
+    );
+
+    if (!response.ok) {
+      throw new Error(`Falha ao carregar auditoria (${response.status}).`);
+    }
+
+    const data = (await response.json()) as { data?: AppointmentAuditItem[] };
+    return Array.isArray(data.data) ? data.data : [];
   }
 }
 
