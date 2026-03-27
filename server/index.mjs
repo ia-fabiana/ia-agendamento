@@ -970,7 +970,7 @@ Fluxo:
 - Para desmarcar, priorize pedir codigo de confirmacao (TRK). Se a cliente nao tiver codigo, tente localizar pelo telefone da cliente na base Trinks e prossiga com seguranca.
 - Quando a cliente perguntar nomes de profissionais, consulte a ferramenta listProfessionalsForDate e responda apenas com dados reais.
 - Ao receber preferencia de profissional e/ou horario desejado, use checkAvailability com professionalName e preferredTime para trazer os horarios mais proximos possiveis.
-- Se a profissional preferida nao tiver disponibilidade, pergunte explicitamente se a cliente prefere continuar buscando outro horario com essa profissional ou se deseja opcoes com outras profissionais.
+- Se a profissional preferida nao estiver livre no horario desejado, primeiro mostre os horarios que ela tem no dia e depois pergunte: "Caso esses horarios nao sirvam para voce, quer saber a disponibilidade de outros profissionais?".
 
 Datas:
 - Use obrigatoriamente o contexto temporal oficial enviado no prompt.
@@ -1460,7 +1460,7 @@ function buildConversationPrompt(history, message, knowledge, customerContext = 
       : "- Telefone da cliente (WhatsApp): nao informado.",
     "- Regra: pergunte sobre preferencia de profissional somente quando a cliente estiver tentando agendar horario.",
     "- Regra: se nao houver preferencia de profissional e houver horario desejado, liste todas as profissionais disponiveis naquele horario.",
-    "- Regra: se a profissional preferida estiver indisponivel, pergunte se a cliente deseja outro horario com ela ou opcoes com outras profissionais.",
+    "- Regra: se a profissional preferida estiver indisponivel no horario pedido, primeiro mostre os horarios que ela tem no dia e so depois pergunte se a cliente quer disponibilidade de outros profissionais.",
     "- Regra: antes de efetivar qualquer agendamento, sempre apresente resumo completo e aguarde confirmacao explicita da cliente.",
     "- Regra: para desmarcacao, prefira solicitar codigo TRK; se nao houver codigo e houver telefone de cliente identificada, tente localizar e continuar com seguranca.",
     "- Regra: antes de responder perguntas comerciais, valide primeiro a FAQ da base de conhecimento.",
@@ -2780,10 +2780,11 @@ async function getAvailability(
       if (!professionalHasOpenSchedule(matched)) {
         preferredProfessionalUnavailable = true;
         if (strictProfessional) {
+          const preferredTimesText = preferredProfessionalGeneralTimes.length
+            ? `Horarios de ${requestedProfessionalDisplay} no dia ${isoToBrDate(date) || date}: ${preferredProfessionalGeneralTimes.join(", ")}. `
+            : "";
           const error = new Error(
-            otherOpenDisplayNames.length
-              ? `${requestedProfessionalDisplay} nao possui agenda aberta para este servico nesta data. Deseja que eu continue buscando outro horario com ${requestedProfessionalDisplay} ou prefere ver opcoes com outras profissionais (${otherOpenDisplayNames.join(", ")})?`
-              : `${requestedProfessionalDisplay} nao possui agenda aberta para este servico nesta data. Deseja que eu continue buscando outro horario com ${requestedProfessionalDisplay}?`,
+            `${requestedProfessionalDisplay} nao possui agenda aberta para este servico nesta data. ${preferredTimesText}Caso esses horarios nao sirvam para voce, quer saber a disponibilidade de outros profissionais?`,
           );
           error.status = 409;
           error.details = {
@@ -2801,18 +2802,13 @@ async function getAvailability(
         if (normalizedPreferredTime && !matched.availableTimes.includes(normalizedPreferredTime)) {
           preferredProfessionalUnavailable = true;
           if (strictProfessional) {
+            const preferredTimesList = preferredProfessionalNearestTimes.length
+              ? preferredProfessionalNearestTimes
+              : preferredProfessionalGeneralTimes;
             const error = new Error(
-              preferredProfessionalNearestTimes.length
-                ? `${requestedProfessionalDisplay} nao possui agenda livre as ${normalizedPreferredTime}. Horarios com ${requestedProfessionalDisplay}: ${preferredProfessionalNearestTimes.join(", ")}. ${
-                    otherProfessionalsAtPreferredTime.length
-                      ? `Deseja continuar buscando com ${requestedProfessionalDisplay} ou prefere opcoes no mesmo horario com outras profissionais (${otherProfessionalsAtPreferredTime.join(", ")})?`
-                      : `Deseja continuar buscando com ${requestedProfessionalDisplay} ou prefere opcoes com outras profissionais (${otherOpenDisplayNames.join(", ")})?`
-                  }`
-                : `${requestedProfessionalDisplay} nao possui agenda livre as ${normalizedPreferredTime}. ${
-                    otherOpenDisplayNames.length
-                      ? `Deseja continuar buscando com ${requestedProfessionalDisplay} ou prefere opcoes com outras profissionais (${otherOpenDisplayNames.join(", ")})?`
-                      : `Deseja continuar buscando com ${requestedProfessionalDisplay}?`
-                  }`,
+              preferredTimesList.length
+                ? `${requestedProfessionalDisplay} nao possui agenda livre as ${normalizedPreferredTime}. Horarios de ${requestedProfessionalDisplay} no dia ${isoToBrDate(date) || date}: ${preferredTimesList.join(", ")}. Caso esses horarios nao sirvam para voce, quer saber a disponibilidade de outros profissionais?`
+                : `${requestedProfessionalDisplay} nao possui agenda livre as ${normalizedPreferredTime}. Caso esses horarios nao sirvam para voce, quer saber a disponibilidade de outros profissionais?`,
             );
             error.status = 409;
             error.details = {
@@ -2872,31 +2868,13 @@ async function getAvailability(
       requestedProfessional
         ? preferredProfessionalUnavailable
           ? preferredProfessionalNearestTimes.length || preferredProfessionalGeneralTimes.length
-            ? `${requestedProfessionalDisplay} nao esta livre no horario solicitado para este servico. Horarios de ${requestedProfessionalDisplay} no dia: ${
+            ? `${requestedProfessionalDisplay} tem disponibilidade no dia ${isoToBrDate(date) || date} em: ${
                 (preferredProfessionalNearestTimes.length
                   ? preferredProfessionalNearestTimes
                   : preferredProfessionalGeneralTimes).join(", ")
-              }. ${
-                otherOpenDisplayNames.length
-                  ? `Outras profissionais para este servico no dia: ${otherOpenDisplayNames.join(", ")}.`
-                  : ""
-              }${
-                allOpenDisplayNamesDay.length &&
-                normalizeForMatch(allOpenDisplayNamesDay.join(",")) !== normalizeForMatch(allOpenDisplayNames.join(","))
-                  ? ` Em agenda geral do salao no dia, tambem aparecem: ${allOpenDisplayNamesDay.join(", ")}.`
-                  : ""
-              }`
-            : `${requestedProfessionalDisplay} nao esta disponivel para este servico neste dia. ${
-                otherOpenDisplayNames.length
-                  ? `Outras profissionais disponiveis: ${otherOpenDisplayNames.join(", ")}.`
-                  : ""
-              }${
-                allOpenDisplayNamesDay.length &&
-                normalizeForMatch(allOpenDisplayNamesDay.join(",")) !== normalizeForMatch(allOpenDisplayNames.join(","))
-                  ? ` Em agenda geral do salao no dia, tambem aparecem: ${allOpenDisplayNamesDay.join(", ")}.`
-                  : ""
-              }`
-          : `Horarios com ${requestedProfessionalDisplay} em ${date}.`
+              }. Caso esses horarios nao sirvam para voce, quer saber a disponibilidade de outros profissionais?`
+            : `${requestedProfessionalDisplay} nao tem agenda disponivel para este servico no dia ${isoToBrDate(date) || date}. Quer que eu verifique a disponibilidade de outros profissionais?`
+          : `Horarios com ${requestedProfessionalDisplay} em ${isoToBrDate(date) || date}.`
         : normalizedPreferredTime
           ? professionalsAtPreferredTime.length
             ? `Para ${service} em ${date} as ${normalizedPreferredTime}, profissionais disponiveis: ${professionalsAtPreferredTime.join(", ")}.${
@@ -3020,16 +2998,8 @@ async function resolveBookingPreviewItem({
     const error = new Error(
       display
         ? nearest.length
-          ? `${display} nao possui agenda livre as ${normalizedTime}. Horarios proximos com ${display}: ${nearest.join(", ")}. ${
-              alternativesAtSameTime.length
-                ? `Deseja continuar buscando com ${display} ou prefere opcoes com outras profissionais (${alternativesAtSameTime.join(", ")})?`
-                : `Deseja continuar buscando com ${display}?`
-            }`
-          : `${display} nao possui agenda livre as ${normalizedTime}. ${
-              alternativesAtSameTime.length
-                ? `Deseja continuar buscando com ${display} ou prefere opcoes com outras profissionais (${alternativesAtSameTime.join(", ")})?`
-                : `Deseja continuar buscando com ${display}?`
-            }`
+          ? `${display} nao possui agenda livre as ${normalizedTime}. Horarios de ${display} no dia ${isoToBrDate(normalizedDate) || normalizedDate}: ${nearest.join(", ")}. Caso esses horarios nao sirvam para voce, quer saber a disponibilidade de outros profissionais?`
+          : `${display} nao possui agenda livre as ${normalizedTime}. Caso esses horarios nao sirvam para voce, quer saber a disponibilidade de outros profissionais?`
         : `Nao encontrei agenda livre as ${normalizedTime} para ${normalizedService}.`,
     );
     error.status = 409;
@@ -3177,16 +3147,8 @@ async function createAppointment({
         );
         const error = new Error(
           nearestTimes.length
-            ? `${displayName} nao possui agenda livre as ${requestedTime}. Horarios proximos com ${displayName}: ${nearestTimes.join(", ")}. ${
-                alternativesAtSameTime.length
-                  ? `Deseja continuar buscando com ${displayName} ou prefere opcoes com outras profissionais (${alternativesAtSameTime.join(", ")})?`
-                  : `Deseja continuar buscando com ${displayName}?`
-              }`
-            : `${displayName} nao possui agenda livre na data informada para este servico. ${
-                alternativesAtSameTime.length
-                  ? `Deseja continuar buscando com ${displayName} ou prefere opcoes com outras profissionais (${alternativesAtSameTime.join(", ")})?`
-                  : `Deseja continuar buscando com ${displayName}?`
-              }`,
+            ? `${displayName} nao possui agenda livre as ${requestedTime}. Horarios de ${displayName} no dia ${isoToBrDate(date) || date}: ${nearestTimes.join(", ")}. Caso esses horarios nao sirvam para voce, quer saber a disponibilidade de outros profissionais?`
+            : `${displayName} nao possui agenda livre na data informada para este servico. Caso esses horarios nao sirvam para voce, quer saber a disponibilidade de outros profissionais?`,
         );
         error.status = 409;
         error.details = {
