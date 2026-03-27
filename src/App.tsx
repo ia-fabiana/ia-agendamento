@@ -82,6 +82,22 @@ type AuditItem = {
   createdAt?: string;
 };
 
+type WebhookEventItem = {
+  id?: number;
+  event?: string;
+  instanceName?: string;
+  senderRaw?: string;
+  senderNumber?: string;
+  senderName?: string;
+  messageId?: string;
+  messageType?: string;
+  messageText?: string;
+  status?: string;
+  reason?: string;
+  details?: Record<string, any> | null;
+  receivedAt?: string;
+};
+
 const initialKnowledge = {
   identity: {
     brandName: 'Fabiana Luxury Salon',
@@ -154,6 +170,7 @@ export default function App() {
   const [historyConversations, setHistoryConversations] = useState<DbConversation[]>([]);
   const [historyMessages, setHistoryMessages] = useState<DbMessage[]>([]);
   const [historyAudit, setHistoryAudit] = useState<AuditItem[]>([]);
+  const [historyWebhookEvents, setHistoryWebhookEvents] = useState<WebhookEventItem[]>([]);
   const [selectedHistoryPhone, setSelectedHistoryPhone] = useState('');
   const [historyPhoneFilter, setHistoryPhoneFilter] = useState('');
   const [historyStatusFilter, setHistoryStatusFilter] = useState<'all' | 'success' | 'error'>('all');
@@ -410,17 +427,22 @@ export default function App() {
       const phoneCandidate = normalizeDigits(forcedPhone || historyPhoneFilter || selectedHistoryPhone);
       const statusCandidate = historyStatusFilter === 'all' ? '' : historyStatusFilter;
 
-      const [conversations, audit] = await Promise.all([
+      const [conversations, audit, webhookEvents] = await Promise.all([
         appointmentService.current.getDbConversations(200),
         appointmentService.current.getAppointmentsAudit({
           phone: phoneCandidate || undefined,
           status: statusCandidate || undefined,
           limit: historyLimit,
         }),
+        appointmentService.current.getWebhookEvents({
+          phone: phoneCandidate || undefined,
+          limit: historyLimit,
+        }),
       ]);
 
       setHistoryConversations(conversations);
       setHistoryAudit(audit);
+      setHistoryWebhookEvents(webhookEvents);
 
       if (phoneCandidate) {
         setSelectedHistoryPhone(phoneCandidate);
@@ -923,6 +945,49 @@ export default function App() {
                             </tr>
                           );
                         })}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+
+                <div className="rounded-2xl bg-white/5 border border-white/10 p-4">
+                  <p className="text-xs uppercase tracking-widest text-white/60 mb-3">
+                    Eventos do Webhook ({historyWebhookEvents.length})
+                  </p>
+                  <div className="overflow-x-auto">
+                    <table className="w-full text-left text-xs text-white/85">
+                      <thead className="text-white/60">
+                        <tr>
+                          <th className="py-2 pr-4">Data</th>
+                          <th className="py-2 pr-4">Telefone</th>
+                          <th className="py-2 pr-4">Status</th>
+                          <th className="py-2 pr-4">Motivo</th>
+                          <th className="py-2 pr-4">Tipo</th>
+                          <th className="py-2 pr-0">Mensagem</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {!historyWebhookEvents.length && (
+                          <tr>
+                            <td colSpan={6} className="py-3 text-white/60">
+                              Nenhum evento de webhook para os filtros atuais.
+                            </td>
+                          </tr>
+                        )}
+                        {historyWebhookEvents.map((item) => (
+                          <tr key={`webhook-${item.id || `${item.receivedAt}-${item.messageId}`}`} className="border-t border-white/10">
+                            <td className="py-2 pr-4 whitespace-nowrap">
+                              {item.receivedAt ? new Date(item.receivedAt).toLocaleString('pt-BR') : '-'}
+                            </td>
+                            <td className="py-2 pr-4">{item.senderName || item.senderNumber || '-'}</td>
+                            <td className="py-2 pr-4 uppercase">{item.status || '-'}</td>
+                            <td className="py-2 pr-4">{item.reason || '-'}</td>
+                            <td className="py-2 pr-4">{item.messageType || '-'}</td>
+                            <td className="py-2 pr-0 max-w-[360px] truncate" title={item.messageText || ''}>
+                              {item.messageText || '-'}
+                            </td>
+                          </tr>
+                        ))}
                       </tbody>
                     </table>
                   </div>

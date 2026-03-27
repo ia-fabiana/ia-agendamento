@@ -23,6 +23,9 @@ const TRINKS_MAX_RETRIES = Math.max(1, Number(process.env.TRINKS_MAX_RETRIES || 
 const TRINKS_RETRY_BASE_MS = Math.max(200, Number(process.env.TRINKS_RETRY_BASE_MS || 700));
 const BOOKING_SEQUENCE_GAP_MS = Math.max(0, Number(process.env.BOOKING_SEQUENCE_GAP_MS || 450));
 const TRINKS_STATUS_ID_CANCELLED = Math.max(1, Number(process.env.TRINKS_STATUS_ID_CANCELLED || 9));
+const UNSUPPORTED_MESSAGE_REPLY =
+  toNonEmptyString(process.env.WHATSAPP_UNSUPPORTED_MESSAGE_REPLY) ||
+  "Recebi sua mensagem, mas no momento consigo ler apenas texto. Pode me escrever por texto, por favor?";
 const whatsappConversations = new Map();
 const recentWebhookMessages = new Map();
 const pendingBookingConfirmations = new Map();
@@ -73,6 +76,38 @@ function initDatabase() {
 
     CREATE INDEX IF NOT EXISTS idx_appointment_audit_phone
       ON appointment_audit(client_phone);
+
+    CREATE TABLE IF NOT EXISTS webhook_events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      event TEXT,
+      instance_name TEXT,
+      sender_raw TEXT,
+      sender_number TEXT,
+      sender_name TEXT,
+      message_id TEXT,
+      message_type TEXT,
+      message_text TEXT,
+      status TEXT NOT NULL,
+      reason TEXT,
+      details TEXT,
+      received_at TEXT NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_webhook_events_received_at
+      ON webhook_events(received_at DESC);
+
+    CREATE INDEX IF NOT EXISTS idx_webhook_events_sender
+      ON webhook_events(sender_number, received_at DESC);
+
+    CREATE TABLE IF NOT EXISTS client_phone_map (
+      phone TEXT PRIMARY KEY,
+      client_id INTEGER NOT NULL,
+      client_name TEXT,
+      updated_at TEXT NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_client_phone_map_client
+      ON client_phone_map(client_id);
   `);
 
   return database;
@@ -86,7 +121,171 @@ function safeJsonStringify(value) {
   }
 }
 
-app.use(express.json());
+function escapeInvalidJsonBackslashes(value) {
+  return String(value || "").replace(/\\(?!["\\/bfnrtu])/g, "\\\\");
+}
+
+function tryParseJsonLoose(value) {
+  const raw = toNonEmptyString(value);
+  if (!raw) {
+    return null;
+  }
+
+  try {
+    return JSON.parse(raw);
+  } catch {
+    try {
+      return JSON.parse(escapeInvalidJsonBackslashes(raw));
+    } catch {
+      return null;
+    }
+  }
+}
+
+function inferSenderFromRawWebhookText(rawText) {
+  const text = toNonEmptyString(rawText);
+  if (!text) {
+    return "";
+  }
+
+  const jidMatch = text.match(/(\d{10,15})@s\.whatsapp\.net/i);
+  if (jidMatch?.[1]) {
+    return normalizeWhatsappNumber(jidMatch[1]);
+  }
+
+  const numberMatch = text.match(/\b55\d{10,13}\b/);
+  if (numberMatch?.[0]) {
+    return normalizeWhatsappNumber(numberMatch[0]);
+  }
+
+  return "";
+}
+
+function parseWebhookPayload(rawBody) {
+  if (rawBody && typeof rawBody === "object") {
+    return {
+      payload: rawBody,
+      rawText: "",
+      parseStatus: "parsed_object",
+      parseError: "",
+    };
+  }
+
+  const rawText = toNonEmptyString(rawBody);
+  if (!rawText) {
+    return {
+      payload: {},
+      rawText: "",
+      parseStatus: "empty",
+      parseError: "",
+    };
+  }
+
+  const direct = tryParseJsonLoose(rawText);
+  if (direct && typeof direct === "object") {
+    return {
+      payload: direct,
+      rawText,
+      parseStatus: "parsed_json",
+      parseError: "",
+    };
+  }
+
+  const params = new URLSearchParams(rawText);
+  const candidateKeys = ["payload", "data", "body"];
+  for (const key of candidateKeys) {
+    const value = params.get(key);
+    if (!value) {
+      continue;
+    }
+    const parsed = tryParseJsonLoose(value);
+    if (parsed && typeof parsed === "object") {
+      return {
+        payload: parsed,
+        rawText,
+        parseStatus: `parsed_form_${key}`,
+        parseError: "",
+      };
+    }
+  }
+
+  return {
+    payload: {},
+    rawText,
+    parseStatus: "invalid",
+    parseError: "invalid_json",
+  };
+}
+
+function recordWebhookEvent({
+  event = "",
+  instanceName = "",
+  senderRaw = "",
+  senderNumber = "",
+  senderName = "",
+  messageId = "",
+  messageType = "",
+  messageText = "",
+  status = "processed",
+  reason = "",
+  details = null,
+} = {}) {
+  try {
+    db.prepare(
+      `
+        INSERT INTO webhook_events (
+          event, instance_name, sender_raw, sender_number, sender_name,
+          message_id, message_type, message_text, status, reason, details, received_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `,
+    ).run(
+      String(event || ""),
+      String(instanceName || ""),
+      String(senderRaw || ""),
+      normalizePhone(senderNumber || ""),
+      String(senderName || ""),
+      String(messageId || ""),
+      String(messageType || ""),
+      String(messageText || "").slice(0, 2000),
+      String(status || "processed"),
+      String(reason || ""),
+      safeJsonStringify(details),
+      new Date().toISOString(),
+    );
+  } catch (error) {
+    console.error("[webhook] failed to persist webhook event:", error?.message || error);
+  }
+}
+
+function isLikelyIncomingMessageEvent(incoming) {
+  const event = toNonEmptyString(incoming?.event).toLowerCase();
+  if (!event) {
+    return false;
+  }
+
+  return (
+    event.includes("message") ||
+    event.includes("messages.upsert") ||
+    event.includes("messages-update") ||
+    event.includes("upsert")
+  );
+}
+
+function unsupportedInboundPlaceholder(incoming) {
+  const type = toNonEmptyString(incoming?.messageType) || "mensagem";
+  return `[mensagem sem texto: ${type}]`;
+}
+
+const jsonBodyParser = express.json({ limit: "2mb" });
+const webhookBodyParser = express.text({ type: "*/*", limit: "2mb" });
+
+app.use((req, res, next) => {
+  if (req.path === "/webhook/whatsapp") {
+    return next();
+  }
+  return jsonBodyParser(req, res, next);
+});
 app.use((req, res, next) => {
   res.header("Access-Control-Allow-Origin", "*");
   res.header("Access-Control-Allow-Methods", "GET,POST,PUT,PATCH,DELETE,OPTIONS");
@@ -803,6 +1002,129 @@ function dedupeClients(items) {
   return result;
 }
 
+function getMappedClientByPhone(clientPhone) {
+  const normalizedPhone = normalizePhone(clientPhone);
+  if (!normalizedPhone) {
+    return null;
+  }
+
+  const row = db.prepare(
+    `
+      SELECT phone, client_id AS clientId, client_name AS clientName, updated_at AS updatedAt
+      FROM client_phone_map
+      WHERE phone = ?
+      LIMIT 1
+    `,
+  ).get(normalizedPhone);
+
+  if (!row) {
+    return null;
+  }
+
+  const parsedClientId = Number(row.clientId);
+  if (!Number.isFinite(parsedClientId) || parsedClientId <= 0) {
+    return null;
+  }
+
+  return {
+    phone: normalizedPhone,
+    clientId: parsedClientId,
+    clientName: toNonEmptyString(row.clientName),
+    updatedAt: toNonEmptyString(row.updatedAt),
+  };
+}
+
+function upsertClientPhoneMap(clientPhone, clientId, clientName = "") {
+  const normalizedPhone = normalizePhone(clientPhone);
+  const parsedClientId = Number(clientId);
+  if (!normalizedPhone || !Number.isFinite(parsedClientId) || parsedClientId <= 0) {
+    return;
+  }
+
+  db.prepare(
+    `
+      INSERT INTO client_phone_map (phone, client_id, client_name, updated_at)
+      VALUES (?, ?, ?, ?)
+      ON CONFLICT(phone) DO UPDATE SET
+        client_id = excluded.client_id,
+        client_name = excluded.client_name,
+        updated_at = excluded.updated_at
+    `,
+  ).run(
+    normalizedPhone,
+    parsedClientId,
+    toNonEmptyString(clientName),
+    new Date().toISOString(),
+  );
+}
+
+function scoreClientCandidate(item, { clientPhone = "", clientName = "" } = {}) {
+  let score = 0;
+  const normalizedTargetName = normalizeForMatch(clientName).trim();
+  const normalizedCandidateName = normalizeForMatch(clientDisplayNameFrom(item)).trim();
+  const targetTokens = normalizedTargetName.split(/\s+/).filter(Boolean);
+  const candidateTokens = normalizedCandidateName.split(/\s+/).filter(Boolean);
+  const candidateSet = new Set(candidateTokens);
+  const overlap = targetTokens.filter((token) => candidateSet.has(token)).length;
+
+  if (clientPhone && matchesClientPhone(item, clientPhone)) {
+    score += 10_000;
+  }
+
+  if (normalizedTargetName && normalizedCandidateName) {
+    if (normalizedTargetName === normalizedCandidateName) {
+      score += 2_000;
+    } else if (normalizedCandidateName.startsWith(normalizedTargetName)) {
+      score += 1_200;
+    } else if (overlap > 0) {
+      score += overlap * 120;
+    }
+  }
+
+  if (targetTokens.length && candidateTokens.length) {
+    const missing = Math.max(0, targetTokens.length - overlap);
+    score -= missing * 20;
+  }
+
+  const phonesCount = Array.isArray(item?.telefones || item?.phones) ? (item?.telefones || item?.phones).length : 0;
+  if (phonesCount > 0) {
+    score += Math.min(phonesCount, 3) * 15;
+  }
+
+  score += Math.min(candidateTokens.length, 4) * 5;
+
+  const id = Number(clientIdFrom(item));
+  if (Number.isFinite(id) && id > 0) {
+    score += Math.max(0, 1000 - Math.min(id, 1000));
+  }
+
+  return score;
+}
+
+function pickBestClientCandidate(items, { clientPhone = "", clientName = "" } = {}) {
+  if (!Array.isArray(items) || !items.length) {
+    return null;
+  }
+
+  const ranked = [...items]
+    .map((item) => ({
+      item,
+      score: scoreClientCandidate(item, { clientPhone, clientName }),
+      id: Number(clientIdFrom(item)),
+    }))
+    .sort((left, right) => {
+      if (right.score !== left.score) {
+        return right.score - left.score;
+      }
+
+      const leftId = Number.isFinite(left.id) && left.id > 0 ? left.id : Number.MAX_SAFE_INTEGER;
+      const rightId = Number.isFinite(right.id) && right.id > 0 ? right.id : Number.MAX_SAFE_INTEGER;
+      return leftId - rightId;
+    });
+
+  return ranked[0]?.item || null;
+}
+
 function clientDisplayNameFrom(item) {
   return firstNonEmpty([item?.nome, item?.name, item?.cliente?.nome, item?.clienteNome]);
 }
@@ -827,6 +1149,8 @@ async function findExistingClientByPhone(estabelecimentoId, clientPhone) {
     return null;
   }
 
+  const mapped = getMappedClientByPhone(normalizedPhone);
+
   const searches = [
     listClients(estabelecimentoId, { telefone: normalizedPhone }),
     listClients(estabelecimentoId, { phone: normalizedPhone }),
@@ -840,8 +1164,35 @@ async function findExistingClientByPhone(estabelecimentoId, clientPhone) {
       .filter((item) => item.status === "fulfilled")
       .flatMap((item) => item.value),
   );
+  const byPhone = candidates.filter((item) => matchesClientPhone(item, normalizedPhone));
+  if (mapped?.clientId) {
+    const mappedMatch = byPhone.find((item) => Number(clientIdFrom(item)) === Number(mapped.clientId));
+    if (mappedMatch) {
+      upsertClientPhoneMap(normalizedPhone, mapped.clientId, clientDisplayNameFrom(mappedMatch) || mapped.clientName);
+      return mappedMatch;
+    }
+  }
 
-  return candidates.find((item) => matchesClientPhone(item, normalizedPhone)) || null;
+  const selected = pickBestClientCandidate(byPhone, {
+    clientPhone: normalizedPhone,
+    clientName: "",
+  });
+  if (!selected && mapped?.clientId) {
+    return {
+      id: mapped.clientId,
+      nome: mapped.clientName,
+      telefones: [{ numero: normalizedPhone }],
+      source: "phone_map_fallback",
+    };
+  }
+  if (!selected) return null;
+
+  const selectedId = Number(clientIdFrom(selected));
+  if (Number.isFinite(selectedId) && selectedId > 0) {
+    upsertClientPhoneMap(normalizedPhone, selectedId, clientDisplayNameFrom(selected));
+  }
+
+  return selected;
 }
 
 function extractItems(payload) {
@@ -1893,6 +2244,38 @@ async function fetchEvolutionQr(instanceName) {
   };
 }
 
+function detectWhatsappMessageType(...candidates) {
+  const priority = [
+    ["conversation", "text"],
+    ["extendedTextMessage", "text"],
+    ["buttonsResponseMessage", "button_reply"],
+    ["listResponseMessage", "list_reply"],
+    ["templateButtonReplyMessage", "template_reply"],
+    ["imageMessage", "image"],
+    ["videoMessage", "video"],
+    ["documentMessage", "document"],
+    ["audioMessage", "audio"],
+    ["stickerMessage", "sticker"],
+    ["contactMessage", "contact"],
+    ["locationMessage", "location"],
+    ["reactionMessage", "reaction"],
+  ];
+
+  for (const candidate of candidates) {
+    if (!candidate || typeof candidate !== "object") {
+      continue;
+    }
+
+    for (const [key, label] of priority) {
+      if (candidate[key]) {
+        return label;
+      }
+    }
+  }
+
+  return "unknown";
+}
+
 function extractIncomingWhatsapp(body) {
   const data = body?.data && typeof body.data === "object" ? body.data : body;
   const firstMessage =
@@ -1915,6 +2298,7 @@ function extractIncomingWhatsapp(body) {
     message?.viewOnceMessageV2?.message ||
     message?.viewOnceMessageV2Extension?.message ||
     {};
+  const messageType = detectWhatsappMessageType(message, nestedMessage, firstMessage?.message);
 
   const senderRaw = firstNonEmpty([
     key?.remoteJid,
@@ -1971,6 +2355,7 @@ function extractIncomingWhatsapp(body) {
     messageText: text,
     messageId: firstNonEmpty([key?.id, data?.id, body?.id]),
     isGroup: senderRaw.includes("@g.us"),
+    messageType,
     instanceName,
   };
 }
@@ -2730,6 +3115,8 @@ async function findProfessionalForBooking({ establishmentId, date, professionalN
 async function findOrCreateClient(estabelecimentoId, clientName, clientPhone) {
   const searches = [];
   const normalizedPhone = normalizePhone(clientPhone);
+  const normalizedName = toNonEmptyString(clientName);
+  const mapped = normalizedPhone ? getMappedClientByPhone(normalizedPhone) : null;
 
   if (normalizedPhone) {
     searches.push(listClients(estabelecimentoId, { telefone: normalizedPhone }));
@@ -2740,6 +3127,7 @@ async function findOrCreateClient(estabelecimentoId, clientName, clientPhone) {
   if (clientName) {
     searches.push(listClients(estabelecimentoId, { nome: clientName }));
   }
+  searches.push(listClients(estabelecimentoId));
 
   const searchResults = await Promise.allSettled(searches);
   const candidates = dedupeClients(
@@ -2748,15 +3136,34 @@ async function findOrCreateClient(estabelecimentoId, clientName, clientPhone) {
       .flatMap((result) => result.value),
   );
 
-  const existingByPhoneAndName = candidates.find(
-    (item) => matchesClientPhone(item, clientPhone) && matchesClientName(item, clientName),
+  const matchingPool = candidates.filter(
+    (item) =>
+      (normalizedPhone && matchesClientPhone(item, normalizedPhone)) ||
+      (normalizedName && matchesClientName(item, normalizedName)),
   );
-  const existingByPhone = candidates.find((item) => matchesClientPhone(item, clientPhone));
-  const existingByName = candidates.find((item) => matchesClientName(item, clientName));
-  const existing = existingByPhoneAndName || existingByPhone || existingByName;
+  const mappedMatch = mapped?.clientId
+    ? matchingPool.find((item) => Number(clientIdFrom(item)) === Number(mapped.clientId))
+    : null;
+  const existing = mappedMatch || pickBestClientCandidate(matchingPool, {
+    clientPhone: normalizedPhone,
+    clientName: normalizedName,
+  });
 
   if (existing) {
+    const selectedId = Number(clientIdFrom(existing));
+    if (normalizedPhone && Number.isFinite(selectedId) && selectedId > 0) {
+      upsertClientPhoneMap(normalizedPhone, selectedId, clientDisplayNameFrom(existing));
+    }
     return existing;
+  }
+
+  if (mapped?.clientId && normalizedPhone) {
+    return {
+      id: mapped.clientId,
+      nome: mapped.clientName || normalizedName,
+      telefones: [{ numero: normalizedPhone }],
+      source: "phone_map_fallback",
+    };
   }
 
   const parsedPhone = parseBrazilianPhone(clientPhone);
@@ -2774,6 +3181,10 @@ async function findOrCreateClient(estabelecimentoId, clientName, clientPhone) {
   });
 
   const created = createPayload?.item || createPayload?.data || createPayload;
+  const createdId = Number(clientIdFrom(created));
+  if (normalizedPhone && Number.isFinite(createdId) && createdId > 0) {
+    upsertClientPhoneMap(normalizedPhone, createdId, clientDisplayNameFrom(created) || normalizedName);
+  }
   return created;
 }
 
@@ -5517,6 +5928,55 @@ app.get("/api/db/appointments-audit", (req, res) => {
   }
 });
 
+app.get("/api/db/webhook-events", (req, res) => {
+  try {
+    const limit = Math.min(Math.max(Number(req.query.limit || 200), 1), 2000);
+    const phone = normalizePhone(req.query.phone || "");
+    const status = toNonEmptyString(req.query.status);
+    const reason = toNonEmptyString(req.query.reason);
+
+    let query = `
+      SELECT id, event, instance_name AS instanceName, sender_raw AS senderRaw,
+             sender_number AS senderNumber, sender_name AS senderName,
+             message_id AS messageId, message_type AS messageType,
+             message_text AS messageText, status, reason, details, received_at AS receivedAt
+      FROM webhook_events
+    `;
+
+    const params = [];
+    const conditions = [];
+    if (phone) {
+      conditions.push("sender_number = ?");
+      params.push(phone);
+    }
+    if (status) {
+      conditions.push("status = ?");
+      params.push(status);
+    }
+    if (reason) {
+      conditions.push("reason = ?");
+      params.push(reason);
+    }
+    if (conditions.length) {
+      query += ` WHERE ${conditions.join(" AND ")}`;
+    }
+    query += " ORDER BY datetime(received_at) DESC, id DESC LIMIT ?";
+    params.push(limit);
+
+    const rows = db.prepare(query).all(...params).map((row) => ({
+      ...row,
+      details: row.details ? safeJsonParse(row.details) : null,
+    }));
+
+    return res.json({ status: "ok", data: rows });
+  } catch (error) {
+    return res.status(500).json({
+      status: "error",
+      message: error.message || "Erro ao consultar eventos de webhook.",
+    });
+  }
+});
+
 app.get("/api/whatsapp/inbox", (req, res) => {
   const conversations = summarizeWhatsappConversations();
   return res.json({ status: "ok", conversations });
@@ -5676,19 +6136,72 @@ app.post("/api/handoff/resume", async (req, res) => {
   }
 });
 
-app.post("/webhook/whatsapp", async (req, res) => {
+app.post("/webhook/whatsapp", webhookBodyParser, async (req, res) => {
+  let incoming = null;
+  let payloadParse = null;
   try {
-    const incoming = extractIncomingWhatsapp(req.body || {});
+    payloadParse = parseWebhookPayload(req.body);
+    incoming = extractIncomingWhatsapp(payloadParse.payload || {});
+
+    if (payloadParse.parseError) {
+      const inferredSender = incoming.senderNumber || inferSenderFromRawWebhookText(payloadParse.rawText);
+      recordWebhookEvent({
+        event: incoming.event,
+        instanceName: incoming.instanceName,
+        senderRaw: incoming.senderRaw,
+        senderNumber: inferredSender,
+        senderName: incoming.senderName,
+        messageId: incoming.messageId,
+        messageType: incoming.messageType,
+        messageText: incoming.messageText,
+        status: "ignored",
+        reason: "invalidPayload",
+        details: {
+          parseStatus: payloadParse.parseStatus,
+          parseError: payloadParse.parseError,
+          rawSnippet: toNonEmptyString(payloadParse.rawText).slice(0, 1200),
+        },
+      });
+      return res.status(200).json({
+        received: true,
+        ignored: true,
+        reason: "invalidPayload",
+      });
+    }
 
     if (incoming.fromMe) {
+      recordWebhookEvent({
+        event: incoming.event,
+        instanceName: incoming.instanceName,
+        senderRaw: incoming.senderRaw,
+        senderNumber: incoming.senderNumber,
+        senderName: incoming.senderName,
+        messageId: incoming.messageId,
+        messageType: incoming.messageType,
+        messageText: incoming.messageText,
+        status: "ignored",
+        reason: "fromMe",
+      });
       return res.status(200).json({ received: true, ignored: true, reason: "fromMe" });
     }
 
     if (incoming.isGroup) {
+      recordWebhookEvent({
+        event: incoming.event,
+        instanceName: incoming.instanceName,
+        senderRaw: incoming.senderRaw,
+        senderNumber: incoming.senderNumber,
+        senderName: incoming.senderName,
+        messageId: incoming.messageId,
+        messageType: incoming.messageType,
+        messageText: incoming.messageText,
+        status: "ignored",
+        reason: "groupMessage",
+      });
       return res.status(200).json({ received: true, ignored: true, reason: "groupMessage" });
     }
 
-    if (!incoming.senderNumber || !incoming.messageText) {
+    if (!incoming.senderNumber) {
       console.warn("[webhook] ignored missingSenderOrText", {
         event: incoming.event || null,
         fromMe: incoming.fromMe,
@@ -5698,15 +6211,120 @@ app.post("/webhook/whatsapp", async (req, res) => {
         messageId: incoming.messageId || null,
         instance: incoming.instanceName || null,
       });
+      recordWebhookEvent({
+        event: incoming.event,
+        instanceName: incoming.instanceName,
+        senderRaw: incoming.senderRaw,
+        senderNumber: incoming.senderNumber,
+        senderName: incoming.senderName,
+        messageId: incoming.messageId,
+        messageType: incoming.messageType,
+        messageText: incoming.messageText,
+        status: "ignored",
+        reason: "missingSender",
+      });
       return res.status(200).json({
         received: true,
         ignored: true,
-        reason: "missingSenderOrText",
+        reason: "missingSender",
+        event: incoming.event || null,
+      });
+    }
+
+    if (!incoming.messageText) {
+      const messageEvent = isLikelyIncomingMessageEvent(incoming);
+      if (messageEvent) {
+        const establishmentId = getConfiguredEstablishmentId();
+        const knownClient = establishmentId
+          ? await findExistingClientByPhone(establishmentId, incoming.senderNumber).catch(() => null)
+          : null;
+        const knownClientName = toNonEmptyString(clientDisplayNameFrom(knownClient));
+        const effectiveClientName = knownClientName || incoming.senderName;
+        const instance = resolveEvolutionInstance(incoming.instanceName);
+        const placeholder = unsupportedInboundPlaceholder(incoming);
+
+        pushWhatsappHistory(incoming.senderNumber, "user", placeholder, effectiveClientName);
+
+        if (instance) {
+          await evolutionRequest(`/message/sendText/${instance}`, {
+            method: "POST",
+            body: {
+              number: incoming.senderNumber,
+              text: UNSUPPORTED_MESSAGE_REPLY,
+            },
+          });
+          pushWhatsappHistory(incoming.senderNumber, "assistant", UNSUPPORTED_MESSAGE_REPLY);
+        }
+
+        recordWebhookEvent({
+          event: incoming.event,
+          instanceName: incoming.instanceName,
+          senderRaw: incoming.senderRaw,
+          senderNumber: incoming.senderNumber,
+          senderName: effectiveClientName,
+          messageId: incoming.messageId,
+          messageType: incoming.messageType,
+          messageText: "",
+          status: "processed",
+          reason: "unsupportedMessageType",
+          details: {
+            messageType: incoming.messageType,
+            replied: Boolean(instance),
+          },
+        });
+
+        return res.status(200).json({
+          received: true,
+          processed: true,
+          reason: "unsupportedMessageType",
+          event: incoming.event || null,
+          messageType: incoming.messageType || null,
+          messageId: incoming.messageId || null,
+        });
+      }
+
+      console.warn("[webhook] ignored missingSenderOrText", {
+        event: incoming.event || null,
+        fromMe: incoming.fromMe,
+        senderRaw: incoming.senderRaw || null,
+        senderNumber: incoming.senderNumber || null,
+        hasText: false,
+        messageId: incoming.messageId || null,
+        instance: incoming.instanceName || null,
+      });
+      recordWebhookEvent({
+        event: incoming.event,
+        instanceName: incoming.instanceName,
+        senderRaw: incoming.senderRaw,
+        senderNumber: incoming.senderNumber,
+        senderName: incoming.senderName,
+        messageId: incoming.messageId,
+        messageType: incoming.messageType,
+        messageText: "",
+        status: "ignored",
+        reason: "missingText",
+      });
+      return res.status(200).json({
+        received: true,
+        ignored: true,
+        reason: "missingText",
         event: incoming.event || null,
       });
     }
 
     if (isDuplicateIncomingWhatsapp(incoming)) {
+      recordWebhookEvent({
+        event: incoming.event,
+        instanceName: incoming.instanceName,
+        senderRaw: incoming.senderRaw,
+        senderNumber: incoming.senderNumber,
+        senderName: incoming.senderName,
+        messageId: incoming.messageId,
+        messageType: incoming.messageType,
+        messageText: incoming.messageText,
+        status: "ignored",
+        reason: "duplicateMessage",
+      });
       return res.status(200).json({
         received: true,
         ignored: true,
@@ -5757,6 +6375,18 @@ app.post("/webhook/whatsapp", async (req, res) => {
           },
         });
         pushWhatsappHistory(incoming.senderNumber, "assistant", resumeMessage);
+        recordWebhookEvent({
+          event: incoming.event,
+          instanceName: instance,
+          senderRaw: incoming.senderRaw,
+          senderNumber: incoming.senderNumber,
+          senderName: effectiveClientName,
+          messageId: incoming.messageId,
+          messageType: incoming.messageType,
+          messageText: incoming.messageText,
+          status: "processed",
+          reason: "handoffResumed",
+        });
 
         return res.status(200).json({
           received: true,
@@ -5799,6 +6429,23 @@ app.post("/webhook/whatsapp", async (req, res) => {
           customerName: effectiveClientName,
           customerMessage: incoming.messageText,
         });
+        recordWebhookEvent({
+          event: incoming.event,
+          instanceName: instance,
+          senderRaw: incoming.senderRaw,
+          senderNumber: incoming.senderNumber,
+          senderName: effectiveClientName,
+          messageId: incoming.messageId,
+          messageType: incoming.messageType,
+          messageText: incoming.messageText,
+          status: "processed",
+          reason: "handoffActivated",
+          details: {
+            alertPhones: Array.isArray(alertResult?.targets)
+              ? alertResult.targets.map((item) => item.phone || item.number).filter(Boolean)
+              : [],
+          },
+        });
 
         return res.status(200).json({
           received: true,
@@ -5839,6 +6486,20 @@ app.post("/webhook/whatsapp", async (req, res) => {
           });
         }
 
+        recordWebhookEvent({
+          event: incoming.event,
+          instanceName: instance,
+          senderRaw: incoming.senderRaw,
+          senderNumber: incoming.senderNumber,
+          senderName: effectiveClientName,
+          messageId: incoming.messageId,
+          messageType: incoming.messageType,
+          messageText: incoming.messageText,
+          status: "processed",
+          reason: "handoffActive",
+          details: { waitingAckSent: shouldSendWaitingAck },
+        });
+
         return res.status(200).json({
           received: true,
           processed: true,
@@ -5872,6 +6533,18 @@ app.post("/webhook/whatsapp", async (req, res) => {
     });
 
     pushWhatsappHistory(incoming.senderNumber, "assistant", answer);
+    recordWebhookEvent({
+      event: incoming.event,
+      instanceName: instance,
+      senderRaw: incoming.senderRaw,
+      senderNumber: incoming.senderNumber,
+      senderName: effectiveClientName,
+      messageId: incoming.messageId,
+      messageType: incoming.messageType,
+      messageText: incoming.messageText,
+      status: "processed",
+      reason: "aiResponseSent",
+    });
 
     return res.status(200).json({
       received: true,
@@ -5882,6 +6555,23 @@ app.post("/webhook/whatsapp", async (req, res) => {
       messageId: incoming.messageId || null,
     });
   } catch (error) {
+    recordWebhookEvent({
+      event: incoming?.event || "",
+      instanceName: incoming?.instanceName || "",
+      senderRaw: incoming?.senderRaw || "",
+      senderNumber: incoming?.senderNumber || inferSenderFromRawWebhookText(payloadParse?.rawText || ""),
+      senderName: incoming?.senderName || "",
+      messageId: incoming?.messageId || "",
+      messageType: incoming?.messageType || "",
+      messageText: incoming?.messageText || "",
+      status: "error",
+      reason: "exception",
+      details: {
+        message: error?.message || "Erro interno.",
+        status: error?.status || 500,
+        parseStatus: payloadParse?.parseStatus || "",
+      },
+    });
     return res.status(error.status || 500).json({
       received: true,
       processed: false,
@@ -5890,6 +6580,34 @@ app.post("/webhook/whatsapp", async (req, res) => {
       details: error.details || null,
     });
   }
+});
+
+app.use((error, req, res, next) => {
+  if (error instanceof SyntaxError && error?.status === 400 && "body" in error) {
+    if (req.path === "/webhook/whatsapp") {
+      recordWebhookEvent({
+        status: "ignored",
+        reason: "invalidPayloadSyntax",
+        details: {
+          path: req.path,
+          method: req.method,
+          message: error.message || "JSON invalido.",
+        },
+      });
+      return res.status(200).json({
+        received: true,
+        ignored: true,
+        reason: "invalidPayloadSyntax",
+      });
+    }
+
+    return res.status(400).json({
+      status: "error",
+      message: "JSON invalido na requisicao.",
+    });
+  }
+
+  return next(error);
 });
 
 app.listen(port, () => {

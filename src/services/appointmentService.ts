@@ -77,6 +77,22 @@ type AppointmentAuditItem = {
   createdAt?: string;
 };
 
+type WebhookEventItem = {
+  id?: number;
+  event?: string;
+  instanceName?: string;
+  senderRaw?: string;
+  senderNumber?: string;
+  senderName?: string;
+  messageId?: string;
+  messageType?: string;
+  messageText?: string;
+  status?: string;
+  reason?: string;
+  details?: Record<string, unknown> | null;
+  receivedAt?: string;
+};
+
 export class AppointmentService {
   private backendUrl: string;
   private establishmentId: string;
@@ -375,6 +391,35 @@ export class AppointmentService {
     }
 
     const data = (await response.json()) as { data?: AppointmentAuditItem[] };
+    return Array.isArray(data.data) ? data.data : [];
+  }
+
+  async getWebhookEvents(options: { phone?: string; status?: string; reason?: string; limit?: number } = {}) {
+    const params = new URLSearchParams();
+    params.set("limit", String(options.limit ?? 300));
+    if (options.phone) {
+      params.set("phone", options.phone);
+    }
+    if (options.status) {
+      params.set("status", options.status);
+    }
+    if (options.reason) {
+      params.set("reason", options.reason);
+    }
+
+    const response = await fetch(
+      this.getBackendEndpoint(`/api/db/webhook-events?${params.toString()}`),
+      {
+        method: "GET",
+        headers: { "Content-Type": "application/json" },
+      },
+    );
+
+    if (!response.ok) {
+      throw new Error(`Falha ao carregar eventos de webhook (${response.status}).`);
+    }
+
+    const data = (await response.json()) as { data?: WebhookEventItem[] };
     return Array.isArray(data.data) ? data.data : [];
   }
 }
