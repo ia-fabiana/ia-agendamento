@@ -18,9 +18,11 @@ const DATA_DIR_PATH = path.join(__dirname, "data");
 const SQLITE_DB_PATH = process.env.IA_DB_PATH?.trim() || path.join(DATA_DIR_PATH, "ia_agendamento.sqlite");
 const MAX_WHATSAPP_HISTORY_MESSAGES = 20;
 const BOOKING_CONFIRMATION_TTL_MS = 20 * 60 * 1000;
+const HUMAN_HANDOFF_TTL_MS = 12 * 60 * 60 * 1000;
 const whatsappConversations = new Map();
 const recentWebhookMessages = new Map();
 const pendingBookingConfirmations = new Map();
+const humanHandoffSessions = new Map();
 const WEBHOOK_DEDUPE_WINDOW_MS = 30_000;
 const db = initDatabase();
 
@@ -415,6 +417,154 @@ function clearPendingBookingConfirmation(sessionKey) {
     return;
   }
   pendingBookingConfirmations.delete(sessionKey);
+}
+
+function isHumanHandoffEnabled() {
+  const raw = String(process.env.HUMAN_HANDOFF_ENABLED || "true").trim().toLowerCase();
+  return !["0", "false", "off", "no", "nao"].includes(raw);
+}
+
+function cleanupHumanHandoffSessions(now = Date.now()) {
+  for (const [phone, value] of humanHandoffSessions.entries()) {
+    if (!value || now > Number(value.expiresAt || 0)) {
+      humanHandoffSessions.delete(phone);
+    }
+  }
+}
+
+function getHumanHandoffSession(phone) {
+  const normalizedPhone = normalizePhone(phone);
+  if (!normalizedPhone) {
+    return null;
+  }
+
+  cleanupHumanHandoffSessions();
+  return humanHandoffSessions.get(normalizedPhone) || null;
+}
+
+function setHumanHandoffSession(phone, payload = {}) {
+  const normalizedPhone = normalizePhone(phone);
+  if (!normalizedPhone) {
+    return null;
+  }
+
+  const now = Date.now();
+  const value = {
+    active: true,
+    phone: normalizedPhone,
+    createdAt: now,
+    updatedAt: now,
+    expiresAt: now + HUMAN_HANDOFF_TTL_MS,
+    ...payload,
+  };
+
+  humanHandoffSessions.set(normalizedPhone, value);
+  return value;
+}
+
+function clearHumanHandoffSession(phone) {
+  const normalizedPhone = normalizePhone(phone);
+  if (!normalizedPhone) {
+    return false;
+  }
+
+  return humanHandoffSessions.delete(normalizedPhone);
+}
+
+function listHumanAlertPhones() {
+  const raw = firstNonEmpty([
+    process.env.HUMAN_ALERT_NUMBERS,
+    process.env.RECEPTION_ALERT_NUMBERS,
+    process.env.RECEPCAO_ALERT_NUMBERS,
+  ]);
+
+  if (!raw) {
+    return [];
+  }
+
+  return [...new Set(
+    String(raw)
+      .split(/[;,]/)
+      .map((item) => normalizePhone(item))
+      .filter(Boolean),
+  )];
+}
+
+function isHumanHandoffRequest(text) {
+  const normalized = normalizeForMatch(text);
+  if (!normalized) {
+    return false;
+  }
+
+  return (
+    /\b(falar com atendente|falar com humano|atendimento humano|suporte humano|quero humano|quero atendente)\b/.test(
+      normalized,
+    ) ||
+    /\b(chamar recepcao|chamar recepcao|me transfere|transferir para humano|transferir atendimento)\b/.test(
+      normalized,
+    )
+  );
+}
+
+function isHumanHandoffResumeRequest(text) {
+  const normalized = normalizeForMatch(text);
+  if (!normalized) {
+    return false;
+  }
+
+  return (
+    /\b(voltar para ia|retomar ia|continuar com ia|atendimento automatico|bot pode voltar)\b/.test(normalized) ||
+    /\b(ia pode continuar|pode seguir ia)\b/.test(normalized)
+  );
+}
+
+async function notifyHumanAlertPhones({
+  instance,
+  establishmentId,
+  customerPhone,
+  customerName,
+  customerMessage,
+}) {
+  const alertPhones = listHumanAlertPhones();
+  if (!alertPhones.length) {
+    return { sent: 0, skipped: true, reason: "noAlertNumbersConfigured" };
+  }
+
+  const dateContext = getSaoPauloDateContext();
+  const clientLabel = toNonEmptyString(customerName) || "Cliente sem nome";
+  const text = [
+    "ALERTA DE ATENDIMENTO HUMANO",
+    `Cliente: ${clientLabel}`,
+    `WhatsApp: ${normalizePhone(customerPhone)}`,
+    `Mensagem: ${toNonEmptyString(customerMessage) || "-"}`,
+    `Data: ${dateContext.brToday}`,
+    `Hora: ${new Intl.DateTimeFormat("pt-BR", { timeZone: "America/Sao_Paulo", hour: "2-digit", minute: "2-digit" }).format(new Date())}`,
+    `Estabelecimento: ${establishmentId}`,
+  ].join("\n");
+
+  const sent = [];
+  const failed = [];
+  for (const to of alertPhones) {
+    try {
+      const result = await evolutionRequest(`/message/sendText/${instance}`, {
+        method: "POST",
+        body: { number: to, text },
+      });
+      sent.push({ to, result });
+    } catch (error) {
+      failed.push({
+        to,
+        message: error?.message || "Erro ao alertar recepcao.",
+        status: error?.status || null,
+      });
+    }
+  }
+
+  return {
+    sent: sent.length,
+    failed: failed.length,
+    details: { sent, failed },
+  };
 }
 
 function detectConfirmationIntent(message) {
@@ -4021,6 +4171,9 @@ app.get("/", (req, res) => {
       trinksCancel: "POST /api/trinks/appointments/cancel",
       evolutionSendText: "POST /api/evolution/send-text",
       evolutionQrPage: "GET /api/evolution/instance/connect?instance=SEU_NOME",
+      handoffStatus: "GET /api/handoff/status?phone=5511999999999",
+      handoffActivate: "POST /api/handoff/activate",
+      handoffResume: "POST /api/handoff/resume",
       dbConversations: "GET /api/db/conversations?limit=50",
       dbMessages: "GET /api/db/messages?phone=5511999999999&limit=100",
       dbAppointmentAudit: "GET /api/db/appointments-audit?limit=100",
@@ -4734,11 +4887,40 @@ app.get("/api/whatsapp/messages", (req, res) => {
 
 app.post("/api/evolution/send-text", async (req, res) => {
   try {
-    const instance = ensureEnv("EVOLUTION_INSTANCE");
+    const instance = resolveEvolutionInstance(req.body?.instance || req.body?.instanceName);
+    if (!instance) {
+      return res.status(400).json({ message: "Informe instance/instanceName ou configure EVOLUTION_INSTANCE." });
+    }
+
     const { to, text } = req.body || {};
 
     if (!to || !text) {
       return res.status(400).json({ message: "Campos obrigatorios: to, text" });
+    }
+
+    const trimmedText = String(text).trim();
+    const normalizedTarget = normalizePhone(to);
+
+    if (normalizedTarget && /^\/(retomar(\s|-)?ia|ia\s+on)$/i.test(trimmedText)) {
+      clearHumanHandoffSession(normalizedTarget);
+      return res.json({
+        status: "ok",
+        action: "handoffResumed",
+        phone: normalizedTarget,
+      });
+    }
+
+    if (normalizedTarget && /^\/(humano(\s|-)?on|handoff(\s|-)?on)$/i.test(trimmedText)) {
+      const session = setHumanHandoffSession(normalizedTarget, {
+        source: "manualCommand",
+        reason: "Ativado manualmente pelo painel",
+      });
+      return res.json({
+        status: "ok",
+        action: "handoffActivated",
+        phone: normalizedTarget,
+        session,
+      });
     }
 
     const payload = {
@@ -4761,6 +4943,87 @@ app.post("/api/evolution/send-text", async (req, res) => {
     return res.status(error.status || 500).json({
       status: "error",
       message: error.message || "Erro ao enviar mensagem na Evolution.",
+      details: error.details || null,
+    });
+  }
+});
+
+app.get("/api/handoff/status", (req, res) => {
+  const phone = normalizePhone(req.query.phone || "");
+  if (!phone) {
+    return res.status(400).json({ message: "Informe ?phone=numero" });
+  }
+
+  const session = getHumanHandoffSession(phone);
+  return res.json({
+    status: "ok",
+    phone,
+    active: Boolean(session?.active),
+    session: session || null,
+  });
+});
+
+app.post("/api/handoff/activate", (req, res) => {
+  const phone = normalizePhone(req.body?.phone || req.body?.clientPhone || "");
+  if (!phone) {
+    return res.status(400).json({ message: "Campo obrigatorio: phone" });
+  }
+
+  const session = setHumanHandoffSession(phone, {
+    source: "api",
+    reason: toNonEmptyString(req.body?.reason) || "Ativado por endpoint",
+    customerName: toNonEmptyString(req.body?.customerName),
+  });
+
+  return res.json({
+    status: "ok",
+    action: "handoffActivated",
+    phone,
+    session,
+  });
+});
+
+app.post("/api/handoff/resume", async (req, res) => {
+  try {
+    const phone = normalizePhone(req.body?.phone || req.body?.clientPhone || "");
+    if (!phone) {
+      return res.status(400).json({ message: "Campo obrigatorio: phone" });
+    }
+
+    const hadSession = Boolean(getHumanHandoffSession(phone));
+    clearHumanHandoffSession(phone);
+
+    const notifyClient = Boolean(req.body?.notifyClient);
+    if (notifyClient) {
+      const instance = resolveEvolutionInstance(req.body?.instance || req.body?.instanceName);
+      if (!instance) {
+        return res.status(400).json({
+          message: "Para notifyClient=true, informe instance/instanceName ou configure EVOLUTION_INSTANCE.",
+        });
+      }
+
+      const message =
+        toNonEmptyString(req.body?.message) ||
+        "Perfeito. Voltei com o atendimento automatico do Jacques para te ajudar.";
+
+      await evolutionRequest(`/message/sendText/${instance}`, {
+        method: "POST",
+        body: { number: phone, text: message },
+      });
+      pushWhatsappHistory(phone, "assistant", message);
+    }
+
+    return res.json({
+      status: "ok",
+      action: "handoffResumed",
+      phone,
+      hadSession,
+      notifyClient,
+    });
+  } catch (error) {
+    return res.status(error.status || 500).json({
+      status: "error",
+      message: error.message || "Erro ao retomar atendimento automatico.",
       details: error.details || null,
     });
   }
@@ -4817,9 +5080,130 @@ app.post("/webhook/whatsapp", async (req, res) => {
     const knownClient = await findExistingClientByPhone(establishmentId, incoming.senderNumber).catch(() => null);
     const knownClientName = toNonEmptyString(clientDisplayNameFrom(knownClient));
     const effectiveClientName = knownClientName || incoming.senderName;
+    const instance = resolveEvolutionInstance(incoming.instanceName);
+    if (!instance) {
+      const instanceError = new Error("EVOLUTION_INSTANCE nao configurado e nao informado no webhook.");
+      instanceError.status = 500;
+      throw instanceError;
+    }
 
     const previousHistory = getWhatsappHistory(incoming.senderNumber);
     pushWhatsappHistory(incoming.senderNumber, "user", incoming.messageText, effectiveClientName);
+
+    if (isHumanHandoffEnabled()) {
+      const askedHuman = isHumanHandoffRequest(incoming.messageText);
+      const askedResume = isHumanHandoffResumeRequest(incoming.messageText);
+      const activeHandoff = getHumanHandoffSession(incoming.senderNumber);
+
+      if (askedResume && activeHandoff?.active) {
+        clearHumanHandoffSession(incoming.senderNumber);
+
+        const resumeMessage =
+          toNonEmptyString(process.env.HUMAN_HANDOFF_RESUME_MESSAGE) ||
+          "Perfeito. Voltei com o atendimento automatico do Jacques para te ajudar.";
+
+        await evolutionRequest(`/message/sendText/${instance}`, {
+          method: "POST",
+          body: {
+            number: incoming.senderNumber,
+            text: resumeMessage,
+          },
+        });
+        pushWhatsappHistory(incoming.senderNumber, "assistant", resumeMessage);
+
+        return res.status(200).json({
+          received: true,
+          processed: true,
+          handoff: true,
+          handoffAction: "resumed",
+          instance,
+          to: incoming.senderNumber,
+          event: incoming.event || null,
+          messageId: incoming.messageId || null,
+        });
+      }
+
+      if (askedHuman) {
+        const session = setHumanHandoffSession(incoming.senderNumber, {
+          source: "customerRequest",
+          reason: incoming.messageText,
+          establishmentId,
+          customerName: effectiveClientName,
+          messageId: incoming.messageId || "",
+        });
+
+        const ackMessage =
+          toNonEmptyString(process.env.HUMAN_HANDOFF_ACK_MESSAGE) ||
+          "Perfeito. Vou acionar nossa recepcao agora e um atendente humano segue com voce.";
+
+        await evolutionRequest(`/message/sendText/${instance}`, {
+          method: "POST",
+          body: {
+            number: incoming.senderNumber,
+            text: ackMessage,
+          },
+        });
+        pushWhatsappHistory(incoming.senderNumber, "assistant", ackMessage);
+
+        const alertResult = await notifyHumanAlertPhones({
+          instance,
+          establishmentId,
+          customerPhone: incoming.senderNumber,
+          customerName: effectiveClientName,
+          customerMessage: incoming.messageText,
+        });
+
+        return res.status(200).json({
+          received: true,
+          processed: true,
+          handoff: true,
+          handoffAction: "activated",
+          instance,
+          to: incoming.senderNumber,
+          event: incoming.event || null,
+          messageId: incoming.messageId || null,
+          session: session || null,
+          alertResult,
+        });
+      }
+
+      if (activeHandoff?.active) {
+        const now = Date.now();
+        const lastWaitAckAt = Number(activeHandoff.lastWaitAckAt || 0);
+        const shouldSendWaitingAck = now - lastWaitAckAt > 5 * 60 * 1000;
+
+        if (shouldSendWaitingAck) {
+          const waitingMessage =
+            toNonEmptyString(process.env.HUMAN_HANDOFF_WAITING_MESSAGE) ||
+            "Nosso atendimento humano ja foi acionado e vai continuar com voce em instantes.";
+
+          await evolutionRequest(`/message/sendText/${instance}`, {
+            method: "POST",
+            body: {
+              number: incoming.senderNumber,
+              text: waitingMessage,
+            },
+          });
+          pushWhatsappHistory(incoming.senderNumber, "assistant", waitingMessage);
+
+          setHumanHandoffSession(incoming.senderNumber, {
+            ...activeHandoff,
+            lastWaitAckAt: now,
+          });
+        }
+
+        return res.status(200).json({
+          received: true,
+          processed: true,
+          handoff: true,
+          handoffAction: "active",
+          instance,
+          to: incoming.senderNumber,
+          event: incoming.event || null,
+          messageId: incoming.messageId || null,
+        });
+      }
+    }
 
     const answer = await sendChatMessage({
       establishmentId,
@@ -4831,13 +5215,6 @@ app.post("/webhook/whatsapp", async (req, res) => {
         fromTrinks: Boolean(knownClientName),
       },
     });
-
-    const instance = resolveEvolutionInstance(incoming.instanceName);
-    if (!instance) {
-      const instanceError = new Error("EVOLUTION_INSTANCE nao configurado e nao informado no webhook.");
-      instanceError.status = 500;
-      throw instanceError;
-    }
 
     await evolutionRequest(`/message/sendText/${instance}`, {
       method: "POST",
