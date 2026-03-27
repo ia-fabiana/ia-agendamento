@@ -462,57 +462,99 @@ export default function App() {
   };
 
   const handleExportAuditCsv = () => {
-    if (!historyAudit.length) {
-      setHistoryError('Nao ha dados de auditoria para exportar.');
+    if (!historyAudit.length && !historyWebhookEvents.length) {
+      setHistoryError('Nao ha dados para exportar.');
       return;
     }
 
-    const header = [
-      'id',
-      'createdAt',
-      'eventType',
-      'status',
-      'clientName',
-      'clientPhone',
-      'serviceName',
-      'professionalName',
-      'date',
-      'time',
-      'confirmationCode',
-      'appointmentId',
-      'requestReference',
-      'errorMessage',
-    ];
+    const downloadCsv = (filename: string, header: string[], rows: string[][]) => {
+      const csvRows = rows.map((row) => row.map(csvEscape).join(','));
+      const csv = [header.map(csvEscape).join(','), ...csvRows].join('\n');
+      const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = filename;
+      a.click();
+      URL.revokeObjectURL(url);
+    };
 
-    const rows = historyAudit.map((item) => {
-      const requestReference = toText(item?.requestPayload?.requestReference);
-      return [
-        item.id ?? '',
-        item.createdAt ?? '',
-        item.eventType ?? '',
-        item.status ?? '',
-        item.clientName ?? '',
-        item.clientPhone ?? '',
-        item.serviceName ?? '',
-        item.professionalName ?? '',
-        item.date ?? '',
-        item.time ?? '',
-        item.confirmationCode ?? '',
-        item.appointmentId ?? '',
-        requestReference,
-        item.errorMessage ?? '',
-      ].map(csvEscape).join(',');
-    });
-
-    const csv = [header.map(csvEscape).join(','), ...rows].join('\n');
-    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
     const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-');
-    a.href = url;
-    a.download = `historico-agendamentos-${stamp}.csv`;
-    a.click();
-    URL.revokeObjectURL(url);
+
+    if (historyAudit.length) {
+      const auditHeader = [
+        'id',
+        'createdAt',
+        'eventType',
+        'status',
+        'clientName',
+        'clientPhone',
+        'serviceName',
+        'professionalName',
+        'date',
+        'time',
+        'confirmationCode',
+        'appointmentId',
+        'requestReference',
+        'errorMessage',
+      ];
+
+      const auditRows = historyAudit.map((item) => {
+        const requestReference = toText(item?.requestPayload?.requestReference);
+        return [
+          String(item.id ?? ''),
+          String(item.createdAt ?? ''),
+          String(item.eventType ?? ''),
+          String(item.status ?? ''),
+          String(item.clientName ?? ''),
+          String(item.clientPhone ?? ''),
+          String(item.serviceName ?? ''),
+          String(item.professionalName ?? ''),
+          String(item.date ?? ''),
+          String(item.time ?? ''),
+          String(item.confirmationCode ?? ''),
+          String(item.appointmentId ?? ''),
+          String(requestReference ?? ''),
+          String(item.errorMessage ?? ''),
+        ];
+      });
+
+      downloadCsv(`historico-agendamentos-${stamp}.csv`, auditHeader, auditRows);
+    }
+
+    if (historyWebhookEvents.length) {
+      const webhookHeader = [
+        'id',
+        'receivedAt',
+        'event',
+        'instanceName',
+        'senderNumber',
+        'senderName',
+        'messageId',
+        'messageType',
+        'status',
+        'reason',
+        'messageText',
+      ];
+
+      const webhookRows = historyWebhookEvents.map((item) => [
+        String(item.id ?? ''),
+        String(item.receivedAt ?? ''),
+        String(item.event ?? ''),
+        String(item.instanceName ?? ''),
+        String(item.senderNumber ?? ''),
+        String(item.senderName ?? ''),
+        String(item.messageId ?? ''),
+        String(item.messageType ?? ''),
+        String(item.status ?? ''),
+        String(item.reason ?? ''),
+        String(item.messageText ?? ''),
+      ]);
+
+      downloadCsv(`historico-webhook-${stamp}.csv`, webhookHeader, webhookRows);
+    }
+
+    setHistoryError('');
   };
 
   const loadInbox = async () => {
@@ -794,7 +836,7 @@ export default function App() {
                     </button>
                     <button
                       onClick={handleExportAuditCsv}
-                      disabled={isLoadingHistory || !historyAudit.length}
+                      disabled={isLoadingHistory || (!historyAudit.length && !historyWebhookEvents.length)}
                       className="px-4 py-2 rounded-lg bg-white/10 text-white text-xs uppercase tracking-wider disabled:opacity-50"
                     >
                       Exportar CSV
