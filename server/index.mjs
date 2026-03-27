@@ -5172,7 +5172,7 @@ async function sendChatMessage({ establishmentId, message, history, customerCont
     });
   }
 
-  throw new Error("Nao foi possivel concluir a conversa com a IA.");
+  return "Tive uma instabilidade momentanea aqui. Consegue repetir sua ultima mensagem para eu continuar seu atendimento?";
 }
 
 app.get("/api/health", (req, res) => {
@@ -6555,11 +6555,32 @@ app.post("/webhook/whatsapp", webhookBodyParser, async (req, res) => {
       messageId: incoming.messageId || null,
     });
   } catch (error) {
+    const fallbackInstance = resolveEvolutionInstance(incoming?.instanceName);
+    const fallbackPhone = normalizePhone(incoming?.senderNumber || inferSenderFromRawWebhookText(payloadParse?.rawText || ""));
+    const shouldSendFallback = Boolean(fallbackInstance && fallbackPhone);
+    const fallbackText =
+      "Tive uma instabilidade momentanea aqui. Pode repetir sua ultima mensagem para eu continuar?";
+
+    if (shouldSendFallback) {
+      try {
+        await evolutionRequest(`/message/sendText/${fallbackInstance}`, {
+          method: "POST",
+          body: {
+            number: fallbackPhone,
+            text: fallbackText,
+          },
+        });
+        pushWhatsappHistory(fallbackPhone, "assistant", fallbackText);
+      } catch {
+        // Evita falha em cascata: ainda devolvemos 200 para o webhook.
+      }
+    }
+
     recordWebhookEvent({
       event: incoming?.event || "",
       instanceName: incoming?.instanceName || "",
       senderRaw: incoming?.senderRaw || "",
-      senderNumber: incoming?.senderNumber || inferSenderFromRawWebhookText(payloadParse?.rawText || ""),
+      senderNumber: fallbackPhone,
       senderName: incoming?.senderName || "",
       messageId: incoming?.messageId || "",
       messageType: incoming?.messageType || "",
@@ -6570,9 +6591,10 @@ app.post("/webhook/whatsapp", webhookBodyParser, async (req, res) => {
         message: error?.message || "Erro interno.",
         status: error?.status || 500,
         parseStatus: payloadParse?.parseStatus || "",
+        fallbackSent: shouldSendFallback,
       },
     });
-    return res.status(error.status || 500).json({
+    return res.status(200).json({
       received: true,
       processed: false,
       status: "error",
