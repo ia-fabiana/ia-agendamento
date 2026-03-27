@@ -1424,6 +1424,52 @@ function historyAlreadyAskedProfessionalPreference(history) {
   });
 }
 
+function messageContainsProfessionalPreferenceHint(message) {
+  const normalized = normalizeForMatch(message)
+    .replace(/[^a-z0-9\s]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  if (!normalized) {
+    return false;
+  }
+
+  if (/\bpreferenc\w*\s+(de|por)\s+profission/.test(normalized)) {
+    return false;
+  }
+
+  return (
+    /\bcom\s+(a|o)\s+[a-z]{3,}\b/.test(normalized) ||
+    /\bsim[, ]+\s*[a-z]{3,}\b/.test(normalized) ||
+    /\b(prefiro|quero|gosto)\s+(da|do|de)?\s*[a-z]{3,}\b/.test(normalized)
+  );
+}
+
+function historyHasProfessionalContext(history) {
+  if (!Array.isArray(history) || !history.length) {
+    return false;
+  }
+
+  const patterns = [
+    /\bcom\s+(a|o)\s+[a-z]{3,}\b/,
+    /\bhorarios?\s+com\s+[a-z]{3,}\b/,
+    /\bprofissional\s*:\s*[a-z]{3,}\b/,
+    /\b(a|o)\s+[a-z]{3,}\s+tem disponibilidade\b/,
+    /\b(a|o)\s+[a-z]{3,}\s+nao possui disponibilidade\b/,
+  ];
+
+  return history.some((item) => {
+    const text = normalizeForMatch(item?.content || "")
+      .replace(/[^a-z0-9\s]/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+    if (!text) {
+      return false;
+    }
+    return patterns.some((pattern) => pattern.test(text));
+  });
+}
+
 function buildConversationPrompt(history, message, knowledge, customerContext = null) {
   const dateContext = getSaoPauloDateContext();
   const relativeDate = detectRelativeDateReference(message, dateContext);
@@ -3954,6 +4000,8 @@ async function sendChatMessage({ establishmentId, message, history, customerCont
   const hasBookingTimeIntent = messageSuggestsBookingTimeIntent(message, dateContext);
   const hasSchedulingIntent = messageSuggestsSchedulingIntent(message);
   const asksProfessionals = /(profission|quem atende|cabeleireir)/.test(normalizedMessageForGate);
+  const hasProfessionalHintInMessage = messageContainsProfessionalPreferenceHint(message);
+  const hasProfessionalHintInHistory = historyHasProfessionalContext(history);
   const pendingSessionKey = resolvePendingSessionKey(establishmentId, customerContext);
   const pendingConfirmation = getPendingBookingConfirmation(pendingSessionKey);
 
@@ -3999,11 +4047,24 @@ async function sendChatMessage({ establishmentId, message, history, customerCont
       return "Perfeito, nao vou confirmar ainda. Me diga o que deseja ajustar (servico, profissional, data ou horario).";
     }
 
-    return `${buildBookingConfirmationMessage(pendingConfirmation.items)}\n\nSe quiser ajustar algo, me diga o que devo alterar.`;
+    const hasAdjustmentIntent =
+      hasSchedulingIntent ||
+      hasBookingTimeIntent ||
+      Boolean(inferredPreferredTime) ||
+      /\b(ajust|troc|mudar|alterar|outro|dia|horario|hora|profissional|servico)\b/.test(normalizedMessageForGate);
+
+    if (hasAdjustmentIntent) {
+      clearPendingBookingConfirmation(pendingSessionKey);
+    } else {
+      return `${buildBookingConfirmationMessage(pendingConfirmation.items)}\n\nSe quiser ajustar algo, me diga o que devo alterar.`;
+    }
+
   }
 
   const shouldAskPreferenceFirst =
     hasBookingTimeIntent &&
+    !hasProfessionalHintInMessage &&
+    !hasProfessionalHintInHistory &&
     !asksProfessionals &&
     !historyAlreadyAskedProfessionalPreference(history);
 
