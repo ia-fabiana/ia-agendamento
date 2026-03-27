@@ -22,6 +22,7 @@ const HUMAN_HANDOFF_TTL_MS = 12 * 60 * 60 * 1000;
 const TRINKS_MAX_RETRIES = Math.max(1, Number(process.env.TRINKS_MAX_RETRIES || 4));
 const TRINKS_RETRY_BASE_MS = Math.max(200, Number(process.env.TRINKS_RETRY_BASE_MS || 700));
 const BOOKING_SEQUENCE_GAP_MS = Math.max(0, Number(process.env.BOOKING_SEQUENCE_GAP_MS || 450));
+const TRINKS_STATUS_ID_CANCELLED = Math.max(1, Number(process.env.TRINKS_STATUS_ID_CANCELLED || 9));
 const whatsappConversations = new Map();
 const recentWebhookMessages = new Map();
 const pendingBookingConfirmations = new Map();
@@ -990,6 +991,7 @@ Fluxo:
 - Se houver mais de um servico, monte todos os itens no campo appointments da ferramenta bookAppointment.
 - Para reagendar, use rescheduleAppointment.
 - Para desmarcar sem remarcar, use cancelAppointment.
+- Regra critica: se a cliente pedir alteracao ou cancelamento, nao use bookAppointment antes de concluir reschedule/cancel.
 - Para desmarcar, priorize pedir codigo de confirmacao (TRK). Se a cliente nao tiver codigo, tente localizar pelo telefone da cliente na base Trinks e prossiga com seguranca.
 - Quando a cliente perguntar nomes de profissionais, consulte a ferramenta listProfessionalsForDate e responda apenas com dados reais.
 - Ao receber preferencia de profissional e/ou horario desejado, use checkAvailability com professionalName e preferredTime para trazer os horarios mais proximos possiveis.
@@ -1432,6 +1434,16 @@ function messageSuggestsBookingTimeIntent(message, dateContext = getSaoPauloDate
   return (hasBookingVerb && (hasClientIntent || hasDateCue)) || (hasAvailabilityCue && hasDateCue);
 }
 
+function messageSuggestsCancellationIntent(message) {
+  const normalized = normalizeForMatch(message);
+  return /\b(cancel|cancela|cancelar|desmar|demar|remover|apagar|excluir)\b/.test(normalized);
+}
+
+function messageSuggestsRescheduleIntent(message) {
+  const normalized = normalizeForMatch(message);
+  return /\b(remar|reagend|alter|mudar|trocar)\b/.test(normalized);
+}
+
 function historyAlreadyAskedProfessionalPreference(history) {
   if (!Array.isArray(history)) {
     return false;
@@ -1531,6 +1543,7 @@ function buildConversationPrompt(history, message, knowledge, customerContext = 
     "- Regra: se nao houver preferencia de profissional e houver horario desejado, liste todas as profissionais disponiveis naquele horario.",
     "- Regra: se a profissional preferida estiver indisponivel no horario pedido, primeiro mostre os horarios que ela tem no dia e so depois pergunte se a cliente quer disponibilidade de outros profissionais.",
     "- Regra: antes de efetivar qualquer agendamento, sempre apresente resumo completo e aguarde confirmacao explicita da cliente.",
+    "- Regra: se o pedido atual for para cancelar ou alterar, nao abrir novo agendamento ate concluir o cancelamento/alteracao.",
     "- Regra: para desmarcacao, prefira solicitar codigo TRK; se nao houver codigo e houver telefone de cliente identificada, tente localizar e continuar com seguranca.",
     "- Regra: antes de responder perguntas comerciais, valide primeiro a FAQ da base de conhecimento.",
     "",
@@ -3712,6 +3725,75 @@ function parseAppointmentIdOrNull({ confirmationCode, appointmentId }) {
   return null;
 }
 
+async function getAppointmentSnapshot(establishmentId, appointmentId) {
+  const parsedId = Number(appointmentId);
+  if (!Number.isFinite(parsedId) || parsedId <= 0) {
+    const error = new Error("ID de agendamento invalido para consulta.");
+    error.status = 400;
+    throw error;
+  }
+
+  return trinksRequest(`/agendamentos/${parsedId}`, {
+    method: "GET",
+    estabelecimentoId: establishmentId,
+  });
+}
+
+function buildAppointmentUpdatePayload(snapshot, overrides = {}) {
+  const clienteId = Number(snapshot?.cliente?.id ?? snapshot?.clienteId ?? snapshot?.clienteEstabelecimentoId);
+  const servicoId = Number(snapshot?.servico?.id ?? snapshot?.servicoId ?? snapshot?.servicoEstabelecimentoId);
+  const profissionalId = Number(
+    snapshot?.profissional?.id ?? snapshot?.profissionalId ?? snapshot?.profissionalEstabelecimentoId,
+  );
+  const dataHoraInicio = toNonEmptyString(snapshot?.dataHoraInicio || snapshot?.inicio);
+  const duracaoEmMinutos = Number(snapshot?.duracaoEmMinutos ?? snapshot?.duracao ?? snapshot?.duracaoMinutos);
+  const valor = Number(snapshot?.valor ?? snapshot?.preco ?? 0);
+  const observacoes = firstNonEmpty([
+    snapshot?.observacoesDoEstabelecimento,
+    snapshot?.observacoes,
+    snapshot?.observacao,
+  ]);
+  const confirmedStatusName = normalizeForMatch(firstNonEmpty([snapshot?.status?.nome, snapshot?.situacao]));
+  const confirmado = confirmedStatusName.includes("confirm");
+
+  if (!Number.isFinite(clienteId) || clienteId <= 0) {
+    const error = new Error("Agendamento sem clienteId valido para atualizacao.");
+    error.status = 422;
+    throw error;
+  }
+  if (!Number.isFinite(servicoId) || servicoId <= 0) {
+    const error = new Error("Agendamento sem servicoId valido para atualizacao.");
+    error.status = 422;
+    throw error;
+  }
+  if (!Number.isFinite(profissionalId) || profissionalId <= 0) {
+    const error = new Error("Agendamento sem profissionalId valido para atualizacao.");
+    error.status = 422;
+    throw error;
+  }
+  if (!dataHoraInicio) {
+    const error = new Error("Agendamento sem dataHoraInicio valida para atualizacao.");
+    error.status = 422;
+    throw error;
+  }
+
+  const basePayload = {
+    clienteId,
+    servicoId,
+    profissionalId,
+    dataHoraInicio,
+    duracaoEmMinutos: Number.isFinite(duracaoEmMinutos) && duracaoEmMinutos > 0 ? duracaoEmMinutos : 60,
+    valor: Number.isFinite(valor) ? valor : 0,
+    observacoes,
+    confirmado,
+  };
+
+  return {
+    ...basePayload,
+    ...overrides,
+  };
+}
+
 function appointmentClientIdFrom(item) {
   return item?.clienteId ?? item?.cliente?.id ?? item?.clientId ?? item?.cliente?.clienteId ?? null;
 }
@@ -3987,7 +4069,43 @@ async function cancelAppointmentById({ establishmentId, appointmentId, reason, r
     : "Cancelado via IA.AGENDAMENTO";
 
   const parsedId = Number(appointmentId);
+  const snapshot = await getAppointmentSnapshot(establishmentId, parsedId);
+  const payloadCancelByStatus = buildAppointmentUpdatePayload(snapshot, {
+    statusId: TRINKS_STATUS_ID_CANCELLED,
+    status: { id: TRINKS_STATUS_ID_CANCELLED },
+    confirmado: false,
+    observacoes: cancellationNote,
+  });
+  const payloadCancelByFlag = {
+    ...payloadCancelByStatus,
+    cancelado: true,
+  };
+
   const attempts = [
+    {
+      method: "PUT",
+      path: `/agendamentos/${parsedId}`,
+      body: payloadCancelByStatus,
+      mode: "PUT_STATUS_CANCELLED_FULL",
+    },
+    {
+      method: "PATCH",
+      path: `/agendamentos/${parsedId}`,
+      body: payloadCancelByStatus,
+      mode: "PATCH_STATUS_CANCELLED_FULL",
+    },
+    {
+      method: "PUT",
+      path: `/agendamentos/${parsedId}`,
+      body: payloadCancelByFlag,
+      mode: "PUT_CANCEL_FLAG_FULL",
+    },
+    {
+      method: "PATCH",
+      path: `/agendamentos/${parsedId}`,
+      body: payloadCancelByFlag,
+      mode: "PATCH_CANCEL_FLAG_FULL",
+    },
     {
       method: "DELETE",
       path: `/agendamentos/${parsedId}`,
@@ -4074,6 +4192,7 @@ async function cancelAppointmentById({ establishmentId, appointmentId, reason, r
     requestPayload: {
       ...requestPayload,
       reason: normalizedReason,
+      payloadCancelByStatus,
       attemptsTried: attempts.map((item) => item.mode),
     },
     responsePayload: attemptErrors,
@@ -4087,39 +4206,22 @@ async function rescheduleAppointment({ establishmentId, confirmationCode, appoin
   const parsedId = parseAppointmentId({ confirmationCode, appointmentId });
   const requestedTime = normalizeTimeValue(time) || String(time || "");
   const dataHoraInicio = toIsoDateTime(date, requestedTime);
-  const payload = { dataHoraInicio };
+  const snapshot = await getAppointmentSnapshot(establishmentId, parsedId);
+  const payload = buildAppointmentUpdatePayload(snapshot, {
+    dataHoraInicio,
+    confirmado: true,
+  });
 
-  try {
-    const updated = await trinksRequest(`/agendamentos/${parsedId}`, {
-      method: "PATCH",
-      estabelecimentoId: establishmentId,
-      body: payload,
-    });
+  const attempts = [
+    { method: "PUT", path: `/agendamentos/${parsedId}`, mode: "PUT_FULL" },
+    { method: "PATCH", path: `/agendamentos/${parsedId}`, mode: "PATCH_FULL" },
+  ];
 
-    const result = {
-      status: "success",
-      confirmationCode: `TRK-${parsedId}`,
-      message: `Horario alterado para ${date} as ${requestedTime}.`,
-      raw: updated,
-    };
-
-    recordAppointmentAudit({
-      eventType: "reschedule",
-      status: "success",
-      establishmentId,
-      appointmentId: parsedId,
-      confirmationCode: `TRK-${parsedId}`,
-      date,
-      time: requestedTime,
-      requestPayload: payload,
-      responsePayload: result,
-    });
-
-    return result;
-  } catch (patchError) {
+  const errors = [];
+  for (const attempt of attempts) {
     try {
-      const updated = await trinksRequest(`/agendamentos/${parsedId}`, {
-        method: "PUT",
+      const updated = await trinksRequest(attempt.path, {
+        method: attempt.method,
         estabelecimentoId: establishmentId,
         body: payload,
       });
@@ -4128,9 +4230,8 @@ async function rescheduleAppointment({ establishmentId, confirmationCode, appoin
         status: "success",
         confirmationCode: `TRK-${parsedId}`,
         message: `Horario alterado para ${date} as ${requestedTime}.`,
+        method: attempt.mode,
         raw: updated,
-        fallbackMethod: "PUT",
-        patchError: patchError?.message || null,
       };
 
       recordAppointmentAudit({
@@ -4141,30 +4242,43 @@ async function rescheduleAppointment({ establishmentId, confirmationCode, appoin
         confirmationCode: `TRK-${parsedId}`,
         date,
         time: requestedTime,
-        requestPayload: payload,
+        requestPayload: {
+          mode: attempt.mode,
+          payload,
+        },
         responsePayload: result,
       });
 
       return result;
-    } catch (putError) {
-      recordAppointmentAudit({
-        eventType: "reschedule",
-        status: "error",
-        establishmentId,
-        appointmentId: parsedId,
-        confirmationCode: `TRK-${parsedId}`,
-        date,
-        time: requestedTime,
-        requestPayload: payload,
-        responsePayload: {
-          patchError: patchError?.message || null,
-          putError: putError?.details || null,
-        },
-        errorMessage: putError?.message || patchError?.message || "Erro ao reagendar",
+    } catch (error) {
+      errors.push({
+        mode: attempt.mode,
+        method: attempt.method,
+        message: error?.message || "Erro ao reagendar.",
+        details: error?.details || null,
+        status: error?.status || null,
       });
-      throw putError;
     }
   }
+
+  const last = errors[errors.length - 1];
+  recordAppointmentAudit({
+    eventType: "reschedule",
+    status: "error",
+    establishmentId,
+    appointmentId: parsedId,
+    confirmationCode: `TRK-${parsedId}`,
+    date,
+    time: requestedTime,
+    requestPayload: payload,
+    responsePayload: errors,
+    errorMessage: last?.message || "Erro ao reagendar",
+  });
+
+  const failure = new Error(last?.message || "Nao foi possivel alterar o agendamento.");
+  failure.status = last?.status || 500;
+  failure.details = errors;
+  throw failure;
 }
 
 async function cancelAppointment({
@@ -4225,6 +4339,9 @@ async function sendChatMessage({ establishmentId, message, history, customerCont
   const inferredPreferredTime = extractPreferredTimeFromMessage(message);
   const hasBookingTimeIntent = messageSuggestsBookingTimeIntent(message, dateContext);
   const hasSchedulingIntent = messageSuggestsSchedulingIntent(message);
+  const hasCancellationIntent = messageSuggestsCancellationIntent(message);
+  const hasRescheduleIntent = messageSuggestsRescheduleIntent(message);
+  const hasChangeRequestIntent = hasCancellationIntent || hasRescheduleIntent;
   const asksProfessionals = /(profission|quem atende|cabeleireir)/.test(normalizedMessageForGate);
   const hasProfessionalHintInMessage = messageContainsProfessionalPreferenceHint(message);
   const hasProfessionalHintInHistory = historyHasProfessionalContext(history);
@@ -4454,6 +4571,20 @@ async function sendChatMessage({ establishmentId, message, history, customerCont
         }
 
         if (call.name === "bookAppointment") {
+          if (hasChangeRequestIntent) {
+            results.push({
+              name: call.name,
+              result: {
+                status: "blocked_by_change_intent",
+                message:
+                  "Detectei pedido de cancelamento/alteracao. Nao vou criar novo agendamento ate concluir a alteracao ou cancelamento solicitado.",
+                requiredAction:
+                  "Use rescheduleAppointment para alterar horario e/ou cancelAppointment para desmarcar.",
+              },
+            });
+            continue;
+          }
+
           const resolvedClientName =
             toNonEmptyString(call.args?.clientName) ||
             toNonEmptyString(customerContext?.name);
