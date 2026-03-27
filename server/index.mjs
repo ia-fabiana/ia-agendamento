@@ -629,6 +629,26 @@ function normalizeBookingDate(value, fallbackDate = "") {
   return toNonEmptyString(fallbackDate);
 }
 
+function generateRequestReference() {
+  const now = new Date();
+  const compact = now.toISOString().replace(/\D/g, "").slice(2, 14);
+  const random = Math.random().toString(36).slice(2, 7).toUpperCase();
+  return `REQ-${compact}-${random}`;
+}
+
+function buildAppointmentObservation({ requestReference = "", confirmationCode = "" } = {}) {
+  const req = toNonEmptyString(requestReference);
+  const code = toNonEmptyString(confirmationCode);
+  const parts = ["Agendamento via IA.AGENDAMENTO"];
+  if (req) {
+    parts.push(`Req ${req}`);
+  }
+  if (code) {
+    parts.push(`Cod ${code}`);
+  }
+  return parts.join(" | ").slice(0, 400);
+}
+
 function recordAppointmentAudit({
   eventType,
   status = "success",
@@ -3014,12 +3034,17 @@ async function getAvailability(
   };
 }
 
-async function upsertAppointmentConfirmationNote({ establishmentId, appointmentId, confirmationCode }) {
-  if (!appointmentId || !confirmationCode) {
+async function upsertAppointmentConfirmationNote({
+  establishmentId,
+  appointmentId,
+  confirmationCode,
+  requestReference = "",
+}) {
+  if (!appointmentId) {
     return { updated: false, reason: "missingData" };
   }
 
-  const note = `Codigo de confirmacao: ${confirmationCode} | Origem: IA.AGENDAMENTO`;
+  const note = buildAppointmentObservation({ requestReference, confirmationCode });
   const attempts = [
     { method: "PATCH", body: { observacoesDoEstabelecimento: note } },
     { method: "PATCH", body: { observacoes: note } },
@@ -3192,12 +3217,14 @@ async function executeConfirmedBookings({ establishmentId, clientName, clientPho
       successes.push({
         ...item,
         confirmationCode: created?.confirmationCode || "",
+        requestReference: toNonEmptyString(created?.requestReference),
       });
     } catch (error) {
       failures.push({
         ...item,
         message: error?.message || "Erro ao criar agendamento.",
         status: Number(error?.status || 0) || null,
+        requestReference: toNonEmptyString(error?.details?.requestReference || error?.requestReference),
       });
     }
   }
@@ -3242,12 +3269,14 @@ async function executeConfirmedBookings({ establishmentId, clientName, clientPho
           professionalId: item.professionalId,
           professionalName: item.professionalName,
           confirmationCode: created?.confirmationCode || "",
+          requestReference: toNonEmptyString(created?.requestReference),
         });
       } catch (error) {
         failures.push({
           ...item,
           message: error?.message || "Erro ao criar agendamento.",
           status: Number(error?.status || 0) || null,
+          requestReference: toNonEmptyString(error?.details?.requestReference || error?.requestReference),
         });
       }
     }
@@ -3277,6 +3306,7 @@ async function createAppointment({
   const normalizedClientPhone = normalizePhone(clientPhone);
   const normalizedClientName = toNonEmptyString(clientName);
   const normalizedRequestedProfessional = toNonEmptyString(professionalName);
+  const requestReference = generateRequestReference();
   const resolvedServiceName = toNonEmptyString(serviceResolvedName) || toNonEmptyString(service);
   const resolvedServiceId = Number(serviceId);
   const resolvedDurationMinutes = Number(durationMinutes);
@@ -3434,7 +3464,7 @@ async function createAppointment({
       dataHoraInicio: toIsoDateTime(date, requestedTime),
       duracaoEmMinutos: selectedDurationMinutes,
       valor: Number.isFinite(selectedAmount) ? selectedAmount : 0,
-      observacoes: "Agendamento criado via IA.AGENDAMENTO",
+      observacoes: buildAppointmentObservation({ requestReference }),
       confirmado: true,
     };
 
@@ -3451,11 +3481,13 @@ async function createAppointment({
       establishmentId,
       appointmentId,
       confirmationCode,
+      requestReference,
     });
 
     const result = {
       status: "success",
       confirmationCode,
+      requestReference,
       message: `Agendamento enviado ao Trinks com sucesso com ${resolvedProfessionalDisplay}.`,
       professional,
       raw: created,
@@ -3474,12 +3506,27 @@ async function createAppointment({
       professionalName: resolvedProfessionalDisplay,
       date,
       time: requestedTime,
-      requestPayload: payload,
+      requestPayload: {
+        requestReference,
+        payload,
+      },
       responsePayload: result,
     });
 
     return result;
   } catch (error) {
+    if (error && typeof error === "object") {
+      const existingDetails =
+        error?.details && typeof error.details === "object"
+          ? error.details
+          : { raw: error?.details ?? null };
+      error.details = {
+        ...existingDetails,
+        requestReference,
+      };
+      error.requestReference = requestReference;
+    }
+
     recordAppointmentAudit({
       eventType: "create",
       status: "error",
@@ -3491,8 +3538,14 @@ async function createAppointment({
       professionalName: resolvedProfessionalDisplay || normalizedRequestedProfessional,
       date,
       time: requestedTime || String(time || ""),
-      requestPayload: payload,
-      responsePayload: error?.details || null,
+      requestPayload: {
+        requestReference,
+        payload,
+      },
+      responsePayload: {
+        requestReference,
+        details: error?.details || null,
+      },
       errorMessage: error?.message || "Erro desconhecido no createAppointment",
     });
     throw error;
@@ -3547,6 +3600,7 @@ async function tryCreateAppointmentVariants({
   context,
 }) {
   const baseDateTime = toIsoDateTime(date, time);
+  const requestReference = generateRequestReference();
   const attempts = [
     {
       name: "current-shape",
@@ -3557,7 +3611,7 @@ async function tryCreateAppointmentVariants({
         dataHoraInicio: baseDateTime,
         duracaoEmMinutos: context.duration,
         valor: context.amount,
-        observacoes: "Agendamento criado via IA.AGENDAMENTO",
+        observacoes: buildAppointmentObservation({ requestReference }),
         confirmado: true,
       },
     },
@@ -4191,9 +4245,13 @@ async function sendChatMessage({ establishmentId, message, history, customerCont
 
       const successLines = execution.successes.map((item) => {
         const codeSuffix = item.confirmationCode ? ` | codigo ${item.confirmationCode}` : "";
-        return `- ${formatBookingItemSummary(item)}${codeSuffix}`;
+        const reqSuffix = item.requestReference ? ` | req ${item.requestReference}` : "";
+        return `- ${formatBookingItemSummary(item)}${codeSuffix}${reqSuffix}`;
       });
-      const failureLines = execution.failures.map((item) => `- ${formatBookingItemSummary(item)} | erro: ${item.message}`);
+      const failureLines = execution.failures.map((item) => {
+        const reqSuffix = item.requestReference ? ` | req ${item.requestReference}` : "";
+        return `- ${formatBookingItemSummary(item)}${reqSuffix} | erro: ${item.message}`;
+      });
 
       if (execution.successes.length && !execution.failures.length) {
         return `Perfeito, agendamento confirmado com sucesso:\n${successLines.join("\n")}`;
