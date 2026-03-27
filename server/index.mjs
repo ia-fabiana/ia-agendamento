@@ -854,6 +854,16 @@ function professionalDisplayName(name) {
   return first.charAt(0).toUpperCase() + first.slice(1).toLowerCase();
 }
 
+function clientFirstName(name) {
+  const raw = toNonEmptyString(name);
+  if (!raw) {
+    return "";
+  }
+
+  const first = raw.split(/\s+/).filter(Boolean)[0] || raw;
+  return first.charAt(0).toUpperCase() + first.slice(1).toLowerCase();
+}
+
 function professionalHasOpenSchedule(item) {
   return Array.isArray(item?.availableTimes) && item.availableTimes.length > 0;
 }
@@ -946,10 +956,12 @@ Diretrizes:
 - Frases curtas, sem paragrafos longos.
 - Foco em concluir agendamentos com precisao.
 - Ao mencionar profissionais para a cliente, use apenas o primeiro nome.
+- Ao chamar a cliente pelo nome, use apenas o primeiro nome.
 
 Fluxo:
 - Identifique o servico desejado.
 - Antes de sugerir horario, consulte disponibilidade real por profissional (checkAvailability).
+- Se a cliente nao tiver preferencia de profissional e informar horario desejado, mostre todas as profissionais que executam o servico e estao livres naquele horario.
 - Para agendar, use bookAppointment.
 - Antes de finalizar o agendamento, sempre valide disponibilidade e apresente um resumo completo para confirmacao explicita da cliente.
 - Se houver mais de um servico, monte todos os itens no campo appointments da ferramenta bookAppointment.
@@ -958,6 +970,7 @@ Fluxo:
 - Para desmarcar, priorize pedir codigo de confirmacao (TRK). Se a cliente nao tiver codigo, tente localizar pelo telefone da cliente na base Trinks e prossiga com seguranca.
 - Quando a cliente perguntar nomes de profissionais, consulte a ferramenta listProfessionalsForDate e responda apenas com dados reais.
 - Ao receber preferencia de profissional e/ou horario desejado, use checkAvailability com professionalName e preferredTime para trazer os horarios mais proximos possiveis.
+- Se a profissional preferida nao tiver disponibilidade, pergunte explicitamente se a cliente prefere continuar buscando outro horario com essa profissional ou se deseja opcoes com outras profissionais.
 
 Datas:
 - Use obrigatoriamente o contexto temporal oficial enviado no prompt.
@@ -1414,7 +1427,7 @@ function historyAlreadyAskedProfessionalPreference(history) {
 function buildConversationPrompt(history, message, knowledge, customerContext = null) {
   const dateContext = getSaoPauloDateContext();
   const relativeDate = detectRelativeDateReference(message, dateContext);
-  const knownClientName = toNonEmptyString(customerContext?.name);
+  const knownClientName = clientFirstName(customerContext?.name);
   const knownClientPhone = normalizePhone(customerContext?.phone || "");
   const transcript = Array.isArray(history)
     ? history
@@ -1446,6 +1459,8 @@ function buildConversationPrompt(history, message, knowledge, customerContext = 
       ? `- Telefone da cliente (WhatsApp): ${knownClientPhone}.`
       : "- Telefone da cliente (WhatsApp): nao informado.",
     "- Regra: pergunte sobre preferencia de profissional somente quando a cliente estiver tentando agendar horario.",
+    "- Regra: se nao houver preferencia de profissional e houver horario desejado, liste todas as profissionais disponiveis naquele horario.",
+    "- Regra: se a profissional preferida estiver indisponivel, pergunte se a cliente deseja outro horario com ela ou opcoes com outras profissionais.",
     "- Regra: antes de efetivar qualquer agendamento, sempre apresente resumo completo e aguarde confirmacao explicita da cliente.",
     "- Regra: para desmarcacao, prefira solicitar codigo TRK; se nao houver codigo e houver telefone de cliente identificada, tente localizar e continuar com seguranca.",
     "- Regra: antes de responder perguntas comerciais, valide primeiro a FAQ da base de conhecimento.",
@@ -2658,6 +2673,13 @@ async function getAvailability(
       availableIntervals: professional.availableIntervals,
     };
   });
+  const professionalsAtPreferredTime = normalizedPreferredTime
+    ? uniqueProfessionalDisplayNames(
+        byProfessional
+          .filter((item) => Array.isArray(item.availableTimes) && item.availableTimes.includes(normalizedPreferredTime))
+          .map((item) => item.name),
+      )
+    : [];
 
   let scopedProfessionals = byProfessional.filter(professionalHasOpenSchedule);
   if (requestedProfessional) {
@@ -2672,13 +2694,20 @@ async function getAvailability(
       throw error;
     }
     if (!professionalHasOpenSchedule(matched)) {
+      const otherOpenNames = uniqueProfessionalDisplayNames(
+        byProfessional.filter(professionalHasOpenSchedule).map((item) => item.name),
+      );
+      const displayPreferred = professionalDisplayName(matched.name);
       const error = new Error(
-        `${professionalDisplayName(matched.name)} nao possui agenda aberta para este servico nesta data.`,
+        otherOpenNames.length
+          ? `${displayPreferred} nao possui agenda aberta para este servico nesta data. Deseja que eu continue buscando outro horario com ${displayPreferred} ou prefere ver opcoes com outras profissionais (${otherOpenNames.join(", ")})?`
+          : `${displayPreferred} nao possui agenda aberta para este servico nesta data. Deseja que eu continue buscando outro horario com ${displayPreferred}?`,
       );
       error.status = 409;
       error.details = {
-        requestedProfessional: professionalDisplayName(matched.name),
+        requestedProfessional: displayPreferred,
         requestedDate: date,
+        otherProfessionals: otherOpenNames,
       };
       throw error;
     }
@@ -2707,9 +2736,15 @@ async function getAvailability(
     occupiedTimes: [],
     professionals: responseProfessionals,
     suggestions,
+    professionalsAtPreferredTime,
     requestedProfessional: requestedProfessional ? professionalDisplayName(requestedProfessional) : null,
     preferredTime: normalizedPreferredTime || null,
-    message: `Horarios consultados para ${service} em ${date}`,
+    message:
+      normalizedPreferredTime && !requestedProfessional
+        ? professionalsAtPreferredTime.length
+          ? `Para ${service} em ${date} as ${normalizedPreferredTime}, profissionais disponiveis: ${professionalsAtPreferredTime.join(", ")}.`
+          : `Nao encontrei profissionais disponiveis para ${service} em ${date} as ${normalizedPreferredTime}.`
+        : `Horarios consultados para ${service} em ${date}`,
   };
 }
 
@@ -2808,9 +2843,25 @@ async function resolveBookingPreviewItem({
   if (!selected || !Array.isArray(selected.availableTimes) || !selected.availableTimes.includes(normalizedTime)) {
     const nearest = Array.isArray(selected?.nearestTimes) ? selected.nearestTimes.slice(0, 5) : [];
     const display = professionalDisplayName(selected?.name || requestedProfessional || "");
+    const alternativesAtSameTime = uniqueProfessionalDisplayNames(
+      professionals
+        .filter((item) => normalizeForMatch(item.name) !== normalizeForMatch(display))
+        .filter((item) => Array.isArray(item.availableTimes) && item.availableTimes.includes(normalizedTime))
+        .map((item) => item.name),
+    );
     const error = new Error(
-      nearest.length
-        ? `${display} nao possui agenda livre as ${normalizedTime}. Horarios proximos: ${nearest.join(", ")}.`
+      display
+        ? nearest.length
+          ? `${display} nao possui agenda livre as ${normalizedTime}. Horarios proximos com ${display}: ${nearest.join(", ")}. ${
+              alternativesAtSameTime.length
+                ? `Deseja continuar buscando com ${display} ou prefere opcoes com outras profissionais (${alternativesAtSameTime.join(", ")})?`
+                : `Deseja continuar buscando com ${display}?`
+            }`
+          : `${display} nao possui agenda livre as ${normalizedTime}. ${
+              alternativesAtSameTime.length
+                ? `Deseja continuar buscando com ${display} ou prefere opcoes com outras profissionais (${alternativesAtSameTime.join(", ")})?`
+                : `Deseja continuar buscando com ${display}?`
+            }`
         : `Nao encontrei agenda livre as ${normalizedTime} para ${normalizedService}.`,
     );
     error.status = 409;
@@ -2820,6 +2871,7 @@ async function resolveBookingPreviewItem({
       time: normalizedTime,
       professionalName: display || null,
       nearestTimes: nearest,
+      alternativesAtSameTime,
       suggestions: availability?.suggestions || [],
     };
     throw error;
@@ -2949,16 +3001,31 @@ async function createAppointment({
       if (!professional.availableTimes.includes(requestedTime)) {
         const nearestTimes = rankTimesByPreferredTime(professional.availableTimes, requestedTime).slice(0, 6);
         const displayName = professionalDisplayName(professional.name);
+        const alternativesAtSameTime = uniqueProfessionalDisplayNames(
+          normalizedProfessionals
+            .filter((item) => normalizeForMatch(item.name) !== normalizeForMatch(professional.name))
+            .filter((item) => item.availableTimes.includes(requestedTime))
+            .map((item) => item.name),
+        );
         const error = new Error(
           nearestTimes.length
-            ? `${displayName} nao possui agenda livre as ${requestedTime}. Horarios proximos: ${nearestTimes.join(", ")}.`
-            : `${displayName} nao possui agenda livre na data informada para este servico.`,
+            ? `${displayName} nao possui agenda livre as ${requestedTime}. Horarios proximos com ${displayName}: ${nearestTimes.join(", ")}. ${
+                alternativesAtSameTime.length
+                  ? `Deseja continuar buscando com ${displayName} ou prefere opcoes com outras profissionais (${alternativesAtSameTime.join(", ")})?`
+                  : `Deseja continuar buscando com ${displayName}?`
+              }`
+            : `${displayName} nao possui agenda livre na data informada para este servico. ${
+                alternativesAtSameTime.length
+                  ? `Deseja continuar buscando com ${displayName} ou prefere opcoes com outras profissionais (${alternativesAtSameTime.join(", ")})?`
+                  : `Deseja continuar buscando com ${displayName}?`
+              }`,
         );
         error.status = 409;
         error.details = {
           requestedProfessional: displayName,
           requestedTime,
           nearestTimes,
+          alternativesAtSameTime,
         };
         throw error;
       }
@@ -3734,7 +3801,7 @@ async function sendChatMessage({ establishmentId, message, history, customerCont
   const knowledge = loadSalonKnowledge();
   const dateContext = getSaoPauloDateContext();
   const relativeDate = detectRelativeDateReference(message, dateContext);
-  const knownClientName = toNonEmptyString(customerContext?.name);
+  const knownClientName = clientFirstName(customerContext?.name);
   const normalizedMessageForGate = normalizeForMatch(message);
   const inferredPreferredTime = extractPreferredTimeFromMessage(message);
   const hasBookingTimeIntent = messageSuggestsBookingTimeIntent(message, dateContext);
