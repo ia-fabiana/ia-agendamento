@@ -3878,235 +3878,246 @@ async function sendChatMessage({ establishmentId, message, history, customerCont
 
     const results = [];
     for (const call of calls) {
-      if (call.name === "checkAvailability") {
-        const requestedDate = relativeDate?.iso || toNonEmptyString(call.args?.date);
-        const requestedProfessional = toNonEmptyString(call.args?.professionalName);
-        const requestedPreferredTime =
-          normalizeTimeValue(call.args?.preferredTime) || inferredPreferredTime;
-        const availability = await getAvailability(
-          establishmentId,
-          String(call.args.service),
-          requestedDate,
-          {
-            professionalName: requestedProfessional,
-            preferredTime: requestedPreferredTime,
-          },
-        );
-        results.push({ name: call.name, result: availability });
-        continue;
-      }
-
-      if (call.name === "listAppointmentsForDate") {
-        const requestedDate =
-          relativeDate?.iso || toNonEmptyString(call.args?.date) || dateContext.isoToday;
-        const { items, source } = await getAppointmentsForDate(
-          establishmentId,
-          requestedDate,
-        );
-        const normalized = items.map(normalizeAppointmentItem).filter(Boolean);
-        results.push({ name: call.name, result: { source, appointments: normalized } });
-        continue;
-      }
-
-      if (call.name === "listProfessionalsForDate") {
-        const requestedDate =
-          relativeDate?.iso || toNonEmptyString(call.args?.date) || dateContext.isoToday;
-        const requestedService = toNonEmptyString(call.args?.service);
-
-        let serviceId;
-        if (requestedService) {
-          try {
-            const service = await findServiceByName(establishmentId, requestedService);
-            serviceId = Number(serviceIdFrom(service)) || undefined;
-          } catch {
-            serviceId = undefined;
-          }
+      try {
+        if (call.name === "checkAvailability") {
+          const requestedDate = relativeDate?.iso || toNonEmptyString(call.args?.date);
+          const requestedProfessional = toNonEmptyString(call.args?.professionalName);
+          const requestedPreferredTime =
+            normalizeTimeValue(call.args?.preferredTime) || inferredPreferredTime;
+          const availability = await getAvailability(
+            establishmentId,
+            String(call.args.service),
+            requestedDate,
+            {
+              professionalName: requestedProfessional,
+              preferredTime: requestedPreferredTime,
+            },
+          );
+          results.push({ name: call.name, result: availability });
+          continue;
         }
 
-        const professionals = await getProfessionals({
-          establishmentId,
-          date: requestedDate,
-          serviceId,
-        });
+        if (call.name === "listAppointmentsForDate") {
+          const requestedDate =
+            relativeDate?.iso || toNonEmptyString(call.args?.date) || dateContext.isoToday;
+          const { items, source } = await getAppointmentsForDate(
+            establishmentId,
+            requestedDate,
+          );
+          const normalized = items.map(normalizeAppointmentItem).filter(Boolean);
+          results.push({ name: call.name, result: { source, appointments: normalized } });
+          continue;
+        }
 
-        const names = uniqueProfessionalDisplayNames(
-          professionals
-            .filter(professionalHasOpenSchedule)
-            .map((item) => toNonEmptyString(item?.name || professionalNameFrom(item))),
-        );
+        if (call.name === "listProfessionalsForDate") {
+          const requestedDate =
+            relativeDate?.iso || toNonEmptyString(call.args?.date) || dateContext.isoToday;
+          const requestedService = toNonEmptyString(call.args?.service);
 
-        results.push({
-          name: call.name,
-          result: {
+          let serviceId;
+          if (requestedService) {
+            try {
+              const service = await findServiceByName(establishmentId, requestedService);
+              serviceId = Number(serviceIdFrom(service)) || undefined;
+            } catch {
+              serviceId = undefined;
+            }
+          }
+
+          const professionals = await getProfessionals({
+            establishmentId,
             date: requestedDate,
-            service: requestedService || null,
-            total: names.length,
-            professionals: names,
-          },
-        });
-        continue;
-      }
+            serviceId,
+          });
 
-      if (call.name === "bookAppointment") {
-        const resolvedClientName =
-          toNonEmptyString(call.args?.clientName) ||
-          toNonEmptyString(customerContext?.name);
-        const resolvedClientPhone =
-          normalizePhone(call.args?.clientPhone) ||
-          normalizePhone(customerContext?.phone);
+          const names = uniqueProfessionalDisplayNames(
+            professionals
+              .filter(professionalHasOpenSchedule)
+              .map((item) => toNonEmptyString(item?.name || professionalNameFrom(item))),
+          );
 
-        if (!resolvedClientName || !resolvedClientPhone) {
           results.push({
             name: call.name,
             result: {
-              status: "error",
-              message:
-                "Nao foi possivel confirmar os dados da cliente para agendamento (nome e telefone).",
-              missing: {
-                clientName: !resolvedClientName,
-                clientPhone: !resolvedClientPhone,
+              date: requestedDate,
+              service: requestedService || null,
+              total: names.length,
+              professionals: names,
+            },
+          });
+          continue;
+        }
+
+        if (call.name === "bookAppointment") {
+          const resolvedClientName =
+            toNonEmptyString(call.args?.clientName) ||
+            toNonEmptyString(customerContext?.name);
+          const resolvedClientPhone =
+            normalizePhone(call.args?.clientPhone) ||
+            normalizePhone(customerContext?.phone);
+
+          if (!resolvedClientName || !resolvedClientPhone) {
+            results.push({
+              name: call.name,
+              result: {
+                status: "error",
+                message:
+                  "Nao foi possivel confirmar os dados da cliente para agendamento (nome e telefone).",
+                missing: {
+                  clientName: !resolvedClientName,
+                  clientPhone: !resolvedClientPhone,
+                },
               },
-            },
-          });
-          continue;
-        }
-
-        const requestedDateFallback = relativeDate?.iso || toNonEmptyString(call.args?.date);
-        const rawItems =
-          Array.isArray(call.args?.appointments) && call.args.appointments.length
-            ? call.args.appointments
-            : [call.args];
-
-        const normalizedItems = rawItems.map((item) => ({
-          service: toNonEmptyString(item?.service || call.args?.service),
-          date: normalizeBookingDate(item?.date || call.args?.date, requestedDateFallback),
-          time: normalizeBookingTime(item?.time || call.args?.time),
-          professionalName: toNonEmptyString(item?.professionalName || call.args?.professionalName),
-        }));
-
-        const invalidItem = normalizedItems.find(
-          (item) => !item.service || !item.date || !item.time,
-        );
-        if (invalidItem) {
-          results.push({
-            name: call.name,
-            result: {
-              status: "error",
-              message:
-                "Para agendar, preciso de servico, data e horario em cada item solicitado.",
-              invalidItem,
-            },
-          });
-          continue;
-        }
-
-        const previewItems = [];
-        let previewError = null;
-        for (const item of normalizedItems) {
-          try {
-            const preview = await resolveBookingPreviewItem({
-              establishmentId,
-              service: item.service,
-              date: item.date,
-              time: item.time,
-              professionalName: item.professionalName,
             });
-            previewItems.push(preview);
-          } catch (error) {
-            previewError = error;
-            break;
+            continue;
           }
-        }
 
-        if (previewError) {
-          results.push({
-            name: call.name,
-            result: {
-              status: "error",
-              message: previewError?.message || "Nao foi possivel validar disponibilidade.",
-              details: previewError?.details || null,
-            },
-          });
-          continue;
-        }
+          const requestedDateFallback = relativeDate?.iso || toNonEmptyString(call.args?.date);
+          const rawItems =
+            Array.isArray(call.args?.appointments) && call.args.appointments.length
+              ? call.args.appointments
+              : [call.args];
 
-        const sessionKey = resolvePendingSessionKey(
-          establishmentId,
-          customerContext,
-          { clientPhone: resolvedClientPhone, clientName: resolvedClientName },
-        );
+          const normalizedItems = rawItems.map((item) => ({
+            service: toNonEmptyString(item?.service || call.args?.service),
+            date: normalizeBookingDate(item?.date || call.args?.date, requestedDateFallback),
+            time: normalizeBookingTime(item?.time || call.args?.time),
+            professionalName: toNonEmptyString(item?.professionalName || call.args?.professionalName),
+          }));
 
-        if (!sessionKey) {
-          results.push({
-            name: call.name,
-            result: {
-              status: "error",
-              message: "Nao consegui identificar a sessao da cliente para confirmar o agendamento.",
-            },
-          });
-          continue;
-        }
+          const invalidItem = normalizedItems.find(
+            (item) => !item.service || !item.date || !item.time,
+          );
+          if (invalidItem) {
+            results.push({
+              name: call.name,
+              result: {
+                status: "error",
+                message:
+                  "Para agendar, preciso de servico, data e horario em cada item solicitado.",
+                invalidItem,
+              },
+            });
+            continue;
+          }
 
-        const pending = setPendingBookingConfirmation(sessionKey, {
-          establishmentId,
-          clientName: resolvedClientName,
-          clientPhone: resolvedClientPhone,
-          items: previewItems,
-        });
+          const previewItems = [];
+          let previewError = null;
+          for (const item of normalizedItems) {
+            try {
+              const preview = await resolveBookingPreviewItem({
+                establishmentId,
+                service: item.service,
+                date: item.date,
+                time: item.time,
+                professionalName: item.professionalName,
+              });
+              previewItems.push(preview);
+            } catch (error) {
+              previewError = error;
+              break;
+            }
+          }
 
-        results.push({
-          name: call.name,
-          result: {
-            status: "pending_confirmation",
+          if (previewError) {
+            results.push({
+              name: call.name,
+              result: {
+                status: "error",
+                message: previewError?.message || "Nao foi possivel validar disponibilidade.",
+                details: previewError?.details || null,
+              },
+            });
+            continue;
+          }
+
+          const sessionKey = resolvePendingSessionKey(
+            establishmentId,
+            customerContext,
+            { clientPhone: resolvedClientPhone, clientName: resolvedClientName },
+          );
+
+          if (!sessionKey) {
+            results.push({
+              name: call.name,
+              result: {
+                status: "error",
+                message: "Nao consegui identificar a sessao da cliente para confirmar o agendamento.",
+              },
+            });
+            continue;
+          }
+
+          const pending = setPendingBookingConfirmation(sessionKey, {
+            establishmentId,
             clientName: resolvedClientName,
             clientPhone: resolvedClientPhone,
-            total: previewItems.length,
             items: previewItems,
-            expiresAt: new Date(pending.expiresAt).toISOString(),
-            message: buildBookingConfirmationMessage(previewItems),
+          });
+
+          results.push({
+            name: call.name,
+            result: {
+              status: "pending_confirmation",
+              clientName: resolvedClientName,
+              clientPhone: resolvedClientPhone,
+              total: previewItems.length,
+              items: previewItems,
+              expiresAt: new Date(pending.expiresAt).toISOString(),
+              message: buildBookingConfirmationMessage(previewItems),
+            },
+          });
+          continue;
+        }
+
+        if (call.name === "rescheduleAppointment") {
+          const requestedDate = relativeDate?.iso || toNonEmptyString(call.args?.date);
+          const rescheduled = await rescheduleAppointment({
+            establishmentId,
+            confirmationCode: String(call.args.confirmationCode || ""),
+            appointmentId: String(call.args.appointmentId || ""),
+            date: requestedDate,
+            time: String(call.args.time),
+          });
+          results.push({ name: call.name, result: rescheduled });
+          continue;
+        }
+
+        if (call.name === "cancelAppointment") {
+          const cancelled = await cancelAppointment({
+            establishmentId,
+            confirmationCode: String(call.args?.confirmationCode || ""),
+            appointmentId: String(call.args?.appointmentId || ""),
+            reason: String(call.args?.reason || ""),
+            clientPhone:
+              normalizePhone(call.args?.clientPhone) ||
+              normalizePhone(customerContext?.phone),
+            clientName:
+              toNonEmptyString(call.args?.clientName) ||
+              toNonEmptyString(customerContext?.name),
+            date: relativeDate?.iso || toNonEmptyString(call.args?.date),
+            time: String(call.args?.time || ""),
+            service: String(call.args?.service || ""),
+            professionalName: String(call.args?.professionalName || ""),
+          });
+          results.push({ name: call.name, result: cancelled });
+          continue;
+        }
+
+        results.push({
+          name: call.name,
+          result: { status: "error", message: `Ferramenta nao suportada: ${call.name}` },
+        });
+      } catch (error) {
+        results.push({
+          name: call.name,
+          result: {
+            status: "error",
+            message: error?.message || "Erro ao executar ferramenta.",
+            details: error?.details || null,
           },
         });
-        continue;
       }
-
-      if (call.name === "rescheduleAppointment") {
-        const requestedDate = relativeDate?.iso || toNonEmptyString(call.args?.date);
-        const rescheduled = await rescheduleAppointment({
-          establishmentId,
-          confirmationCode: String(call.args.confirmationCode || ""),
-          appointmentId: String(call.args.appointmentId || ""),
-          date: requestedDate,
-          time: String(call.args.time),
-        });
-        results.push({ name: call.name, result: rescheduled });
-        continue;
-      }
-
-      if (call.name === "cancelAppointment") {
-        const cancelled = await cancelAppointment({
-          establishmentId,
-          confirmationCode: String(call.args?.confirmationCode || ""),
-          appointmentId: String(call.args?.appointmentId || ""),
-          reason: String(call.args?.reason || ""),
-          clientPhone:
-            normalizePhone(call.args?.clientPhone) ||
-            normalizePhone(customerContext?.phone),
-          clientName:
-            toNonEmptyString(call.args?.clientName) ||
-            toNonEmptyString(customerContext?.name),
-          date: relativeDate?.iso || toNonEmptyString(call.args?.date),
-          time: String(call.args?.time || ""),
-          service: String(call.args?.service || ""),
-          professionalName: String(call.args?.professionalName || ""),
-        });
-        results.push({ name: call.name, result: cancelled });
-        continue;
-      }
-
-      results.push({
-        name: call.name,
-        result: { status: "error", message: `Ferramenta nao suportada: ${call.name}` },
-      });
     }
 
     response = await chat.sendMessage({
