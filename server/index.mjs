@@ -19,6 +19,9 @@ const SQLITE_DB_PATH = process.env.IA_DB_PATH?.trim() || path.join(DATA_DIR_PATH
 const MAX_WHATSAPP_HISTORY_MESSAGES = 20;
 const BOOKING_CONFIRMATION_TTL_MS = 20 * 60 * 1000;
 const HUMAN_HANDOFF_TTL_MS = 12 * 60 * 60 * 1000;
+const TRINKS_MAX_RETRIES = Math.max(1, Number(process.env.TRINKS_MAX_RETRIES || 4));
+const TRINKS_RETRY_BASE_MS = Math.max(200, Number(process.env.TRINKS_RETRY_BASE_MS || 700));
+const BOOKING_SEQUENCE_GAP_MS = Math.max(0, Number(process.env.BOOKING_SEQUENCE_GAP_MS || 450));
 const whatsappConversations = new Map();
 const recentWebhookMessages = new Map();
 const pendingBookingConfirmations = new Map();
@@ -1540,24 +1543,73 @@ async function trinksRequest(path, { method = "GET", estabelecimentoId, body, qu
     headers.estabelecimentoId = String(estabelecimentoId);
   }
 
-  const response = await fetch(url, {
-    method,
-    headers,
-    body: body ? JSON.stringify(body) : undefined,
-  });
+  const totalAttempts = Math.max(1, TRINKS_MAX_RETRIES);
+  for (let attempt = 1; attempt <= totalAttempts; attempt += 1) {
+    let response = null;
+    let text = "";
+    let json = null;
 
-  const text = await response.text();
-  const json = text ? safeJsonParse(text) : null;
+    try {
+      response = await fetch(url, {
+        method,
+        headers,
+        body: body ? JSON.stringify(body) : undefined,
+      });
+      text = await response.text();
+      json = text ? safeJsonParse(text) : null;
+    } catch (networkError) {
+      if (attempt < totalAttempts) {
+        const waitMs = TRINKS_RETRY_BASE_MS * (2 ** (attempt - 1));
+        await new Promise((resolve) => setTimeout(resolve, waitMs));
+        continue;
+      }
 
-  if (!response.ok) {
-    const message = json?.message || json?.mensagem || text || `Erro ${response.status}`;
+      const error = new Error(`Trinks: falha de rede ao acessar ${path}`);
+      error.status = 502;
+      error.details = {
+        path,
+        method,
+        attempt,
+        totalAttempts,
+        reason: networkError?.message || "Erro de rede",
+      };
+      throw error;
+    }
+
+    if (response.ok) {
+      return json;
+    }
+
+    const status = Number(response.status || 0);
+    const message = json?.message || json?.mensagem || text || `Erro ${status}`;
+    const retryAfterHeader = response.headers?.get("retry-after");
+    const retryAfterSeconds = Number(retryAfterHeader);
+    const canUseRetryAfter = Number.isFinite(retryAfterSeconds) && retryAfterSeconds > 0;
+    const retryAfterMs = canUseRetryAfter ? Math.round(retryAfterSeconds * 1000) : 0;
+    const isRetryable = status === 429;
+
+    if (isRetryable && attempt < totalAttempts) {
+      const backoffMs = TRINKS_RETRY_BASE_MS * (2 ** (attempt - 1));
+      const waitMs = Math.max(backoffMs, retryAfterMs);
+      await new Promise((resolve) => setTimeout(resolve, waitMs));
+      continue;
+    }
+
     const error = new Error(`Trinks: ${message}`);
-    error.status = response.status;
-    error.details = json || text;
+    error.status = status;
+    error.details = {
+      response: json || text,
+      attempt,
+      totalAttempts,
+      method,
+      path,
+    };
     throw error;
   }
 
-  return json;
+  const exhausted = new Error("Trinks: tentativas esgotadas.");
+  exhausted.status = 429;
+  throw exhausted;
 }
 
 function resolveEvolutionBaseUrl() {
@@ -3103,9 +3155,23 @@ async function resolveBookingPreviewItem({
 
 async function executeConfirmedBookings({ establishmentId, clientName, clientPhone, items }) {
   const successes = [];
-  const failures = [];
+  let failures = [];
+  let resolvedClientId = null;
 
-  for (const item of items) {
+  try {
+    const client = await findOrCreateClient(establishmentId, clientName, clientPhone);
+    const parsedClientId = Number(clientIdFrom(client));
+    resolvedClientId = Number.isFinite(parsedClientId) && parsedClientId > 0 ? parsedClientId : null;
+  } catch {
+    resolvedClientId = null;
+  }
+
+  for (let index = 0; index < items.length; index += 1) {
+    const item = items[index];
+    if (index > 0 && BOOKING_SEQUENCE_GAP_MS > 0) {
+      await new Promise((resolve) => setTimeout(resolve, BOOKING_SEQUENCE_GAP_MS));
+    }
+
     try {
       const created = await createAppointment({
         establishmentId,
@@ -3114,6 +3180,7 @@ async function executeConfirmedBookings({ establishmentId, clientName, clientPho
         serviceId: item.serviceId,
         durationMinutes: item.durationMinutes,
         serviceAmount: item.serviceAmount,
+        clientId: resolvedClientId,
         date: item.date,
         time: item.time,
         professionalId: item.professionalId,
@@ -3130,7 +3197,59 @@ async function executeConfirmedBookings({ establishmentId, clientName, clientPho
       failures.push({
         ...item,
         message: error?.message || "Erro ao criar agendamento.",
+        status: Number(error?.status || 0) || null,
       });
+    }
+  }
+
+  const retryable = failures.filter(
+    (item) => Number(item?.status || 0) === 429 || /too many requests/i.test(String(item?.message || "")),
+  );
+  if (retryable.length) {
+    failures = failures.filter((item) => !retryable.includes(item));
+    await new Promise((resolve) => setTimeout(resolve, Math.max(1200, BOOKING_SEQUENCE_GAP_MS)));
+
+    for (let index = 0; index < retryable.length; index += 1) {
+      const item = retryable[index];
+      if (index > 0 && BOOKING_SEQUENCE_GAP_MS > 0) {
+        await new Promise((resolve) => setTimeout(resolve, BOOKING_SEQUENCE_GAP_MS));
+      }
+
+      try {
+        const created = await createAppointment({
+          establishmentId,
+          service: item.service,
+          serviceResolvedName: item.serviceResolvedName,
+          serviceId: item.serviceId,
+          durationMinutes: item.durationMinutes,
+          serviceAmount: item.serviceAmount,
+          clientId: resolvedClientId,
+          date: item.date,
+          time: item.time,
+          professionalId: item.professionalId,
+          professionalName: item.professionalName,
+          clientName,
+          clientPhone,
+        });
+        successes.push({
+          service: item.service,
+          serviceResolvedName: item.serviceResolvedName,
+          serviceId: item.serviceId,
+          durationMinutes: item.durationMinutes,
+          serviceAmount: item.serviceAmount,
+          date: item.date,
+          time: item.time,
+          professionalId: item.professionalId,
+          professionalName: item.professionalName,
+          confirmationCode: created?.confirmationCode || "",
+        });
+      } catch (error) {
+        failures.push({
+          ...item,
+          message: error?.message || "Erro ao criar agendamento.",
+          status: Number(error?.status || 0) || null,
+        });
+      }
     }
   }
 
@@ -3147,6 +3266,7 @@ async function createAppointment({
   serviceId = null,
   durationMinutes = null,
   serviceAmount = null,
+  clientId = null,
   date,
   time,
   professionalId = null,
@@ -3161,6 +3281,7 @@ async function createAppointment({
   const resolvedServiceId = Number(serviceId);
   const resolvedDurationMinutes = Number(durationMinutes);
   const resolvedServiceAmount = Number(serviceAmount);
+  const resolvedClientId = Number(clientId);
   const resolvedProfessionalId = Number(professionalId);
   const requestedTime = normalizeTimeValue(time);
   let payload = null;
@@ -3291,10 +3412,16 @@ async function createAppointment({
     }
 
     resolvedProfessionalDisplay = professionalDisplayName(professional.name);
-    const client = await findOrCreateClient(establishmentId, normalizedClientName, normalizedClientPhone);
-    const clientId = clientIdFrom(client);
+    let selectedClientId = Number.isFinite(resolvedClientId) && resolvedClientId > 0
+      ? resolvedClientId
+      : null;
+    if (!selectedClientId) {
+      const client = await findOrCreateClient(establishmentId, normalizedClientName, normalizedClientPhone);
+      const foundClientId = Number(clientIdFrom(client));
+      selectedClientId = Number.isFinite(foundClientId) && foundClientId > 0 ? foundClientId : null;
+    }
 
-    if (!clientId) {
+    if (!selectedClientId) {
       const error = new Error("Cliente sem ID valido no retorno da API Trinks.");
       error.status = 422;
       throw error;
@@ -3302,7 +3429,7 @@ async function createAppointment({
 
     payload = {
       servicoId: Number(selectedServiceId),
-      clienteId: Number(clientId),
+      clienteId: Number(selectedClientId),
       profissionalId: Number(professional.id),
       dataHoraInicio: toIsoDateTime(date, requestedTime),
       duracaoEmMinutos: selectedDurationMinutes,
