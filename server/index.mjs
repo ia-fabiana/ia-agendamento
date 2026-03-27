@@ -4478,6 +4478,10 @@ async function cancelAppointmentById({ establishmentId, appointmentId, reason, r
   const cancellationNote = normalizedReason
     ? `Cancelado via IA.AGENDAMENTO | Motivo: ${normalizedReason}`
     : "Cancelado via IA.AGENDAMENTO";
+  const cancellationStatusPayload = {
+    motivo: normalizedReason || "Cancelado via IA.AGENDAMENTO",
+    quemCancelou: 3,
+  };
 
   const parsedId = Number(appointmentId);
   const snapshot = await getAppointmentSnapshot(establishmentId, parsedId);
@@ -4493,6 +4497,24 @@ async function cancelAppointmentById({ establishmentId, appointmentId, reason, r
   };
 
   const attempts = [
+    {
+      method: "PATCH",
+      path: `/agendamentos/${parsedId}/status/cancelado`,
+      body: cancellationStatusPayload,
+      mode: "PATCH_STATUS_CANCELADO",
+    },
+    {
+      method: "POST",
+      path: `/agendamentos/${parsedId}/status/cancelado`,
+      body: cancellationStatusPayload,
+      mode: "POST_STATUS_CANCELADO",
+    },
+    {
+      method: "PATCH",
+      path: `/agendamentos/${parsedId}/status/cancelada`,
+      body: undefined,
+      mode: "PATCH_STATUS_CANCELADA",
+    },
     {
       method: "PUT",
       path: `/agendamentos/${parsedId}`,
