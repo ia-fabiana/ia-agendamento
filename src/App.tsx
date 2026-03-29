@@ -1132,7 +1132,7 @@ export default function App() {
       </header>
 
       {/* Main Content */}
-      <main className="flex-1 max-w-4xl w-full mx-auto p-4 sm:p-8 flex flex-col gap-6 overflow-hidden">
+      <main className="flex-1 max-w-5xl w-full mx-auto p-4 sm:p-8 flex flex-col gap-6 overflow-y-hidden overflow-x-visible">
         {activeSection !== 'chat' && (
           <div className="glass rounded-2xl p-5 sm:p-6 space-y-4">
             {activeSection === 'services' && (
@@ -1549,24 +1549,24 @@ export default function App() {
 
                 <div className="rounded-xl bg-white/5 border border-white/10 p-4 space-y-3">
                   <p className="text-xs uppercase tracking-wider text-white/60">Acesso</p>
-                  <div className="flex flex-col md:flex-row gap-2">
+                  <div className="flex flex-col xl:flex-row xl:flex-wrap gap-2">
                     <input
                       value={adminToken}
                       onChange={(e) => setAdminToken(e.target.value)}
                       placeholder="Cole o x-admin-token"
-                      className="flex-1 rounded-md bg-[#0f1731] border border-white/15 text-white/90 px-3 py-2 text-sm"
+                      className="min-w-0 xl:flex-1 rounded-md bg-[#0f1731] border border-white/15 text-white/90 px-3 py-2 text-sm"
                     />
                     <button
                       onClick={handleSaveAdminToken}
                       disabled={isLoadingAdmin}
-                      className="px-4 py-2 rounded-lg bg-brand-green text-black text-xs uppercase tracking-wider disabled:opacity-50"
+                      className="w-full xl:w-auto px-4 py-2 rounded-lg bg-brand-green text-black text-xs uppercase tracking-wider disabled:opacity-50"
                     >
                       Salvar token
                     </button>
                     <button
                       onClick={handleAdminLogout}
                       disabled={isLoadingAdmin || !adminToken.trim()}
-                      className="px-4 py-2 rounded-lg bg-white/10 text-white text-xs uppercase tracking-wider disabled:opacity-50"
+                      className="w-full xl:w-auto px-4 py-2 rounded-lg bg-white/10 text-white text-xs uppercase tracking-wider disabled:opacity-50"
                     >
                       Sair
                     </button>
@@ -1613,7 +1613,7 @@ export default function App() {
                   {adminStatus && <p className="text-xs text-brand-green">{adminStatus}</p>}
                 </div>
 
-                <div className="grid lg:grid-cols-[320px_1fr] gap-4">
+                <div className="grid xl:grid-cols-[320px_minmax(0,1fr)] gap-4">
                   <div className="rounded-xl bg-white/5 border border-white/10 p-4 space-y-3">
                     <p className="text-xs uppercase tracking-wider text-white/60">Tenants</p>
                     <div className="space-y-2 max-h-[420px] overflow-y-auto pr-1">
@@ -1689,7 +1689,7 @@ export default function App() {
                     )}
                   </div>
 
-                  <div className="rounded-xl bg-white/5 border border-white/10 p-4 space-y-4">
+                  <div className="min-w-0 rounded-xl bg-white/5 border border-white/10 p-4 space-y-4">
                     {!selectedAdminTenant && (
                       <p className="text-white/70 text-sm">Selecione um tenant para editar detalhes.</p>
                     )}
@@ -1761,7 +1761,7 @@ export default function App() {
                               <span className="text-xs text-white/60">Nenhum identificador.</span>
                             )}
                           </div>
-                          <div className="grid md:grid-cols-[200px_1fr_auto] gap-2">
+                          <div className="grid gap-2 lg:grid-cols-[200px_minmax(0,1fr)_auto]">
                             <select
                               value={adminIdentifierKind}
                               onChange={(e) => setAdminIdentifierKind(e.target.value)}
@@ -1798,7 +1798,7 @@ export default function App() {
                               </span>
                             ))}
                           </div>
-                          <div className="grid md:grid-cols-[220px_auto] gap-2">
+                          <div className="grid gap-2 sm:grid-cols-2">
                             <select
                               value={adminProviderConfigName}
                               onChange={(e) => setAdminProviderConfigName(e.target.value)}
@@ -1881,7 +1881,7 @@ export default function App() {
                               Criar usuario do tenant
                             </button>
 
-                            <div className="grid md:grid-cols-[180px_1fr_auto] gap-2 pt-2">
+                            <div className="grid gap-2 pt-2 lg:grid-cols-[180px_minmax(0,1fr)_auto]">
                               <select
                                 value={adminResetUserId}
                                 onChange={(e) => {
@@ -1927,7 +1927,7 @@ export default function App() {
                         {isSuperAdminSession && (
                           <div className="space-y-2 pt-3 border-t border-white/10">
                           <p className="text-xs uppercase tracking-wider text-white/60">Resolver por identificador</p>
-                          <div className="grid md:grid-cols-[220px_1fr_auto] gap-2">
+                          <div className="grid gap-2 lg:grid-cols-[220px_minmax(0,1fr)_auto]">
                             <select
                               value={adminResolveKind}
                               onChange={(e) => setAdminResolveKind(e.target.value)}
