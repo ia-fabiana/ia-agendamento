@@ -39,6 +39,7 @@ function initDatabase() {
   mkdirSync(DATA_DIR_PATH, { recursive: true });
   const database = new Database(SQLITE_DB_PATH);
   database.pragma("journal_mode = WAL");
+  database.pragma("foreign_keys = ON");
 
   database.exec(`
     CREATE TABLE IF NOT EXISTS whatsapp_messages (
@@ -110,6 +111,55 @@ function initDatabase() {
 
     CREATE INDEX IF NOT EXISTS idx_client_phone_map_client
       ON client_phone_map(client_id);
+
+    CREATE TABLE IF NOT EXISTS tenants (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      code TEXT NOT NULL UNIQUE,
+      name TEXT NOT NULL,
+      segment TEXT DEFAULT '',
+      active INTEGER NOT NULL DEFAULT 1,
+      default_provider TEXT DEFAULT 'trinks',
+      establishment_id INTEGER,
+      knowledge_json TEXT DEFAULT '',
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_tenants_code
+      ON tenants(code);
+
+    CREATE TABLE IF NOT EXISTS tenant_identifiers (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      tenant_id INTEGER NOT NULL,
+      kind TEXT NOT NULL,
+      value TEXT NOT NULL,
+      normalized_value TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      UNIQUE(kind, normalized_value),
+      FOREIGN KEY(tenant_id) REFERENCES tenants(id) ON DELETE CASCADE
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_tenant_identifiers_tenant
+      ON tenant_identifiers(tenant_id);
+
+    CREATE INDEX IF NOT EXISTS idx_tenant_identifiers_kind
+      ON tenant_identifiers(kind, normalized_value);
+
+    CREATE TABLE IF NOT EXISTS tenant_provider_configs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      tenant_id INTEGER NOT NULL,
+      provider TEXT NOT NULL,
+      enabled INTEGER NOT NULL DEFAULT 1,
+      config_json TEXT DEFAULT '{}',
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      UNIQUE(tenant_id, provider),
+      FOREIGN KEY(tenant_id) REFERENCES tenants(id) ON DELETE CASCADE
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_tenant_provider_configs_tenant
+      ON tenant_provider_configs(tenant_id);
   `);
 
   return database;
@@ -291,7 +341,7 @@ app.use((req, res, next) => {
 app.use((req, res, next) => {
   res.header("Access-Control-Allow-Origin", "*");
   res.header("Access-Control-Allow-Methods", "GET,POST,PUT,PATCH,DELETE,OPTIONS");
-  res.header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Api-Key");
+  res.header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Api-Key, X-Admin-Token");
   if (req.method === "OPTIONS") {
     return res.sendStatus(204);
   }
@@ -363,6 +413,394 @@ function firstNonEmpty(values) {
   return "";
 }
 
+function isAdminWriteAuthorized(req) {
+  return isKnowledgeWriteAuthorized(req);
+}
+
+function normalizeTenantCode(value) {
+  const base = toNonEmptyString(value)
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+  return base.slice(0, 64);
+}
+
+function normalizeTenantIdentifierKind(value) {
+  const kind = toNonEmptyString(value)
+    .toLowerCase()
+    .replace(/[\s-]+/g, "_");
+  if (!kind) {
+    return "";
+  }
+  return kind;
+}
+
+function normalizeTenantIdentifierValue(kind, value) {
+  const normalizedKind = normalizeTenantIdentifierKind(kind);
+  const raw = toNonEmptyString(value);
+  if (!raw || !normalizedKind) {
+    return "";
+  }
+
+  if (normalizedKind === "evolution_number") {
+    return normalizePhone(raw);
+  }
+
+  if (normalizedKind === "domain") {
+    return raw
+      .replace(/^https?:\/\//i, "")
+      .split("/")[0]
+      .toLowerCase();
+  }
+
+  if (normalizedKind === "api_key") {
+    return raw;
+  }
+
+  return raw.toLowerCase();
+}
+
+function isSupportedTenantIdentifierKind(kind) {
+  const normalized = normalizeTenantIdentifierKind(kind);
+  return [
+    "evolution_instance",
+    "evolution_number",
+    "domain",
+    "api_key",
+    "custom",
+  ].includes(normalized);
+}
+
+function parseJsonObjectLoose(value, fallback = {}) {
+  const parsed = tryParseJsonLoose(value);
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return fallback;
+  }
+  return parsed;
+}
+
+function mapTenantRow(row) {
+  if (!row) {
+    return null;
+  }
+  return {
+    id: Number(row.id),
+    code: toNonEmptyString(row.code),
+    name: toNonEmptyString(row.name),
+    segment: toNonEmptyString(row.segment),
+    active: Number(row.active) !== 0,
+    defaultProvider: resolveSchedulingProvider(row.defaultProvider),
+    establishmentId: Number.isFinite(Number(row.establishmentId)) ? Number(row.establishmentId) : null,
+    knowledge: parseJsonObjectLoose(row.knowledgeJson, {}),
+    createdAt: toNonEmptyString(row.createdAt),
+    updatedAt: toNonEmptyString(row.updatedAt),
+  };
+}
+
+function listTenants({ includeInactive = false } = {}) {
+  const rows = includeInactive
+    ? db.prepare(
+      `
+        SELECT id, code, name, segment, active, default_provider AS defaultProvider,
+               establishment_id AS establishmentId, knowledge_json AS knowledgeJson,
+               created_at AS createdAt, updated_at AS updatedAt
+        FROM tenants
+        ORDER BY name COLLATE NOCASE ASC, id ASC
+      `,
+    ).all()
+    : db.prepare(
+      `
+        SELECT id, code, name, segment, active, default_provider AS defaultProvider,
+               establishment_id AS establishmentId, knowledge_json AS knowledgeJson,
+               created_at AS createdAt, updated_at AS updatedAt
+        FROM tenants
+        WHERE active = 1
+        ORDER BY name COLLATE NOCASE ASC, id ASC
+      `,
+    ).all();
+
+  return rows.map(mapTenantRow);
+}
+
+function getTenantByCode(code) {
+  const normalizedCode = normalizeTenantCode(code);
+  if (!normalizedCode) {
+    return null;
+  }
+
+  const row = db.prepare(
+    `
+      SELECT id, code, name, segment, active, default_provider AS defaultProvider,
+             establishment_id AS establishmentId, knowledge_json AS knowledgeJson,
+             created_at AS createdAt, updated_at AS updatedAt
+      FROM tenants
+      WHERE code = ?
+      LIMIT 1
+    `,
+  ).get(normalizedCode);
+
+  return mapTenantRow(row);
+}
+
+function resolveTenantByIdentifier({ kind, value }) {
+  const normalizedKind = normalizeTenantIdentifierKind(kind);
+  const normalizedValue = normalizeTenantIdentifierValue(normalizedKind, value);
+  if (!normalizedKind || !normalizedValue) {
+    return null;
+  }
+
+  const row = db.prepare(
+    `
+      SELECT t.id, t.code, t.name, t.segment, t.active,
+             t.default_provider AS defaultProvider,
+             t.establishment_id AS establishmentId,
+             t.knowledge_json AS knowledgeJson,
+             t.created_at AS createdAt,
+             t.updated_at AS updatedAt
+      FROM tenant_identifiers i
+      JOIN tenants t ON t.id = i.tenant_id
+      WHERE i.kind = ?
+        AND i.normalized_value = ?
+      LIMIT 1
+    `,
+  ).get(normalizedKind, normalizedValue);
+
+  return mapTenantRow(row);
+}
+
+function getTenantIdentifiersByCode(code) {
+  const tenant = getTenantByCode(code);
+  if (!tenant) {
+    return [];
+  }
+
+  return db.prepare(
+    `
+      SELECT id, kind, value, normalized_value AS normalizedValue,
+             created_at AS createdAt, updated_at AS updatedAt
+      FROM tenant_identifiers
+      WHERE tenant_id = ?
+      ORDER BY kind ASC, id ASC
+    `,
+  ).all(tenant.id);
+}
+
+function getTenantProviderConfigsByCode(code) {
+  const tenant = getTenantByCode(code);
+  if (!tenant) {
+    return [];
+  }
+
+  const rows = db.prepare(
+    `
+      SELECT id, provider, enabled, config_json AS configJson,
+             created_at AS createdAt, updated_at AS updatedAt
+      FROM tenant_provider_configs
+      WHERE tenant_id = ?
+      ORDER BY provider ASC, id ASC
+    `,
+  ).all(tenant.id);
+
+  return rows.map((row) => ({
+    id: Number(row.id),
+    provider: resolveSchedulingProvider(row.provider),
+    enabled: Number(row.enabled) !== 0,
+    config: parseJsonObjectLoose(row.configJson, {}),
+    createdAt: toNonEmptyString(row.createdAt),
+    updatedAt: toNonEmptyString(row.updatedAt),
+  }));
+}
+
+function createTenant({
+  code = "",
+  name = "",
+  segment = "",
+  active = true,
+  defaultProvider = "",
+  establishmentId = null,
+  knowledge = {},
+}) {
+  const normalizedName = toNonEmptyString(name);
+  if (!normalizedName) {
+    const error = new Error("Campo obrigatorio: name");
+    error.status = 400;
+    throw error;
+  }
+
+  const normalizedCode = normalizeTenantCode(code || normalizedName);
+  if (!normalizedCode) {
+    const error = new Error("Campo obrigatorio: code");
+    error.status = 400;
+    throw error;
+  }
+
+  const provider = resolveSchedulingProvider(defaultProvider);
+  const parsedEstablishmentId = Number(establishmentId);
+  const now = new Date().toISOString();
+
+  db.prepare(
+    `
+      INSERT INTO tenants (
+        code, name, segment, active, default_provider, establishment_id,
+        knowledge_json, created_at, updated_at
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `,
+  ).run(
+    normalizedCode,
+    normalizedName,
+    toNonEmptyString(segment),
+    active ? 1 : 0,
+    provider,
+    Number.isFinite(parsedEstablishmentId) && parsedEstablishmentId > 0 ? parsedEstablishmentId : null,
+    safeJsonStringify(knowledge || {}),
+    now,
+    now,
+  );
+
+  return getTenantByCode(normalizedCode);
+}
+
+function updateTenantByCode(
+  code,
+  {
+    name,
+    segment,
+    active,
+    defaultProvider,
+    establishmentId,
+    knowledge,
+  } = {},
+) {
+  const current = getTenantByCode(code);
+  if (!current) {
+    const error = new Error("Tenant nao encontrado.");
+    error.status = 404;
+    throw error;
+  }
+
+  const nextName = name == null ? current.name : toNonEmptyString(name);
+  if (!nextName) {
+    const error = new Error("Campo invalido: name");
+    error.status = 400;
+    throw error;
+  }
+
+  const nextProvider = defaultProvider == null
+    ? current.defaultProvider
+    : resolveSchedulingProvider(defaultProvider);
+  const now = new Date().toISOString();
+
+  const parsedEstablishmentId = establishmentId == null
+    ? current.establishmentId
+    : Number(establishmentId);
+
+  const nextKnowledge = knowledge == null ? current.knowledge : knowledge;
+  db.prepare(
+    `
+      UPDATE tenants
+      SET name = ?,
+          segment = ?,
+          active = ?,
+          default_provider = ?,
+          establishment_id = ?,
+          knowledge_json = ?,
+          updated_at = ?
+      WHERE code = ?
+    `,
+  ).run(
+    nextName,
+    segment == null ? current.segment : toNonEmptyString(segment),
+    active == null ? (current.active ? 1 : 0) : (Boolean(active) ? 1 : 0),
+    nextProvider,
+    Number.isFinite(parsedEstablishmentId) && parsedEstablishmentId > 0 ? parsedEstablishmentId : null,
+    safeJsonStringify(nextKnowledge || {}),
+    now,
+    current.code,
+  );
+
+  return getTenantByCode(current.code);
+}
+
+function upsertTenantIdentifierByCode(code, { kind, value }) {
+  const tenant = getTenantByCode(code);
+  if (!tenant) {
+    const error = new Error("Tenant nao encontrado.");
+    error.status = 404;
+    throw error;
+  }
+
+  const normalizedKind = normalizeTenantIdentifierKind(kind);
+  const normalizedValue = normalizeTenantIdentifierValue(normalizedKind, value);
+  if (!isSupportedTenantIdentifierKind(normalizedKind)) {
+    const error = new Error("kind de identificador nao suportado.");
+    error.status = 400;
+    error.details = {
+      supportedKinds: ["evolution_instance", "evolution_number", "domain", "api_key", "custom"],
+    };
+    throw error;
+  }
+
+  if (!normalizedValue) {
+    const error = new Error("Campo obrigatorio: value");
+    error.status = 400;
+    throw error;
+  }
+
+  const now = new Date().toISOString();
+  db.prepare(
+    `
+      INSERT INTO tenant_identifiers (tenant_id, kind, value, normalized_value, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?)
+      ON CONFLICT(kind, normalized_value) DO UPDATE SET
+        tenant_id = excluded.tenant_id,
+        value = excluded.value,
+        updated_at = excluded.updated_at
+    `,
+  ).run(
+    tenant.id,
+    normalizedKind,
+    toNonEmptyString(value),
+    normalizedValue,
+    now,
+    now,
+  );
+
+  return getTenantIdentifiersByCode(tenant.code);
+}
+
+function upsertTenantProviderConfigByCode(code, provider, { enabled = true, config = {} } = {}) {
+  const tenant = getTenantByCode(code);
+  if (!tenant) {
+    const error = new Error("Tenant nao encontrado.");
+    error.status = 404;
+    throw error;
+  }
+
+  const normalizedProvider = resolveSchedulingProvider(provider);
+  const now = new Date().toISOString();
+
+  db.prepare(
+    `
+      INSERT INTO tenant_provider_configs (tenant_id, provider, enabled, config_json, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?)
+      ON CONFLICT(tenant_id, provider) DO UPDATE SET
+        enabled = excluded.enabled,
+        config_json = excluded.config_json,
+        updated_at = excluded.updated_at
+    `,
+  ).run(
+    tenant.id,
+    normalizedProvider,
+    enabled ? 1 : 0,
+    safeJsonStringify(config || {}),
+    now,
+    now,
+  );
+
+  return getTenantProviderConfigsByCode(tenant.code);
+}
+
 function normalizeSchedulingProvider(value) {
   const normalized = toNonEmptyString(value)
     .toLowerCase()
@@ -417,6 +855,46 @@ function resolveSchedulingProvider(preferred = "") {
   return SCHEDULING_PROVIDER_TRINKS;
 }
 
+function resolveTenantDefaultSchedulingProvider(tenantCode = "") {
+  const tenant = getTenantByCode(tenantCode);
+  if (!tenant || !tenant.active) {
+    return "";
+  }
+  return resolveSchedulingProvider(tenant.defaultProvider);
+}
+
+function resolveSchedulingProviderForTenant({ preferredProvider = "", tenantCode = "" } = {}) {
+  const explicit = normalizeSchedulingProvider(preferredProvider);
+  if (explicit) {
+    return explicit;
+  }
+
+  const tenantProvider = resolveTenantDefaultSchedulingProvider(tenantCode);
+  if (tenantProvider) {
+    return tenantProvider;
+  }
+
+  return resolveSchedulingProvider("");
+}
+
+function resolveSchedulingRequestContext({ tenantCode = "", tenantAlias = "", establishmentId = null } = {}) {
+  const normalizedTenantCode = normalizeTenantCode(tenantCode || tenantAlias);
+  const tenant = normalizedTenantCode ? getTenantByCode(normalizedTenantCode) : null;
+
+  const parsedEstablishmentId = Number(establishmentId);
+  const resolvedEstablishmentId = Number.isFinite(parsedEstablishmentId) && parsedEstablishmentId > 0
+    ? parsedEstablishmentId
+    : (Number.isFinite(Number(tenant?.establishmentId)) && Number(tenant.establishmentId) > 0
+      ? Number(tenant.establishmentId)
+      : null);
+
+  return {
+    tenantCode: normalizedTenantCode || "",
+    tenant,
+    establishmentId: resolvedEstablishmentId,
+  };
+}
+
 function getSchedulingProviderCapabilities(provider) {
   if (provider === SCHEDULING_PROVIDER_TRINKS) {
     return {
@@ -454,8 +932,8 @@ function getSchedulingProviderCapabilities(provider) {
   };
 }
 
-function listSchedulingProviders() {
-  const defaultProvider = resolveSchedulingProvider();
+function listSchedulingProviders({ tenantCode = "" } = {}) {
+  const defaultProvider = resolveSchedulingProviderForTenant({ tenantCode });
   const googleConfigured = parseBooleanEnv(process.env.GOOGLE_CALENDAR_ENABLED, false)
     || Boolean(
       firstNonEmpty([
@@ -496,8 +974,14 @@ function createSchedulingProviderNotReadyError(provider) {
   return error;
 }
 
-function getSchedulingAdapter(preferredProvider = "") {
-  const provider = resolveSchedulingProvider(preferredProvider);
+function getSchedulingAdapter(preferredProviderOrOptions = "") {
+  const options = typeof preferredProviderOrOptions === "object" && preferredProviderOrOptions !== null
+    ? preferredProviderOrOptions
+    : { provider: preferredProviderOrOptions };
+  const provider = resolveSchedulingProviderForTenant({
+    preferredProvider: options.provider,
+    tenantCode: options.tenantCode,
+  });
 
   if (provider === SCHEDULING_PROVIDER_TRINKS) {
     return {
@@ -5620,6 +6104,13 @@ app.get("/", (req, res) => {
       schedulingProfessionals: "POST /api/scheduling/professionals",
       schedulingReschedule: "POST /api/scheduling/appointments/reschedule",
       schedulingCancel: "POST /api/scheduling/appointments/cancel",
+      adminTenantsList: "GET /api/admin/tenants",
+      adminTenantsCreate: "POST /api/admin/tenants",
+      adminTenantGet: "GET /api/admin/tenants/:code",
+      adminTenantUpdate: "PUT /api/admin/tenants/:code",
+      adminTenantResolve: "GET /api/admin/tenants/resolve?kind=evolution_instance&value=ia-agendamento",
+      adminTenantIdentifiers: "POST /api/admin/tenants/:code/identifiers",
+      adminTenantProviders: "POST /api/admin/tenants/:code/providers/:provider",
       trinksAvailability: "POST /api/trinks/availability",
       trinksAppointments: "POST /api/trinks/appointments",
       trinksAppointmentsDay: "POST /api/trinks/appointments/day",
@@ -5875,12 +6366,330 @@ app.get("/api/evolution/instance/connect", async (req, res) => {
   }
 });
 
-app.get("/api/scheduling/providers", (req, res) => {
+app.get("/api/admin/tenants", (req, res) => {
   try {
-    const providers = listSchedulingProviders();
+    if (!isAdminWriteAuthorized(req)) {
+      return res.status(401).json({ message: "Nao autorizado." });
+    }
+
+    const includeInactive = parseBooleanEnv(req.query.includeInactive, false);
+    const withDetails = parseBooleanEnv(req.query.withDetails, false);
+    const tenants = listTenants({ includeInactive }).map((tenant) =>
+      withDetails
+        ? {
+          ...tenant,
+          identifiers: getTenantIdentifiersByCode(tenant.code),
+          providerConfigs: getTenantProviderConfigsByCode(tenant.code),
+        }
+        : tenant,
+    );
+
     return res.json({
       status: "ok",
-      defaultProvider: resolveSchedulingProvider(),
+      count: tenants.length,
+      data: tenants,
+    });
+  } catch (error) {
+    return res.status(error.status || 500).json({
+      status: "error",
+      message: error.message || "Erro ao listar tenants.",
+      details: error.details || null,
+    });
+  }
+});
+
+app.post("/api/admin/tenants", (req, res) => {
+  try {
+    if (!isAdminWriteAuthorized(req)) {
+      return res.status(401).json({ message: "Nao autorizado." });
+    }
+
+    const tenant = createTenant({
+      code: req.body?.code,
+      name: req.body?.name,
+      segment: req.body?.segment,
+      active: req.body?.active == null ? true : Boolean(req.body.active),
+      defaultProvider: req.body?.defaultProvider || req.body?.provider,
+      establishmentId: req.body?.establishmentId,
+      knowledge: req.body?.knowledge || {},
+    });
+
+    if (Array.isArray(req.body?.identifiers)) {
+      for (const identifier of req.body.identifiers) {
+        if (!identifier || typeof identifier !== "object") {
+          continue;
+        }
+        if (!identifier.kind || !identifier.value) {
+          continue;
+        }
+        upsertTenantIdentifierByCode(tenant.code, {
+          kind: identifier.kind,
+          value: identifier.value,
+        });
+      }
+    }
+
+    if (req.body?.providerConfigs && typeof req.body.providerConfigs === "object") {
+      for (const [provider, config] of Object.entries(req.body.providerConfigs)) {
+        upsertTenantProviderConfigByCode(tenant.code, provider, {
+          enabled: config?.enabled ?? true,
+          config: config?.config || config || {},
+        });
+      }
+    }
+
+    const responseTenant = getTenantByCode(tenant.code);
+    return res.status(201).json({
+      status: "ok",
+      tenant: responseTenant,
+      identifiers: getTenantIdentifiersByCode(tenant.code),
+      providerConfigs: getTenantProviderConfigsByCode(tenant.code),
+    });
+  } catch (error) {
+    if (String(error?.message || "").includes("UNIQUE constraint failed: tenants.code")) {
+      return res.status(409).json({
+        status: "error",
+        message: "Ja existe tenant com esse code.",
+      });
+    }
+    return res.status(error.status || 500).json({
+      status: "error",
+      message: error.message || "Erro ao criar tenant.",
+      details: error.details || null,
+    });
+  }
+});
+
+app.get("/api/admin/tenants/resolve", (req, res) => {
+  try {
+    if (!isAdminWriteAuthorized(req)) {
+      return res.status(401).json({ message: "Nao autorizado." });
+    }
+
+    const kind = toNonEmptyString(req.query.kind || "");
+    const value = toNonEmptyString(req.query.value || "");
+    if (!kind || !value) {
+      return res.status(400).json({ message: "Informe kind e value." });
+    }
+
+    const tenant = resolveTenantByIdentifier({ kind, value });
+    return res.json({
+      status: "ok",
+      kind: normalizeTenantIdentifierKind(kind),
+      value,
+      found: Boolean(tenant),
+      tenant: tenant || null,
+    });
+  } catch (error) {
+    return res.status(error.status || 500).json({
+      status: "error",
+      message: error.message || "Erro ao resolver tenant por identificador.",
+      details: error.details || null,
+    });
+  }
+});
+
+app.get("/api/admin/tenants/:code", (req, res) => {
+  try {
+    if (!isAdminWriteAuthorized(req)) {
+      return res.status(401).json({ message: "Nao autorizado." });
+    }
+
+    const tenant = getTenantByCode(req.params.code);
+    if (!tenant) {
+      return res.status(404).json({ status: "error", message: "Tenant nao encontrado." });
+    }
+
+    return res.json({
+      status: "ok",
+      tenant,
+      identifiers: getTenantIdentifiersByCode(tenant.code),
+      providerConfigs: getTenantProviderConfigsByCode(tenant.code),
+    });
+  } catch (error) {
+    return res.status(error.status || 500).json({
+      status: "error",
+      message: error.message || "Erro ao consultar tenant.",
+      details: error.details || null,
+    });
+  }
+});
+
+app.put("/api/admin/tenants/:code", (req, res) => {
+  try {
+    if (!isAdminWriteAuthorized(req)) {
+      return res.status(401).json({ message: "Nao autorizado." });
+    }
+
+    const tenant = updateTenantByCode(req.params.code, {
+      name: req.body?.name,
+      segment: req.body?.segment,
+      active: req.body?.active,
+      defaultProvider: req.body?.defaultProvider || req.body?.provider,
+      establishmentId: req.body?.establishmentId,
+      knowledge: req.body?.knowledge,
+    });
+
+    return res.json({
+      status: "ok",
+      tenant,
+      identifiers: getTenantIdentifiersByCode(tenant.code),
+      providerConfigs: getTenantProviderConfigsByCode(tenant.code),
+    });
+  } catch (error) {
+    return res.status(error.status || 500).json({
+      status: "error",
+      message: error.message || "Erro ao atualizar tenant.",
+      details: error.details || null,
+    });
+  }
+});
+
+app.get("/api/admin/tenants/:code/identifiers", (req, res) => {
+  try {
+    if (!isAdminWriteAuthorized(req)) {
+      return res.status(401).json({ message: "Nao autorizado." });
+    }
+
+    const tenant = getTenantByCode(req.params.code);
+    if (!tenant) {
+      return res.status(404).json({ status: "error", message: "Tenant nao encontrado." });
+    }
+
+    return res.json({
+      status: "ok",
+      tenant: { code: tenant.code, name: tenant.name },
+      identifiers: getTenantIdentifiersByCode(tenant.code),
+    });
+  } catch (error) {
+    return res.status(error.status || 500).json({
+      status: "error",
+      message: error.message || "Erro ao listar identificadores do tenant.",
+      details: error.details || null,
+    });
+  }
+});
+
+app.post("/api/admin/tenants/:code/identifiers", (req, res) => {
+  try {
+    if (!isAdminWriteAuthorized(req)) {
+      return res.status(401).json({ message: "Nao autorizado." });
+    }
+
+    const identifiers = upsertTenantIdentifierByCode(req.params.code, {
+      kind: req.body?.kind,
+      value: req.body?.value,
+    });
+
+    return res.json({
+      status: "ok",
+      identifiers,
+    });
+  } catch (error) {
+    return res.status(error.status || 500).json({
+      status: "error",
+      message: error.message || "Erro ao salvar identificador do tenant.",
+      details: error.details || null,
+    });
+  }
+});
+
+app.delete("/api/admin/tenants/:code/identifiers/:id", (req, res) => {
+  try {
+    if (!isAdminWriteAuthorized(req)) {
+      return res.status(401).json({ message: "Nao autorizado." });
+    }
+
+    const tenant = getTenantByCode(req.params.code);
+    if (!tenant) {
+      return res.status(404).json({ status: "error", message: "Tenant nao encontrado." });
+    }
+
+    const id = Number(req.params.id);
+    if (!Number.isFinite(id) || id <= 0) {
+      return res.status(400).json({ status: "error", message: "id invalido." });
+    }
+
+    db.prepare(
+      `
+        DELETE FROM tenant_identifiers
+        WHERE id = ?
+          AND tenant_id = ?
+      `,
+    ).run(id, tenant.id);
+
+    return res.json({
+      status: "ok",
+      identifiers: getTenantIdentifiersByCode(tenant.code),
+    });
+  } catch (error) {
+    return res.status(error.status || 500).json({
+      status: "error",
+      message: error.message || "Erro ao excluir identificador do tenant.",
+      details: error.details || null,
+    });
+  }
+});
+
+app.get("/api/admin/tenants/:code/providers", (req, res) => {
+  try {
+    if (!isAdminWriteAuthorized(req)) {
+      return res.status(401).json({ message: "Nao autorizado." });
+    }
+
+    const tenant = getTenantByCode(req.params.code);
+    if (!tenant) {
+      return res.status(404).json({ status: "error", message: "Tenant nao encontrado." });
+    }
+
+    return res.json({
+      status: "ok",
+      tenant: { code: tenant.code, name: tenant.name, defaultProvider: tenant.defaultProvider },
+      providerConfigs: getTenantProviderConfigsByCode(tenant.code),
+    });
+  } catch (error) {
+    return res.status(error.status || 500).json({
+      status: "error",
+      message: error.message || "Erro ao listar providers do tenant.",
+      details: error.details || null,
+    });
+  }
+});
+
+app.post("/api/admin/tenants/:code/providers/:provider", (req, res) => {
+  try {
+    if (!isAdminWriteAuthorized(req)) {
+      return res.status(401).json({ message: "Nao autorizado." });
+    }
+
+    const providerConfigs = upsertTenantProviderConfigByCode(req.params.code, req.params.provider, {
+      enabled: req.body?.enabled ?? true,
+      config: req.body?.config || req.body || {},
+    });
+
+    return res.json({
+      status: "ok",
+      providerConfigs,
+    });
+  } catch (error) {
+    return res.status(error.status || 500).json({
+      status: "error",
+      message: error.message || "Erro ao salvar configuracao de provider do tenant.",
+      details: error.details || null,
+    });
+  }
+});
+
+app.get("/api/scheduling/providers", (req, res) => {
+  try {
+    const tenantCode = toNonEmptyString(req.query.tenantCode || req.query.tenant || "");
+    const tenant = tenantCode ? getTenantByCode(tenantCode) : null;
+    const providers = listSchedulingProviders({ tenantCode });
+    return res.json({
+      status: "ok",
+      tenantCode: tenantCode || null,
+      tenantFound: tenantCode ? Boolean(tenant) : null,
+      defaultProvider: resolveSchedulingProviderForTenant({ tenantCode }),
       providers,
     });
   } catch (error) {
@@ -5894,14 +6703,32 @@ app.get("/api/scheduling/providers", (req, res) => {
 
 app.post("/api/scheduling/availability", async (req, res) => {
   try {
-    const { establishmentId, service, date, professionalName, preferredTime, provider } = req.body || {};
-    if (!establishmentId || !service || !date) {
+    const {
+      establishmentId,
+      service,
+      date,
+      professionalName,
+      preferredTime,
+      provider,
+      tenantCode,
+      tenant,
+    } = req.body || {};
+    const context = resolveSchedulingRequestContext({
+      tenantCode,
+      tenantAlias: tenant,
+      establishmentId,
+    });
+
+    if (!context.establishmentId || !service || !date) {
       return res.status(400).json({ message: "Campos obrigatorios: establishmentId, service, date" });
     }
 
-    const adapter = getSchedulingAdapter(provider);
+    const adapter = getSchedulingAdapter({
+      provider,
+      tenantCode: context.tenantCode,
+    });
     const availability = await adapter.getAvailability({
-      establishmentId,
+      establishmentId: context.establishmentId,
       service,
       date,
       professionalName,
@@ -5928,17 +6755,28 @@ app.post("/api/scheduling/appointments", async (req, res) => {
       clientName,
       clientPhone,
       provider,
+      tenantCode,
+      tenant,
     } = req.body || {};
 
-    if (!establishmentId || !service || !date || !time || !clientName || !clientPhone) {
+    const context = resolveSchedulingRequestContext({
+      tenantCode,
+      tenantAlias: tenant,
+      establishmentId,
+    });
+
+    if (!context.establishmentId || !service || !date || !time || !clientName || !clientPhone) {
       return res.status(400).json({
         message: "Campos obrigatorios: establishmentId, service, date, time, clientName, clientPhone",
       });
     }
 
-    const adapter = getSchedulingAdapter(provider);
+    const adapter = getSchedulingAdapter({
+      provider,
+      tenantCode: context.tenantCode,
+    });
     const createdAppointment = await adapter.createAppointment({
-      establishmentId,
+      establishmentId: context.establishmentId,
       service,
       date,
       time,
@@ -5959,16 +6797,24 @@ app.post("/api/scheduling/appointments", async (req, res) => {
 
 app.post("/api/scheduling/appointments/day", async (req, res) => {
   try {
-    const { establishmentId, date, provider } = req.body || {};
+    const { establishmentId, date, provider, tenantCode, tenant } = req.body || {};
+    const context = resolveSchedulingRequestContext({
+      tenantCode,
+      tenantAlias: tenant,
+      establishmentId,
+    });
 
-    if (!establishmentId || !date) {
+    if (!context.establishmentId || !date) {
       return res.status(400).json({
         message: "Campos obrigatorios: establishmentId, date",
       });
     }
 
-    const adapter = getSchedulingAdapter(provider);
-    const result = await adapter.getAppointmentsDay({ establishmentId, date });
+    const adapter = getSchedulingAdapter({
+      provider,
+      tenantCode: context.tenantCode,
+    });
+    const result = await adapter.getAppointmentsDay({ establishmentId: context.establishmentId, date });
     return res.json(result);
   } catch (error) {
     return res.status(error.status || 500).json({
@@ -5981,16 +6827,28 @@ app.post("/api/scheduling/appointments/day", async (req, res) => {
 
 app.post("/api/scheduling/professionals", async (req, res) => {
   try {
-    const { establishmentId, date, serviceId, provider } = req.body || {};
+    const { establishmentId, date, serviceId, provider, tenantCode, tenant } = req.body || {};
+    const context = resolveSchedulingRequestContext({
+      tenantCode,
+      tenantAlias: tenant,
+      establishmentId,
+    });
 
-    if (!establishmentId || !date) {
+    if (!context.establishmentId || !date) {
       return res.status(400).json({
         message: "Campos obrigatorios: establishmentId, date",
       });
     }
 
-    const adapter = getSchedulingAdapter(provider);
-    const result = await adapter.getProfessionals({ establishmentId, date, serviceId });
+    const adapter = getSchedulingAdapter({
+      provider,
+      tenantCode: context.tenantCode,
+    });
+    const result = await adapter.getProfessionals({
+      establishmentId: context.establishmentId,
+      date,
+      serviceId,
+    });
     return res.json(result);
   } catch (error) {
     return res.status(error.status || 500).json({
@@ -6010,17 +6868,28 @@ app.post("/api/scheduling/appointments/reschedule", async (req, res) => {
       date,
       time,
       provider,
+      tenantCode,
+      tenant,
     } = req.body || {};
 
-    if (!establishmentId || !date || !time || (!confirmationCode && !appointmentId)) {
+    const context = resolveSchedulingRequestContext({
+      tenantCode,
+      tenantAlias: tenant,
+      establishmentId,
+    });
+
+    if (!context.establishmentId || !date || !time || (!confirmationCode && !appointmentId)) {
       return res.status(400).json({
         message: "Campos obrigatorios: establishmentId, date, time e (confirmationCode ou appointmentId)",
       });
     }
 
-    const adapter = getSchedulingAdapter(provider);
+    const adapter = getSchedulingAdapter({
+      provider,
+      tenantCode: context.tenantCode,
+    });
     const result = await adapter.rescheduleAppointment({
-      establishmentId,
+      establishmentId: context.establishmentId,
       confirmationCode,
       appointmentId,
       date,
@@ -6050,18 +6919,29 @@ app.post("/api/scheduling/appointments/cancel", async (req, res) => {
       service,
       professionalName,
       provider,
+      tenantCode,
+      tenant,
     } = req.body || {};
 
-    if (!establishmentId || (!confirmationCode && !appointmentId && !clientPhone)) {
+    const context = resolveSchedulingRequestContext({
+      tenantCode,
+      tenantAlias: tenant,
+      establishmentId,
+    });
+
+    if (!context.establishmentId || (!confirmationCode && !appointmentId && !clientPhone)) {
       return res.status(400).json({
         message:
           "Campos obrigatorios: establishmentId e (confirmationCode ou appointmentId ou clientPhone)",
       });
     }
 
-    const adapter = getSchedulingAdapter(provider);
+    const adapter = getSchedulingAdapter({
+      provider,
+      tenantCode: context.tenantCode,
+    });
     const result = await adapter.cancelAppointment({
-      establishmentId,
+      establishmentId: context.establishmentId,
       confirmationCode,
       appointmentId,
       reason,
