@@ -23,6 +23,8 @@ const TRINKS_MAX_RETRIES = Math.max(1, Number(process.env.TRINKS_MAX_RETRIES || 
 const TRINKS_RETRY_BASE_MS = Math.max(200, Number(process.env.TRINKS_RETRY_BASE_MS || 700));
 const BOOKING_SEQUENCE_GAP_MS = Math.max(0, Number(process.env.BOOKING_SEQUENCE_GAP_MS || 450));
 const TRINKS_STATUS_ID_CANCELLED = Math.max(1, Number(process.env.TRINKS_STATUS_ID_CANCELLED || 9));
+const SCHEDULING_PROVIDER_TRINKS = "trinks";
+const SCHEDULING_PROVIDER_GOOGLE_CALENDAR = "google_calendar";
 const UNSUPPORTED_MESSAGE_REPLY =
   toNonEmptyString(process.env.WHATSAPP_UNSUPPORTED_MESSAGE_REPLY) ||
   "Recebi sua mensagem, mas no momento consigo ler apenas texto. Pode me escrever por texto, por favor?";
@@ -359,6 +361,258 @@ function firstNonEmpty(values) {
     }
   }
   return "";
+}
+
+function normalizeSchedulingProvider(value) {
+  const normalized = toNonEmptyString(value)
+    .toLowerCase()
+    .replace(/[\s-]+/g, "_");
+  if (!normalized) {
+    return "";
+  }
+
+  if (normalized === "trinks") {
+    return SCHEDULING_PROVIDER_TRINKS;
+  }
+
+  if (
+    normalized === "google" ||
+    normalized === "google_calendar" ||
+    normalized === "googlecalendar" ||
+    normalized === "calendar"
+  ) {
+    return SCHEDULING_PROVIDER_GOOGLE_CALENDAR;
+  }
+
+  return normalized;
+}
+
+function parseBooleanEnv(value, fallback = false) {
+  const normalized = toNonEmptyString(value).toLowerCase();
+  if (!normalized) {
+    return fallback;
+  }
+  if (["1", "true", "yes", "on", "sim"].includes(normalized)) {
+    return true;
+  }
+  if (["0", "false", "no", "off", "nao"].includes(normalized)) {
+    return false;
+  }
+  return fallback;
+}
+
+function resolveSchedulingProvider(preferred = "") {
+  const explicit = normalizeSchedulingProvider(preferred);
+  if (explicit) {
+    return explicit;
+  }
+
+  const envProvider = normalizeSchedulingProvider(
+    firstNonEmpty([process.env.SCHEDULING_PROVIDER, process.env.SCHEDULING_DEFAULT_PROVIDER]),
+  );
+  if (envProvider) {
+    return envProvider;
+  }
+
+  return SCHEDULING_PROVIDER_TRINKS;
+}
+
+function getSchedulingProviderCapabilities(provider) {
+  if (provider === SCHEDULING_PROVIDER_TRINKS) {
+    return {
+      availability: true,
+      createAppointment: true,
+      listAppointmentsDay: true,
+      listProfessionals: true,
+      rescheduleAppointment: true,
+      cancelAppointment: true,
+      supportsProfessionalAgenda: true,
+      supportsMultiServiceAppointment: true,
+    };
+  }
+
+  if (provider === SCHEDULING_PROVIDER_GOOGLE_CALENDAR) {
+    return {
+      availability: true,
+      createAppointment: true,
+      listAppointmentsDay: true,
+      listProfessionals: false,
+      rescheduleAppointment: true,
+      cancelAppointment: true,
+      supportsProfessionalAgenda: false,
+      supportsMultiServiceAppointment: false,
+    };
+  }
+
+  return {
+    availability: false,
+    createAppointment: false,
+    listAppointmentsDay: false,
+    listProfessionals: false,
+    rescheduleAppointment: false,
+    cancelAppointment: false,
+  };
+}
+
+function listSchedulingProviders() {
+  const defaultProvider = resolveSchedulingProvider();
+  const googleConfigured = parseBooleanEnv(process.env.GOOGLE_CALENDAR_ENABLED, false)
+    || Boolean(
+      firstNonEmpty([
+        process.env.GOOGLE_CLIENT_ID,
+        process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL,
+        process.env.GOOGLE_CALENDAR_ID,
+      ]),
+    );
+
+  return [
+    {
+      provider: SCHEDULING_PROVIDER_TRINKS,
+      label: "Trinks",
+      ready: true,
+      default: defaultProvider === SCHEDULING_PROVIDER_TRINKS,
+      capabilities: getSchedulingProviderCapabilities(SCHEDULING_PROVIDER_TRINKS),
+    },
+    {
+      provider: SCHEDULING_PROVIDER_GOOGLE_CALENDAR,
+      label: "Google Calendar",
+      ready: googleConfigured,
+      default: defaultProvider === SCHEDULING_PROVIDER_GOOGLE_CALENDAR,
+      capabilities: getSchedulingProviderCapabilities(SCHEDULING_PROVIDER_GOOGLE_CALENDAR),
+    },
+  ];
+}
+
+function createSchedulingProviderNotReadyError(provider) {
+  const normalized = normalizeSchedulingProvider(provider) || String(provider || "");
+  const error = new Error(
+    `Provider de agenda '${normalized}' ainda nao foi configurado neste backend.`,
+  );
+  error.status = 501;
+  error.details = {
+    provider: normalized,
+    action: "configure_provider_credentials",
+  };
+  return error;
+}
+
+function getSchedulingAdapter(preferredProvider = "") {
+  const provider = resolveSchedulingProvider(preferredProvider);
+
+  if (provider === SCHEDULING_PROVIDER_TRINKS) {
+    return {
+      provider,
+      capabilities: getSchedulingProviderCapabilities(provider),
+      async getAvailability({ establishmentId, service, date, professionalName = "", preferredTime = "" }) {
+        return getAvailability(establishmentId, service, date, {
+          professionalName: professionalName ? String(professionalName) : "",
+          preferredTime: preferredTime ? String(preferredTime) : "",
+        });
+      },
+      async createAppointment({
+        establishmentId,
+        service,
+        date,
+        time,
+        professionalName = "",
+        clientName,
+        clientPhone,
+      }) {
+        return createAppointment({
+          establishmentId,
+          service,
+          date,
+          time,
+          professionalName: professionalName ? String(professionalName) : "",
+          clientName,
+          clientPhone,
+        });
+      },
+      async getAppointmentsDay({ establishmentId, date }) {
+        const response = await getAppointmentsForDate(Number(establishmentId), String(date));
+        return {
+          source: response.source,
+          appointments: response.items.map(normalizeAppointmentItem).filter(Boolean),
+          raw: response.raw,
+        };
+      },
+      async getProfessionals({ establishmentId, date, serviceId }) {
+        const professionals = await getProfessionals({
+          establishmentId: Number(establishmentId),
+          date: String(date),
+          serviceId: serviceId ? Number(serviceId) : undefined,
+        });
+        return {
+          professionals: professionals
+            .filter(professionalHasOpenSchedule)
+            .map((item) => ({
+              id: item.id,
+              name: professionalDisplayName(item.name),
+              availableTimes: item.availableTimes,
+            })),
+        };
+      },
+      async rescheduleAppointment({ establishmentId, confirmationCode, appointmentId, date, time }) {
+        return rescheduleAppointment({
+          establishmentId: Number(establishmentId),
+          confirmationCode: confirmationCode ? String(confirmationCode) : "",
+          appointmentId: appointmentId ? String(appointmentId) : "",
+          date: String(date),
+          time: String(time),
+        });
+      },
+      async cancelAppointment({
+        establishmentId,
+        confirmationCode,
+        appointmentId,
+        reason,
+        clientPhone,
+        clientName,
+        date,
+        time,
+        service,
+        professionalName,
+      }) {
+        return cancelAppointment({
+          establishmentId: Number(establishmentId),
+          confirmationCode: confirmationCode ? String(confirmationCode) : "",
+          appointmentId: appointmentId ? String(appointmentId) : "",
+          reason: reason ? String(reason) : "",
+          clientPhone: clientPhone ? String(clientPhone) : "",
+          clientName: clientName ? String(clientName) : "",
+          date: date ? String(date) : "",
+          time: time ? String(time) : "",
+          service: service ? String(service) : "",
+          professionalName: professionalName ? String(professionalName) : "",
+        });
+      },
+    };
+  }
+
+  if (provider === SCHEDULING_PROVIDER_GOOGLE_CALENDAR) {
+    const notReady = async () => {
+      throw createSchedulingProviderNotReadyError(provider);
+    };
+
+    return {
+      provider,
+      capabilities: getSchedulingProviderCapabilities(provider),
+      getAvailability: notReady,
+      createAppointment: notReady,
+      getAppointmentsDay: notReady,
+      getProfessionals: notReady,
+      rescheduleAppointment: notReady,
+      cancelAppointment: notReady,
+    };
+  }
+
+  const error = new Error(`Provider de agenda nao suportado: ${provider}`);
+  error.status = 400;
+  error.details = {
+    provider,
+    supportedProviders: [SCHEDULING_PROVIDER_TRINKS, SCHEDULING_PROVIDER_GOOGLE_CALENDAR],
+  };
+  throw error;
 }
 
 function normalizeWhatsappMessage(item) {
@@ -2143,6 +2397,122 @@ function resolveEvolutionInstance(preferred) {
   }
 
   return toNonEmptyString(process.env.EVOLUTION_INSTANCE);
+}
+
+function resolvePublicBaseUrl(req) {
+  const envBase = firstNonEmpty([
+    process.env.EVOLUTION_WEBHOOK_BASE_URL,
+    process.env.WEBHOOK_BASE_URL,
+    process.env.PUBLIC_BASE_URL,
+    process.env.APP_BASE_URL,
+    process.env.BACKEND_PUBLIC_URL,
+  ]);
+  if (envBase) {
+    return String(envBase).replace(/\/$/, "");
+  }
+
+  const forwardedProto = toNonEmptyString(String(req?.headers?.["x-forwarded-proto"] || "").split(",")[0]);
+  const forwardedHost = toNonEmptyString(String(req?.headers?.["x-forwarded-host"] || "").split(",")[0]);
+  const host = forwardedHost || toNonEmptyString(req?.get?.("host"));
+  const proto = forwardedProto || req?.protocol || "https";
+
+  if (!host) {
+    return "";
+  }
+
+  return `${proto}://${host}`.replace(/\/$/, "");
+}
+
+function resolveEvolutionWebhookUrl(req, explicitUrl = "") {
+  const fromArg = toNonEmptyString(explicitUrl);
+  if (fromArg) {
+    return fromArg;
+  }
+
+  const envWebhookUrl = firstNonEmpty([process.env.EVOLUTION_WEBHOOK_URL, process.env.WHATSAPP_WEBHOOK_URL]);
+  if (envWebhookUrl) {
+    return String(envWebhookUrl).replace(/\/$/, "");
+  }
+
+  const baseUrl = resolvePublicBaseUrl(req);
+  if (!baseUrl) {
+    return "";
+  }
+
+  return `${baseUrl}/webhook/whatsapp`;
+}
+
+function buildEvolutionWebhookPayload({
+  url = "",
+  enabled = true,
+  webhookByEvents = true,
+  webhookBase64 = false,
+  events = [],
+} = {}) {
+  const normalizedUrl = toNonEmptyString(url);
+  if (!normalizedUrl) {
+    const error = new Error("Webhook URL nao informada.");
+    error.status = 400;
+    throw error;
+  }
+
+  const normalizedEvents = Array.isArray(events)
+    ? events
+        .map((item) => toNonEmptyString(item).toUpperCase())
+        .filter(Boolean)
+    : [];
+  const finalEvents = normalizedEvents.length
+    ? normalizedEvents
+    : ["MESSAGES_UPSERT", "CONNECTION_UPDATE", "SEND_MESSAGE"];
+
+  return {
+    enabled: Boolean(enabled),
+    url: normalizedUrl,
+    webhookByEvents: Boolean(webhookByEvents),
+    webhookBase64: Boolean(webhookBase64),
+    events: finalEvents,
+  };
+}
+
+async function setEvolutionWebhook(instanceName, webhookPayload) {
+  const instance = toNonEmptyString(instanceName);
+  if (!instance) {
+    const error = new Error("Nome da instancia nao informado.");
+    error.status = 400;
+    throw error;
+  }
+
+  const payload = buildEvolutionWebhookPayload(webhookPayload);
+  const { payload: response, attempt } = await evolutionRequestWithFallback([
+    {
+      path: `/webhook/set/${instance}`,
+      method: "POST",
+      body: { webhook: payload },
+    },
+    {
+      path: `/webhook/set/${instance}`,
+      method: "POST",
+      body: payload,
+    },
+  ]);
+
+  return { payload: response, attempt, request: payload };
+}
+
+async function findEvolutionWebhook(instanceName) {
+  const instance = toNonEmptyString(instanceName);
+  if (!instance) {
+    const error = new Error("Nome da instancia nao informado.");
+    error.status = 400;
+    throw error;
+  }
+
+  const { payload, attempt } = await evolutionRequestWithFallback([
+    { path: `/webhook/find/${instance}`, method: "GET" },
+    { path: `/webhook/find?instance=${encodeURIComponent(instance)}`, method: "GET" },
+  ]);
+
+  return { payload, attempt };
 }
 
 async function createEvolutionInstance(instanceName) {
@@ -5243,6 +5613,13 @@ app.get("/", (req, res) => {
     docs: {
       health: "/api/health",
       chat: "POST /api/chat",
+      schedulingProviders: "GET /api/scheduling/providers",
+      schedulingAvailability: "POST /api/scheduling/availability",
+      schedulingAppointments: "POST /api/scheduling/appointments",
+      schedulingAppointmentsDay: "POST /api/scheduling/appointments/day",
+      schedulingProfessionals: "POST /api/scheduling/professionals",
+      schedulingReschedule: "POST /api/scheduling/appointments/reschedule",
+      schedulingCancel: "POST /api/scheduling/appointments/cancel",
       trinksAvailability: "POST /api/trinks/availability",
       trinksAppointments: "POST /api/trinks/appointments",
       trinksAppointmentsDay: "POST /api/trinks/appointments/day",
@@ -5251,6 +5628,8 @@ app.get("/", (req, res) => {
       trinksCancel: "POST /api/trinks/appointments/cancel",
       evolutionSendText: "POST /api/evolution/send-text",
       evolutionQrPage: "GET /api/evolution/instance/connect?instance=SEU_NOME",
+      evolutionWebhookFind: "GET /api/evolution/webhook/find?instance=SEU_NOME",
+      evolutionWebhookSet: "POST /api/evolution/webhook/set",
       handoffStatus: "GET /api/handoff/status?phone=5511999999999",
       handoffActivate: "POST /api/handoff/activate",
       handoffResume: "POST /api/handoff/resume",
@@ -5269,11 +5648,96 @@ app.post("/api/evolution/instance/create", async (req, res) => {
     }
 
     const created = await createEvolutionInstance(instance);
-    return res.json({ status: "ok", instance, created });
+    const shouldConfigureWebhook = req.body?.configureWebhook !== false;
+    const webhookUrl = resolveEvolutionWebhookUrl(req, req.body?.webhookUrl || req.body?.url);
+    let webhook = null;
+
+    if (shouldConfigureWebhook && webhookUrl) {
+      try {
+        webhook = await setEvolutionWebhook(instance, {
+          url: webhookUrl,
+          enabled: req.body?.webhookEnabled ?? true,
+          webhookByEvents: req.body?.webhookByEvents ?? true,
+          webhookBase64: req.body?.webhookBase64 ?? false,
+          events: req.body?.webhookEvents,
+        });
+      } catch (webhookError) {
+        webhook = {
+          status: "error",
+          message: webhookError.message || "Falha ao configurar webhook.",
+          details: webhookError.details || null,
+        };
+      }
+    }
+
+    return res.json({ status: "ok", instance, created, webhook });
   } catch (error) {
     return res.status(error.status || 500).json({
       status: "error",
       message: error.message || "Erro ao criar instancia na Evolution.",
+      details: error.details || null,
+    });
+  }
+});
+
+app.get("/api/evolution/webhook/find", async (req, res) => {
+  try {
+    const instance = resolveEvolutionInstance(req.query.instance || req.query.instanceName);
+    if (!instance) {
+      return res.status(400).json({ message: "Informe instance ou configure EVOLUTION_INSTANCE." });
+    }
+
+    const webhook = await findEvolutionWebhook(instance);
+    return res.json({
+      status: "ok",
+      instance,
+      webhook: webhook.payload,
+      sourcePath: webhook.attempt?.path || null,
+    });
+  } catch (error) {
+    return res.status(error.status || 500).json({
+      status: "error",
+      message: error.message || "Erro ao consultar webhook da instancia.",
+      details: error.details || null,
+    });
+  }
+});
+
+app.post("/api/evolution/webhook/set", async (req, res) => {
+  try {
+    const instance = resolveEvolutionInstance(req.body?.instance || req.body?.instanceName);
+    if (!instance) {
+      return res.status(400).json({ message: "Informe instance/instanceName ou configure EVOLUTION_INSTANCE." });
+    }
+
+    const webhookUrl = resolveEvolutionWebhookUrl(req, req.body?.webhookUrl || req.body?.url);
+    if (!webhookUrl) {
+      return res.status(400).json({
+        message:
+          "Nao foi possivel resolver URL de webhook. Informe webhookUrl/url no body ou configure EVOLUTION_WEBHOOK_URL.",
+      });
+    }
+
+    const webhook = await setEvolutionWebhook(instance, {
+      url: webhookUrl,
+      enabled: req.body?.enabled ?? req.body?.webhookEnabled ?? true,
+      webhookByEvents: req.body?.webhookByEvents ?? true,
+      webhookBase64: req.body?.webhookBase64 ?? false,
+      events: req.body?.events || req.body?.webhookEvents,
+    });
+
+    return res.json({
+      status: "ok",
+      instance,
+      webhookUrl,
+      sourcePath: webhook.attempt?.path || null,
+      request: webhook.request,
+      response: webhook.payload,
+    });
+  } catch (error) {
+    return res.status(error.status || 500).json({
+      status: "error",
+      message: error.message || "Erro ao configurar webhook da instancia.",
       details: error.details || null,
     });
   }
@@ -5340,15 +5804,46 @@ app.get("/api/evolution/instance/connect", async (req, res) => {
     }
 
     const created = await createEvolutionInstance(instance);
+    const webhookUrl = resolveEvolutionWebhookUrl(req, req.query.webhookUrl || req.query.url);
+    let webhookResult = null;
+    let webhookWarning = "";
+
+    if (webhookUrl) {
+      try {
+        webhookResult = await setEvolutionWebhook(instance, {
+          url: webhookUrl,
+          enabled: true,
+          webhookByEvents: true,
+          webhookBase64: false,
+        });
+      } catch (webhookError) {
+        webhookWarning = webhookError.message || "Falha ao configurar webhook automaticamente.";
+      }
+    }
+
     const qr = await fetchEvolutionQr(instance);
 
     const statusMessage = created?.alreadyExists
       ? "Instancia ja existia. Escaneie o QR para conectar."
       : "Instancia criada. Escaneie o QR no WhatsApp Business.";
+    const statusMessageWithWebhook = webhookWarning
+      ? `${statusMessage} Aviso: ${webhookWarning}`
+      : statusMessage;
 
-    const details = qr.qrDataUrl
-      ? ""
-      : JSON.stringify({ create: created, qrSource: qr.attempt?.path, qrRaw: qr.qrRaw, raw: qr.payload }, null, 2);
+    const detailsObject = {
+      create: created,
+      webhook: webhookResult
+        ? {
+            sourcePath: webhookResult.attempt?.path || null,
+            request: webhookResult.request,
+            response: webhookResult.payload,
+          }
+        : null,
+      qrSource: qr.attempt?.path,
+      qrRaw: qr.qrRaw,
+      raw: qr.payload,
+    };
+    const details = qr.qrDataUrl ? "" : JSON.stringify(detailsObject, null, 2);
 
     res.setHeader("Content-Type", "text/html; charset=utf-8");
     return res.send(
@@ -5356,7 +5851,7 @@ app.get("/api/evolution/instance/connect", async (req, res) => {
         instance,
         qrDataUrl: qr.qrDataUrl,
         pairingCode: qr.pairingCode,
-        statusMessage,
+        statusMessage: statusMessageWithWebhook,
         details,
       }),
     );
@@ -5377,6 +5872,213 @@ app.get("/api/evolution/instance/connect", async (req, res) => {
     });
     res.setHeader("Content-Type", "text/html; charset=utf-8");
     return res.status(error.status || 500).send(html);
+  }
+});
+
+app.get("/api/scheduling/providers", (req, res) => {
+  try {
+    const providers = listSchedulingProviders();
+    return res.json({
+      status: "ok",
+      defaultProvider: resolveSchedulingProvider(),
+      providers,
+    });
+  } catch (error) {
+    return res.status(error.status || 500).json({
+      status: "error",
+      message: error.message || "Erro ao listar providers de agenda.",
+      details: error.details || null,
+    });
+  }
+});
+
+app.post("/api/scheduling/availability", async (req, res) => {
+  try {
+    const { establishmentId, service, date, professionalName, preferredTime, provider } = req.body || {};
+    if (!establishmentId || !service || !date) {
+      return res.status(400).json({ message: "Campos obrigatorios: establishmentId, service, date" });
+    }
+
+    const adapter = getSchedulingAdapter(provider);
+    const availability = await adapter.getAvailability({
+      establishmentId,
+      service,
+      date,
+      professionalName,
+      preferredTime,
+    });
+
+    return res.json(availability);
+  } catch (error) {
+    return res.status(error.status || 500).json({
+      message: error.message || "Erro ao consultar disponibilidade.",
+      details: error.details || null,
+    });
+  }
+});
+
+app.post("/api/scheduling/appointments", async (req, res) => {
+  try {
+    const {
+      establishmentId,
+      service,
+      date,
+      time,
+      professionalName,
+      clientName,
+      clientPhone,
+      provider,
+    } = req.body || {};
+
+    if (!establishmentId || !service || !date || !time || !clientName || !clientPhone) {
+      return res.status(400).json({
+        message: "Campos obrigatorios: establishmentId, service, date, time, clientName, clientPhone",
+      });
+    }
+
+    const adapter = getSchedulingAdapter(provider);
+    const createdAppointment = await adapter.createAppointment({
+      establishmentId,
+      service,
+      date,
+      time,
+      professionalName,
+      clientName,
+      clientPhone,
+    });
+
+    return res.status(201).json(createdAppointment);
+  } catch (error) {
+    return res.status(error.status || 500).json({
+      status: "error",
+      message: error.message || "Erro ao criar agendamento.",
+      details: error.details || null,
+    });
+  }
+});
+
+app.post("/api/scheduling/appointments/day", async (req, res) => {
+  try {
+    const { establishmentId, date, provider } = req.body || {};
+
+    if (!establishmentId || !date) {
+      return res.status(400).json({
+        message: "Campos obrigatorios: establishmentId, date",
+      });
+    }
+
+    const adapter = getSchedulingAdapter(provider);
+    const result = await adapter.getAppointmentsDay({ establishmentId, date });
+    return res.json(result);
+  } catch (error) {
+    return res.status(error.status || 500).json({
+      status: "error",
+      message: error.message || "Erro ao buscar agendamentos do dia.",
+      details: error.details || null,
+    });
+  }
+});
+
+app.post("/api/scheduling/professionals", async (req, res) => {
+  try {
+    const { establishmentId, date, serviceId, provider } = req.body || {};
+
+    if (!establishmentId || !date) {
+      return res.status(400).json({
+        message: "Campos obrigatorios: establishmentId, date",
+      });
+    }
+
+    const adapter = getSchedulingAdapter(provider);
+    const result = await adapter.getProfessionals({ establishmentId, date, serviceId });
+    return res.json(result);
+  } catch (error) {
+    return res.status(error.status || 500).json({
+      status: "error",
+      message: error.message || "Erro ao buscar profissionais.",
+      details: error.details || null,
+    });
+  }
+});
+
+app.post("/api/scheduling/appointments/reschedule", async (req, res) => {
+  try {
+    const {
+      establishmentId,
+      confirmationCode,
+      appointmentId,
+      date,
+      time,
+      provider,
+    } = req.body || {};
+
+    if (!establishmentId || !date || !time || (!confirmationCode && !appointmentId)) {
+      return res.status(400).json({
+        message: "Campos obrigatorios: establishmentId, date, time e (confirmationCode ou appointmentId)",
+      });
+    }
+
+    const adapter = getSchedulingAdapter(provider);
+    const result = await adapter.rescheduleAppointment({
+      establishmentId,
+      confirmationCode,
+      appointmentId,
+      date,
+      time,
+    });
+    return res.json(result);
+  } catch (error) {
+    return res.status(error.status || 500).json({
+      status: "error",
+      message: error.message || "Erro ao reagendar horario.",
+      details: error.details || null,
+    });
+  }
+});
+
+app.post("/api/scheduling/appointments/cancel", async (req, res) => {
+  try {
+    const {
+      establishmentId,
+      confirmationCode,
+      appointmentId,
+      reason,
+      clientPhone,
+      clientName,
+      date,
+      time,
+      service,
+      professionalName,
+      provider,
+    } = req.body || {};
+
+    if (!establishmentId || (!confirmationCode && !appointmentId && !clientPhone)) {
+      return res.status(400).json({
+        message:
+          "Campos obrigatorios: establishmentId e (confirmationCode ou appointmentId ou clientPhone)",
+      });
+    }
+
+    const adapter = getSchedulingAdapter(provider);
+    const result = await adapter.cancelAppointment({
+      establishmentId,
+      confirmationCode,
+      appointmentId,
+      reason,
+      clientPhone,
+      clientName,
+      date,
+      time,
+      service,
+      professionalName,
+    });
+    return res.json(result);
+  } catch (error) {
+    return res.status(error.status || 500).json({
+      status: "error",
+      message: error.message || "Erro ao cancelar horario.",
+      details: error.details || null,
+    });
   }
 });
 
