@@ -11,7 +11,7 @@ interface Message {
   timestamp: Date;
 }
 
-type TopSection = 'chat' | 'services' | 'salon' | 'contact' | 'knowledge' | 'inbox' | 'history';
+type TopSection = 'chat' | 'services' | 'salon' | 'contact' | 'knowledge' | 'inbox' | 'history' | 'admin';
 type EvolutionStatus = {
   status?: string;
   instance?: string;
@@ -99,6 +99,30 @@ type WebhookEventItem = {
   receivedAt?: string;
 };
 
+type AdminTenant = {
+  id?: number;
+  code: string;
+  name: string;
+  segment?: string;
+  active?: boolean;
+  defaultProvider?: string;
+  establishmentId?: number | null;
+};
+
+type AdminTenantIdentifier = {
+  id?: number;
+  kind: string;
+  value: string;
+  normalizedValue?: string;
+};
+
+type AdminTenantProviderConfig = {
+  id?: number;
+  provider: string;
+  enabled: boolean;
+  config?: Record<string, any>;
+};
+
 const initialKnowledge = {
   identity: {
     brandName: 'Fabiana Luxury Salon',
@@ -134,6 +158,8 @@ function toText(value: unknown) {
 function normalizeDigits(value: string) {
   return String(value || '').replace(/\D/g, '');
 }
+
+const ADMIN_TOKEN_STORAGE_KEY = 'ia_agendamento_admin_token';
 
 export default function App() {
   const [messages, setMessages] = useState<Message[]>([
@@ -172,6 +198,34 @@ export default function App() {
   const [historyLimit, setHistoryLimit] = useState(200);
   const [isLoadingHistory, setIsLoadingHistory] = useState(false);
   const [historyError, setHistoryError] = useState('');
+  const [adminToken, setAdminToken] = useState(() => {
+    if (typeof window === 'undefined') return '';
+    return window.localStorage.getItem(ADMIN_TOKEN_STORAGE_KEY) || '';
+  });
+  const [adminStatus, setAdminStatus] = useState('');
+  const [isLoadingAdmin, setIsLoadingAdmin] = useState(false);
+  const [adminTenants, setAdminTenants] = useState<AdminTenant[]>([]);
+  const [selectedAdminTenantCode, setSelectedAdminTenantCode] = useState('');
+  const [adminTenantIdentifiers, setAdminTenantIdentifiers] = useState<AdminTenantIdentifier[]>([]);
+  const [adminTenantProviderConfigs, setAdminTenantProviderConfigs] = useState<AdminTenantProviderConfig[]>([]);
+  const [adminCreateName, setAdminCreateName] = useState('');
+  const [adminCreateCode, setAdminCreateCode] = useState('');
+  const [adminCreateSegment, setAdminCreateSegment] = useState('salao');
+  const [adminCreateProvider, setAdminCreateProvider] = useState('trinks');
+  const [adminCreateEstablishmentId, setAdminCreateEstablishmentId] = useState('');
+  const [adminEditName, setAdminEditName] = useState('');
+  const [adminEditSegment, setAdminEditSegment] = useState('');
+  const [adminEditProvider, setAdminEditProvider] = useState('trinks');
+  const [adminEditEstablishmentId, setAdminEditEstablishmentId] = useState('');
+  const [adminEditActive, setAdminEditActive] = useState(true);
+  const [adminIdentifierKind, setAdminIdentifierKind] = useState('evolution_instance');
+  const [adminIdentifierValue, setAdminIdentifierValue] = useState('');
+  const [adminProviderConfigName, setAdminProviderConfigName] = useState('google_calendar');
+  const [adminProviderEnabled, setAdminProviderEnabled] = useState(false);
+  const [adminProviderConfigJson, setAdminProviderConfigJson] = useState('{}');
+  const [adminResolveKind, setAdminResolveKind] = useState('evolution_instance');
+  const [adminResolveValue, setAdminResolveValue] = useState('');
+  const [adminResolveResult, setAdminResolveResult] = useState('');
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const appointmentService = useRef<AppointmentService | null>(null);
 
@@ -222,6 +276,12 @@ export default function App() {
       loadHistoryMessages(selectedHistoryPhone);
     }
   }, [activeSection, selectedHistoryPhone]);
+
+  useEffect(() => {
+    if (activeSection === 'admin' && adminToken) {
+      loadAdminTenants();
+    }
+  }, [activeSection]);
 
   const handleSend = async () => {
     if (!input.trim() || isLoading) return;
@@ -594,6 +654,231 @@ export default function App() {
     }
   };
 
+  const loadAdminTenants = async () => {
+    if (!appointmentService.current || !adminToken || isLoadingAdmin) return;
+    setIsLoadingAdmin(true);
+    setAdminStatus('');
+
+    try {
+      const tenants = await appointmentService.current.getAdminTenants(adminToken, {
+        withDetails: true,
+        includeInactive: true,
+      });
+      setAdminTenants(tenants);
+
+      const nextCode =
+        selectedAdminTenantCode && tenants.some((item) => item.code === selectedAdminTenantCode)
+          ? selectedAdminTenantCode
+          : (tenants[0]?.code || '');
+
+      setSelectedAdminTenantCode(nextCode);
+      if (nextCode) {
+        await loadAdminTenant(nextCode);
+      } else {
+        setAdminTenantIdentifiers([]);
+        setAdminTenantProviderConfigs([]);
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Erro ao carregar tenants.';
+      setAdminStatus(message);
+    } finally {
+      setIsLoadingAdmin(false);
+    }
+  };
+
+  const loadAdminTenant = async (code: string) => {
+    if (!appointmentService.current || !adminToken || !code) return;
+    setIsLoadingAdmin(true);
+    setAdminStatus('');
+    try {
+      const payload = await appointmentService.current.getAdminTenant(adminToken, code);
+      const tenant = payload.tenant;
+      setAdminTenantIdentifiers(Array.isArray(payload.identifiers) ? payload.identifiers : []);
+      setAdminTenantProviderConfigs(Array.isArray(payload.providerConfigs) ? payload.providerConfigs : []);
+
+      if (tenant) {
+        setAdminEditName(tenant.name || '');
+        setAdminEditSegment(tenant.segment || '');
+        setAdminEditProvider(tenant.defaultProvider || 'trinks');
+        setAdminEditEstablishmentId(
+          tenant.establishmentId === null || tenant.establishmentId === undefined ? '' : String(tenant.establishmentId),
+        );
+        setAdminEditActive(Boolean(tenant.active));
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Erro ao carregar tenant.';
+      setAdminStatus(message);
+    } finally {
+      setIsLoadingAdmin(false);
+    }
+  };
+
+  const handleSaveAdminToken = async () => {
+    const normalized = adminToken.trim();
+    if (!normalized) {
+      setAdminStatus('Informe o token admin.');
+      return;
+    }
+    try {
+      window.localStorage.setItem(ADMIN_TOKEN_STORAGE_KEY, normalized);
+      setAdminStatus('Token salvo. Validando acesso...');
+      await loadAdminTenants();
+      setAdminStatus('Token validado com sucesso.');
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Erro ao validar token admin.';
+      setAdminStatus(message);
+    }
+  };
+
+  const handleCreateTenant = async () => {
+    if (!appointmentService.current || !adminToken || !adminCreateName.trim()) {
+      setAdminStatus('Informe pelo menos o nome do tenant.');
+      return;
+    }
+    setIsLoadingAdmin(true);
+    setAdminStatus('');
+    try {
+      const response = await appointmentService.current.createAdminTenant(adminToken, {
+        code: adminCreateCode.trim() || undefined,
+        name: adminCreateName.trim(),
+        segment: adminCreateSegment.trim() || undefined,
+        defaultProvider: adminCreateProvider,
+        establishmentId: adminCreateEstablishmentId.trim() ? Number(adminCreateEstablishmentId.trim()) : undefined,
+        active: true,
+      });
+      const createdCode = response.tenant?.code || '';
+      setAdminCreateName('');
+      setAdminCreateCode('');
+      setAdminCreateSegment('salao');
+      setAdminCreateProvider('trinks');
+      setAdminCreateEstablishmentId('');
+      await loadAdminTenants();
+      if (createdCode) {
+        setSelectedAdminTenantCode(createdCode);
+        await loadAdminTenant(createdCode);
+      }
+      setAdminStatus('Tenant criado com sucesso.');
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Erro ao criar tenant.';
+      setAdminStatus(message);
+    } finally {
+      setIsLoadingAdmin(false);
+    }
+  };
+
+  const handleUpdateTenant = async () => {
+    if (!appointmentService.current || !adminToken || !selectedAdminTenantCode) {
+      setAdminStatus('Selecione um tenant para atualizar.');
+      return;
+    }
+    setIsLoadingAdmin(true);
+    setAdminStatus('');
+    try {
+      await appointmentService.current.updateAdminTenant(adminToken, selectedAdminTenantCode, {
+        name: adminEditName.trim(),
+        segment: adminEditSegment.trim(),
+        defaultProvider: adminEditProvider,
+        establishmentId: adminEditEstablishmentId.trim() ? Number(adminEditEstablishmentId.trim()) : undefined,
+        active: adminEditActive,
+      });
+      await loadAdminTenants();
+      await loadAdminTenant(selectedAdminTenantCode);
+      setAdminStatus('Tenant atualizado com sucesso.');
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Erro ao atualizar tenant.';
+      setAdminStatus(message);
+    } finally {
+      setIsLoadingAdmin(false);
+    }
+  };
+
+  const handleAddTenantIdentifier = async () => {
+    if (!appointmentService.current || !adminToken || !selectedAdminTenantCode) {
+      setAdminStatus('Selecione um tenant.');
+      return;
+    }
+    if (!adminIdentifierValue.trim()) {
+      setAdminStatus('Informe o valor do identificador.');
+      return;
+    }
+    setIsLoadingAdmin(true);
+    setAdminStatus('');
+    try {
+      const response = await appointmentService.current.addAdminTenantIdentifier(
+        adminToken,
+        selectedAdminTenantCode,
+        adminIdentifierKind,
+        adminIdentifierValue.trim(),
+      );
+      setAdminTenantIdentifiers(Array.isArray(response.identifiers) ? response.identifiers : []);
+      setAdminIdentifierValue('');
+      setAdminStatus('Identificador salvo com sucesso.');
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Erro ao salvar identificador.';
+      setAdminStatus(message);
+    } finally {
+      setIsLoadingAdmin(false);
+    }
+  };
+
+  const handleSaveProviderConfig = async () => {
+    if (!appointmentService.current || !adminToken || !selectedAdminTenantCode) {
+      setAdminStatus('Selecione um tenant.');
+      return;
+    }
+    setIsLoadingAdmin(true);
+    setAdminStatus('');
+    try {
+      const config = safeParseKnowledge(adminProviderConfigJson) as Record<string, any>;
+      const response = await appointmentService.current.setAdminTenantProviderConfig(
+        adminToken,
+        selectedAdminTenantCode,
+        adminProviderConfigName,
+        {
+          enabled: adminProviderEnabled,
+          config,
+        },
+      );
+      setAdminTenantProviderConfigs(Array.isArray(response.providerConfigs) ? response.providerConfigs : []);
+      setAdminStatus('Configuracao de provider salva.');
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Erro ao salvar provider.';
+      setAdminStatus(message);
+    } finally {
+      setIsLoadingAdmin(false);
+    }
+  };
+
+  const handleResolveTenant = async () => {
+    if (!appointmentService.current || !adminToken || !adminResolveValue.trim()) {
+      setAdminResolveResult('Informe tipo e valor para resolver.');
+      return;
+    }
+    setIsLoadingAdmin(true);
+    setAdminResolveResult('');
+    try {
+      const response = await appointmentService.current.resolveAdminTenant(
+        adminToken,
+        adminResolveKind,
+        adminResolveValue.trim(),
+      );
+      if (response.found && response.tenant?.code) {
+        setAdminResolveResult(`Encontrado: ${response.tenant.name} (${response.tenant.code})`);
+        setSelectedAdminTenantCode(response.tenant.code);
+        await loadAdminTenant(response.tenant.code);
+      } else {
+        setAdminResolveResult('Nenhum tenant encontrado para esse identificador.');
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Erro ao resolver tenant.';
+      setAdminResolveResult(message);
+    } finally {
+      setIsLoadingAdmin(false);
+    }
+  };
+
+  const selectedAdminTenant = adminTenants.find((item) => item.code === selectedAdminTenantCode) || null;
+
   return (
     <div className="min-h-screen flex flex-col luxury-gradient">
       {/* Header */}
@@ -612,6 +897,7 @@ export default function App() {
           <button onClick={() => setActiveSection('salon')} className="hover:text-white cursor-pointer transition-colors">O Salao</button>
           <button onClick={() => setActiveSection('inbox')} className="hover:text-white cursor-pointer transition-colors">Inbox</button>
           <button onClick={() => setActiveSection('history')} className="hover:text-white cursor-pointer transition-colors">Historico</button>
+          <button onClick={() => setActiveSection('admin')} className="hover:text-white cursor-pointer transition-colors">Admin</button>
           <button onClick={() => setActiveSection('contact')} className="hover:text-white cursor-pointer transition-colors">Contato</button>
           <button onClick={() => setActiveSection('knowledge')} className="hover:text-white cursor-pointer transition-colors">Base</button>
         </div>
@@ -1015,6 +1301,285 @@ export default function App() {
                         ))}
                       </tbody>
                     </table>
+                  </div>
+                </div>
+              </>
+            )}
+
+            {activeSection === 'admin' && (
+              <>
+                <div className="flex items-center justify-between gap-3 flex-wrap">
+                  <h2 className="heading-bold text-lg text-white">Painel Admin</h2>
+                  <button
+                    onClick={loadAdminTenants}
+                    disabled={isLoadingAdmin || !adminToken.trim()}
+                    className="px-4 py-2 rounded-lg bg-brand-blue text-white text-xs uppercase tracking-wider disabled:opacity-50"
+                  >
+                    {isLoadingAdmin ? 'Carregando...' : 'Atualizar'}
+                  </button>
+                </div>
+
+                <div className="rounded-xl bg-white/5 border border-white/10 p-4 space-y-3">
+                  <p className="text-xs uppercase tracking-wider text-white/60">Acesso</p>
+                  <div className="flex flex-col md:flex-row gap-2">
+                    <input
+                      value={adminToken}
+                      onChange={(e) => setAdminToken(e.target.value)}
+                      placeholder="Cole o x-admin-token"
+                      className="flex-1 rounded-md bg-[#0f1731] border border-white/15 text-white/90 px-3 py-2 text-sm"
+                    />
+                    <button
+                      onClick={handleSaveAdminToken}
+                      disabled={isLoadingAdmin}
+                      className="px-4 py-2 rounded-lg bg-brand-green text-black text-xs uppercase tracking-wider disabled:opacity-50"
+                    >
+                      Salvar token
+                    </button>
+                  </div>
+                  {adminStatus && <p className="text-xs text-brand-green">{adminStatus}</p>}
+                </div>
+
+                <div className="grid lg:grid-cols-[320px_1fr] gap-4">
+                  <div className="rounded-xl bg-white/5 border border-white/10 p-4 space-y-3">
+                    <p className="text-xs uppercase tracking-wider text-white/60">Tenants</p>
+                    <div className="space-y-2 max-h-[420px] overflow-y-auto pr-1">
+                      {!adminTenants.length && (
+                        <p className="text-white/60 text-sm">Nenhum tenant carregado.</p>
+                      )}
+                      {adminTenants.map((tenant) => (
+                        <button
+                          key={tenant.code}
+                          onClick={async () => {
+                            setSelectedAdminTenantCode(tenant.code);
+                            await loadAdminTenant(tenant.code);
+                          }}
+                          className={`w-full text-left rounded-lg border px-3 py-2 ${
+                            selectedAdminTenantCode === tenant.code
+                              ? 'border-brand-blue bg-white/10'
+                              : 'border-white/10 bg-white/5 hover:bg-white/10'
+                          }`}
+                        >
+                          <div className="text-sm text-white">{tenant.name}</div>
+                          <div className="text-[11px] text-white/60">
+                            {tenant.code} | {tenant.defaultProvider || 'trinks'}
+                          </div>
+                        </button>
+                      ))}
+                    </div>
+
+                    <div className="pt-3 border-t border-white/10 space-y-2">
+                      <p className="text-xs uppercase tracking-wider text-white/60">Novo tenant</p>
+                      <input
+                        value={adminCreateName}
+                        onChange={(e) => setAdminCreateName(e.target.value)}
+                        placeholder="Nome"
+                        className="w-full rounded-md bg-[#0f1731] border border-white/15 text-white/90 px-3 py-2 text-sm"
+                      />
+                      <input
+                        value={adminCreateCode}
+                        onChange={(e) => setAdminCreateCode(e.target.value)}
+                        placeholder="Code (opcional)"
+                        className="w-full rounded-md bg-[#0f1731] border border-white/15 text-white/90 px-3 py-2 text-sm"
+                      />
+                      <input
+                        value={adminCreateSegment}
+                        onChange={(e) => setAdminCreateSegment(e.target.value)}
+                        placeholder="Segmento"
+                        className="w-full rounded-md bg-[#0f1731] border border-white/15 text-white/90 px-3 py-2 text-sm"
+                      />
+                      <div className="grid grid-cols-2 gap-2">
+                        <select
+                          value={adminCreateProvider}
+                          onChange={(e) => setAdminCreateProvider(e.target.value)}
+                          className="rounded-md bg-[#0f1731] border border-white/15 text-white/90 px-3 py-2 text-sm"
+                        >
+                          <option value="trinks">trinks</option>
+                          <option value="google_calendar">google_calendar</option>
+                        </select>
+                        <input
+                          value={adminCreateEstablishmentId}
+                          onChange={(e) => setAdminCreateEstablishmentId(e.target.value)}
+                          placeholder="Estab. ID"
+                          className="rounded-md bg-[#0f1731] border border-white/15 text-white/90 px-3 py-2 text-sm"
+                        />
+                      </div>
+                      <button
+                        onClick={handleCreateTenant}
+                        disabled={isLoadingAdmin || !adminToken.trim()}
+                        className="w-full px-4 py-2 rounded-lg bg-brand-blue text-white text-xs uppercase tracking-wider disabled:opacity-50"
+                      >
+                        Criar tenant
+                      </button>
+                    </div>
+                  </div>
+
+                  <div className="rounded-xl bg-white/5 border border-white/10 p-4 space-y-4">
+                    {!selectedAdminTenant && (
+                      <p className="text-white/70 text-sm">Selecione um tenant para editar detalhes.</p>
+                    )}
+
+                    {selectedAdminTenant && (
+                      <>
+                        <div className="space-y-2">
+                          <p className="text-xs uppercase tracking-wider text-white/60">Tenant selecionado</p>
+                          <div className="grid md:grid-cols-2 gap-2">
+                            <input
+                              value={adminEditName}
+                              onChange={(e) => setAdminEditName(e.target.value)}
+                              placeholder="Nome"
+                              className="rounded-md bg-[#0f1731] border border-white/15 text-white/90 px-3 py-2 text-sm"
+                            />
+                            <input
+                              value={adminEditSegment}
+                              onChange={(e) => setAdminEditSegment(e.target.value)}
+                              placeholder="Segmento"
+                              className="rounded-md bg-[#0f1731] border border-white/15 text-white/90 px-3 py-2 text-sm"
+                            />
+                            <select
+                              value={adminEditProvider}
+                              onChange={(e) => setAdminEditProvider(e.target.value)}
+                              className="rounded-md bg-[#0f1731] border border-white/15 text-white/90 px-3 py-2 text-sm"
+                            >
+                              <option value="trinks">trinks</option>
+                              <option value="google_calendar">google_calendar</option>
+                            </select>
+                            <input
+                              value={adminEditEstablishmentId}
+                              onChange={(e) => setAdminEditEstablishmentId(e.target.value)}
+                              placeholder="Establishment ID"
+                              className="rounded-md bg-[#0f1731] border border-white/15 text-white/90 px-3 py-2 text-sm"
+                            />
+                          </div>
+                          <label className="flex items-center gap-2 text-sm text-white/80">
+                            <input
+                              type="checkbox"
+                              checked={adminEditActive}
+                              onChange={(e) => setAdminEditActive(e.target.checked)}
+                            />
+                            Tenant ativo
+                          </label>
+                          <button
+                            onClick={handleUpdateTenant}
+                            disabled={isLoadingAdmin || !adminToken.trim()}
+                            className="px-4 py-2 rounded-lg bg-brand-blue text-white text-xs uppercase tracking-wider disabled:opacity-50"
+                          >
+                            Salvar tenant
+                          </button>
+                        </div>
+
+                        <div className="space-y-2 pt-3 border-t border-white/10">
+                          <p className="text-xs uppercase tracking-wider text-white/60">Identificadores</p>
+                          <div className="flex flex-wrap gap-2">
+                            {adminTenantIdentifiers.map((identifier) => (
+                              <span key={`${identifier.kind}-${identifier.id}`} className="text-xs rounded-full px-3 py-1 bg-white/10 text-white/80">
+                                {identifier.kind}: {identifier.value}
+                              </span>
+                            ))}
+                            {!adminTenantIdentifiers.length && (
+                              <span className="text-xs text-white/60">Nenhum identificador.</span>
+                            )}
+                          </div>
+                          <div className="grid md:grid-cols-[200px_1fr_auto] gap-2">
+                            <select
+                              value={adminIdentifierKind}
+                              onChange={(e) => setAdminIdentifierKind(e.target.value)}
+                              className="rounded-md bg-[#0f1731] border border-white/15 text-white/90 px-3 py-2 text-sm"
+                            >
+                              <option value="evolution_instance">evolution_instance</option>
+                              <option value="evolution_number">evolution_number</option>
+                              <option value="domain">domain</option>
+                              <option value="api_key">api_key</option>
+                              <option value="custom">custom</option>
+                            </select>
+                            <input
+                              value={adminIdentifierValue}
+                              onChange={(e) => setAdminIdentifierValue(e.target.value)}
+                              placeholder="Valor do identificador"
+                              className="rounded-md bg-[#0f1731] border border-white/15 text-white/90 px-3 py-2 text-sm"
+                            />
+                            <button
+                              onClick={handleAddTenantIdentifier}
+                              disabled={isLoadingAdmin || !adminToken.trim()}
+                              className="px-4 py-2 rounded-lg bg-brand-green text-black text-xs uppercase tracking-wider disabled:opacity-50"
+                            >
+                              Adicionar
+                            </button>
+                          </div>
+                        </div>
+
+                        <div className="space-y-2 pt-3 border-t border-white/10">
+                          <p className="text-xs uppercase tracking-wider text-white/60">Provider config</p>
+                          <div className="flex flex-wrap gap-2">
+                            {adminTenantProviderConfigs.map((config) => (
+                              <span key={`${config.provider}-${config.id}`} className="text-xs rounded-full px-3 py-1 bg-white/10 text-white/80">
+                                {config.provider}: {config.enabled ? 'on' : 'off'}
+                              </span>
+                            ))}
+                          </div>
+                          <div className="grid md:grid-cols-[220px_auto] gap-2">
+                            <select
+                              value={adminProviderConfigName}
+                              onChange={(e) => setAdminProviderConfigName(e.target.value)}
+                              className="rounded-md bg-[#0f1731] border border-white/15 text-white/90 px-3 py-2 text-sm"
+                            >
+                              <option value="trinks">trinks</option>
+                              <option value="google_calendar">google_calendar</option>
+                            </select>
+                            <label className="flex items-center gap-2 text-sm text-white/80">
+                              <input
+                                type="checkbox"
+                                checked={adminProviderEnabled}
+                                onChange={(e) => setAdminProviderEnabled(e.target.checked)}
+                              />
+                              habilitado
+                            </label>
+                          </div>
+                          <textarea
+                            value={adminProviderConfigJson}
+                            onChange={(e) => setAdminProviderConfigJson(e.target.value)}
+                            className="w-full rounded-md bg-[#0f1731] border border-white/15 text-white/90 px-3 py-2 text-sm min-h-24 font-mono"
+                          />
+                          <button
+                            onClick={handleSaveProviderConfig}
+                            disabled={isLoadingAdmin || !adminToken.trim()}
+                            className="px-4 py-2 rounded-lg bg-brand-blue text-white text-xs uppercase tracking-wider disabled:opacity-50"
+                          >
+                            Salvar provider
+                          </button>
+                        </div>
+
+                        <div className="space-y-2 pt-3 border-t border-white/10">
+                          <p className="text-xs uppercase tracking-wider text-white/60">Resolver por identificador</p>
+                          <div className="grid md:grid-cols-[220px_1fr_auto] gap-2">
+                            <select
+                              value={adminResolveKind}
+                              onChange={(e) => setAdminResolveKind(e.target.value)}
+                              className="rounded-md bg-[#0f1731] border border-white/15 text-white/90 px-3 py-2 text-sm"
+                            >
+                              <option value="evolution_instance">evolution_instance</option>
+                              <option value="evolution_number">evolution_number</option>
+                              <option value="domain">domain</option>
+                              <option value="api_key">api_key</option>
+                              <option value="custom">custom</option>
+                            </select>
+                            <input
+                              value={adminResolveValue}
+                              onChange={(e) => setAdminResolveValue(e.target.value)}
+                              placeholder="Valor"
+                              className="rounded-md bg-[#0f1731] border border-white/15 text-white/90 px-3 py-2 text-sm"
+                            />
+                            <button
+                              onClick={handleResolveTenant}
+                              disabled={isLoadingAdmin || !adminToken.trim()}
+                              className="px-4 py-2 rounded-lg bg-white/10 text-white text-xs uppercase tracking-wider disabled:opacity-50"
+                            >
+                              Resolver
+                            </button>
+                          </div>
+                          {adminResolveResult && <p className="text-xs text-white/80">{adminResolveResult}</p>}
+                        </div>
+                      </>
+                    )}
                   </div>
                 </div>
               </>
@@ -1664,6 +2229,12 @@ export default function App() {
             className="px-4 py-2 rounded-full glass label-micro text-white/60 hover:text-white hover:border-white/30 transition-all flex items-center gap-2"
           >
             <Calendar className="w-3 h-3 text-white/70" /> Historico
+          </button>
+          <button
+            onClick={() => setActiveSection('admin')}
+            className="px-4 py-2 rounded-full glass label-micro text-white/60 hover:text-white hover:border-white/30 transition-all flex items-center gap-2"
+          >
+            <Sparkles className="w-3 h-3 text-white/70" /> Admin
           </button>
         </div>
       </main>

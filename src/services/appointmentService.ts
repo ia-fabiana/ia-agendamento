@@ -93,6 +93,37 @@ type WebhookEventItem = {
   receivedAt?: string;
 };
 
+type AdminTenant = {
+  id?: number;
+  code: string;
+  name: string;
+  segment?: string;
+  active?: boolean;
+  defaultProvider?: string;
+  establishmentId?: number | null;
+  knowledge?: Record<string, unknown>;
+  createdAt?: string;
+  updatedAt?: string;
+};
+
+type AdminTenantIdentifier = {
+  id?: number;
+  kind: string;
+  value: string;
+  normalizedValue?: string;
+  createdAt?: string;
+  updatedAt?: string;
+};
+
+type AdminTenantProviderConfig = {
+  id?: number;
+  provider: string;
+  enabled: boolean;
+  config?: Record<string, unknown>;
+  createdAt?: string;
+  updatedAt?: string;
+};
+
 export class AppointmentService {
   private backendUrl: string;
   private establishmentId: string;
@@ -107,6 +138,39 @@ export class AppointmentService {
       throw new Error("VITE_BACKEND_URL nao configurado.");
     }
     return `${this.backendUrl}${path}`;
+  }
+
+  private async adminRequest<T>(path: string, token: string, init: RequestInit = {}): Promise<T> {
+    const normalizedToken = String(token || "").trim();
+    if (!normalizedToken) {
+      throw new Error("Informe o token admin para acessar o painel.");
+    }
+
+    const headers = new Headers(init.headers || {});
+    if (!headers.has("Content-Type") && init.method && init.method !== "GET") {
+      headers.set("Content-Type", "application/json");
+    }
+    headers.set("x-admin-token", normalizedToken);
+
+    const response = await fetch(this.getBackendEndpoint(path), {
+      ...init,
+      headers,
+    });
+
+    if (!response.ok) {
+      let message = `Falha na operacao admin (${response.status}).`;
+      try {
+        const payload = (await response.json()) as { message?: string };
+        if (payload?.message) {
+          message = payload.message;
+        }
+      } catch {
+        // Keep fallback message.
+      }
+      throw new Error(message);
+    }
+
+    return (await response.json()) as T;
   }
 
   async sendMessage(message: string, history: ChatHistoryItem[] = []) {
@@ -421,6 +485,109 @@ export class AppointmentService {
 
     const data = (await response.json()) as { data?: WebhookEventItem[] };
     return Array.isArray(data.data) ? data.data : [];
+  }
+
+  async getAdminTenants(adminToken: string, options: { withDetails?: boolean; includeInactive?: boolean } = {}) {
+    const params = new URLSearchParams();
+    if (options.withDetails) {
+      params.set("withDetails", "true");
+    }
+    if (options.includeInactive) {
+      params.set("includeInactive", "true");
+    }
+    const suffix = params.toString() ? `?${params.toString()}` : "";
+    const data = await this.adminRequest<{ data?: AdminTenant[] }>(`/api/admin/tenants${suffix}`, adminToken, {
+      method: "GET",
+    });
+    return Array.isArray(data.data) ? data.data : [];
+  }
+
+  async createAdminTenant(
+    adminToken: string,
+    payload: {
+      code?: string;
+      name: string;
+      segment?: string;
+      defaultProvider?: string;
+      establishmentId?: number;
+      active?: boolean;
+    },
+  ) {
+    return this.adminRequest<{
+      tenant?: AdminTenant;
+      identifiers?: AdminTenantIdentifier[];
+      providerConfigs?: AdminTenantProviderConfig[];
+    }>("/api/admin/tenants", adminToken, {
+      method: "POST",
+      body: JSON.stringify(payload),
+    });
+  }
+
+  async getAdminTenant(adminToken: string, code: string) {
+    return this.adminRequest<{
+      tenant?: AdminTenant;
+      identifiers?: AdminTenantIdentifier[];
+      providerConfigs?: AdminTenantProviderConfig[];
+    }>(`/api/admin/tenants/${encodeURIComponent(code)}`, adminToken, {
+      method: "GET",
+    });
+  }
+
+  async updateAdminTenant(
+    adminToken: string,
+    code: string,
+    payload: {
+      name?: string;
+      segment?: string;
+      defaultProvider?: string;
+      establishmentId?: number;
+      active?: boolean;
+    },
+  ) {
+    return this.adminRequest<{
+      tenant?: AdminTenant;
+      identifiers?: AdminTenantIdentifier[];
+      providerConfigs?: AdminTenantProviderConfig[];
+    }>(`/api/admin/tenants/${encodeURIComponent(code)}`, adminToken, {
+      method: "PUT",
+      body: JSON.stringify(payload),
+    });
+  }
+
+  async resolveAdminTenant(adminToken: string, kind: string, value: string) {
+    const params = new URLSearchParams({ kind, value });
+    return this.adminRequest<{ found?: boolean; tenant?: AdminTenant | null }>(
+      `/api/admin/tenants/resolve?${params.toString()}`,
+      adminToken,
+      { method: "GET" },
+    );
+  }
+
+  async addAdminTenantIdentifier(adminToken: string, code: string, kind: string, value: string) {
+    return this.adminRequest<{ identifiers?: AdminTenantIdentifier[] }>(
+      `/api/admin/tenants/${encodeURIComponent(code)}/identifiers`,
+      adminToken,
+      {
+        method: "POST",
+        body: JSON.stringify({ kind, value }),
+      },
+    );
+  }
+
+  async setAdminTenantProviderConfig(
+    adminToken: string,
+    code: string,
+    provider: string,
+    payload: { enabled?: boolean; config?: Record<string, unknown> },
+  ) {
+    return this.adminRequest<{ providerConfigs?: AdminTenantProviderConfig[] }>(
+      `/api/admin/tenants/${encodeURIComponent(code)}/providers/${encodeURIComponent(provider)}`,
+      adminToken,
+      {
+        method: "POST",
+        body: JSON.stringify(payload),
+      },
+    );
   }
 }
 
