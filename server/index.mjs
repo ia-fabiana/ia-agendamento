@@ -1069,6 +1069,75 @@ function resolveTenantByIdentifier({ kind, value }) {
   return mapTenantRow(row);
 }
 
+function getActiveTenantByEstablishmentId(establishmentId) {
+  const parsedId = Number(establishmentId);
+  if (!Number.isFinite(parsedId) || parsedId <= 0) {
+    return null;
+  }
+
+  const row = db.prepare(
+    `
+      SELECT id, code, name, segment, active, default_provider AS defaultProvider,
+             establishment_id AS establishmentId, knowledge_json AS knowledgeJson,
+             created_at AS createdAt, updated_at AS updatedAt
+      FROM tenants
+      WHERE active = 1
+        AND establishment_id = ?
+      ORDER BY datetime(updated_at) DESC, id DESC
+      LIMIT 1
+    `,
+  ).get(parsedId);
+
+  return mapTenantRow(row);
+}
+
+function resolveConversationTenantContext({
+  tenantCode = "",
+  tenantAlias = "",
+  instanceName = "",
+  establishmentId = null,
+} = {}) {
+  const normalizedTenantCode = normalizeTenantCode(tenantCode || tenantAlias);
+  let tenant = normalizedTenantCode ? getTenantByCode(normalizedTenantCode) : null;
+
+  if (tenant && !tenant.active) {
+    tenant = null;
+  }
+
+  const normalizedInstance = toNonEmptyString(instanceName);
+  if (!tenant && normalizedInstance) {
+    tenant = resolveTenantByIdentifier({
+      kind: "evolution_instance",
+      value: normalizedInstance,
+    });
+    if (tenant && !tenant.active) {
+      tenant = null;
+    }
+  }
+
+  const parsedEstablishmentId = Number(establishmentId);
+  if (!tenant && Number.isFinite(parsedEstablishmentId) && parsedEstablishmentId > 0) {
+    tenant = getActiveTenantByEstablishmentId(parsedEstablishmentId);
+  }
+
+  const resolvedEstablishmentId = Number.isFinite(parsedEstablishmentId) && parsedEstablishmentId > 0
+    ? parsedEstablishmentId
+    : (Number.isFinite(Number(tenant?.establishmentId)) && Number(tenant.establishmentId) > 0
+      ? Number(tenant.establishmentId)
+      : null);
+
+  const tenantKnowledge = tenant?.knowledge && typeof tenant.knowledge === "object" && !Array.isArray(tenant.knowledge)
+    ? tenant.knowledge
+    : null;
+
+  return {
+    tenant,
+    tenantCode: toNonEmptyString(tenant?.code) || normalizedTenantCode || "",
+    establishmentId: resolvedEstablishmentId,
+    knowledge: tenantKnowledge,
+  };
+}
+
 function getTenantIdentifiersByCode(code) {
   const tenant = getTenantByCode(code);
   if (!tenant) {
@@ -1817,14 +1886,19 @@ function cleanupPendingBookingConfirmations(now = Date.now()) {
 }
 
 function resolvePendingSessionKey(establishmentId, customerContext = {}, fallback = {}) {
+  const tenantCode = normalizeTenantCode(fallback?.tenantCode || "");
+  const scopePrefix = tenantCode
+    ? `${tenantCode}:${Number(establishmentId)}`
+    : String(Number(establishmentId));
+
   const phone = normalizePhone(customerContext?.phone || fallback.clientPhone || "");
   if (phone) {
-    return `${Number(establishmentId)}:phone:${phone}`;
+    return `${scopePrefix}:phone:${phone}`;
   }
 
   const name = normalizeForMatch(customerContext?.name || fallback.clientName || "").trim();
   if (name) {
-    return `${Number(establishmentId)}:name:${name}`;
+    return `${scopePrefix}:name:${name}`;
   }
 
   return "";
@@ -6382,8 +6456,17 @@ async function cancelAppointment({
   });
 }
 
-async function sendChatMessage({ establishmentId, message, history, customerContext }) {
-  const knowledge = loadSalonKnowledge();
+async function sendChatMessage({
+  establishmentId,
+  message,
+  history,
+  customerContext,
+  knowledge: scopedKnowledge = null,
+  tenantCode = "",
+}) {
+  const knowledge = scopedKnowledge && typeof scopedKnowledge === "object" && !Array.isArray(scopedKnowledge)
+    ? scopedKnowledge
+    : loadSalonKnowledge();
   const dateContext = getSaoPauloDateContext();
   const relativeDate = detectRelativeDateReference(message, dateContext);
   const knownClientName = clientFirstName(customerContext?.name);
@@ -6397,7 +6480,7 @@ async function sendChatMessage({ establishmentId, message, history, customerCont
   const asksProfessionals = /(profission|quem atende|cabeleireir)/.test(normalizedMessageForGate);
   const hasProfessionalHintInMessage = messageContainsProfessionalPreferenceHint(message);
   const hasProfessionalHintInHistory = historyHasProfessionalContext(history);
-  const pendingSessionKey = resolvePendingSessionKey(establishmentId, customerContext);
+  const pendingSessionKey = resolvePendingSessionKey(establishmentId, customerContext, { tenantCode });
   const pendingConfirmation = getPendingBookingConfirmation(pendingSessionKey);
   const finalizeChatResponse = (text) =>
     applyMarketingActionBeforeClosing({
@@ -6730,7 +6813,7 @@ async function sendChatMessage({ establishmentId, message, history, customerCont
           const sessionKey = resolvePendingSessionKey(
             establishmentId,
             customerContext,
-            { clientPhone: resolvedClientPhone, clientName: resolvedClientName },
+            { clientPhone: resolvedClientPhone, clientName: resolvedClientName, tenantCode },
           );
 
           if (!sessionKey) {
@@ -6832,8 +6915,46 @@ app.get("/api/health", (req, res) => {
 
 app.get("/api/knowledge", (req, res) => {
   try {
+    const principal = resolveAdminPrincipal(req);
+    const requestedTenantCode = toNonEmptyString(req.query?.tenantCode || req.query?.tenant || "");
+
+    if (principal?.role === "tenant") {
+      const tenant = getTenantByCode(principal.tenantCode);
+      if (!tenant) {
+        return res.status(404).json({
+          message: "Tenant da sessao nao encontrado.",
+        });
+      }
+      return res.json({
+        knowledge: tenant.knowledge || {},
+        scope: "tenant",
+        tenantCode: tenant.code,
+      });
+    }
+
+    if (requestedTenantCode) {
+      if (!principal || principal.role !== "superadmin") {
+        return res.status(401).json({
+          message: "Nao autorizado para consultar base de conhecimento de tenant.",
+        });
+      }
+
+      const tenant = getTenantByCode(requestedTenantCode);
+      if (!tenant) {
+        return res.status(404).json({
+          message: "Tenant nao encontrado.",
+        });
+      }
+
+      return res.json({
+        knowledge: tenant.knowledge || {},
+        scope: "tenant",
+        tenantCode: tenant.code,
+      });
+    }
+
     const knowledge = loadSalonKnowledge();
-    return res.json({ knowledge });
+    return res.json({ knowledge, scope: "global" });
   } catch (error) {
     return res.status(500).json({
       message: error.message || "Erro ao carregar base de conhecimento.",
@@ -6843,7 +6964,8 @@ app.get("/api/knowledge", (req, res) => {
 
 app.put("/api/knowledge", (req, res) => {
   try {
-    if (!isKnowledgeWriteAuthorized(req)) {
+    const principal = resolveAdminPrincipal(req);
+    if (!principal || !isKnowledgeWriteAuthorized(req)) {
       return res.status(401).json({
         message: "Nao autorizado para atualizar a base de conhecimento.",
       });
@@ -6856,8 +6978,29 @@ app.put("/api/knowledge", (req, res) => {
       });
     }
 
+    if (principal.role === "tenant") {
+      const tenant = updateTenantByCode(principal.tenantCode, { knowledge });
+      return res.json({
+        status: "ok",
+        scope: "tenant",
+        tenantCode: tenant.code,
+        knowledge: tenant.knowledge || {},
+      });
+    }
+
+    const requestedTenantCode = toNonEmptyString(req.body?.tenantCode || req.body?.tenant || req.query?.tenantCode || req.query?.tenant || "");
+    if (requestedTenantCode) {
+      const tenant = updateTenantByCode(requestedTenantCode, { knowledge });
+      return res.json({
+        status: "ok",
+        scope: "tenant",
+        tenantCode: tenant.code,
+        knowledge: tenant.knowledge || {},
+      });
+    }
+
     const saved = saveSalonKnowledge(knowledge);
-    return res.json({ status: "ok", knowledge: saved });
+    return res.json({ status: "ok", scope: "global", knowledge: saved });
   } catch (error) {
     return res.status(500).json({
       message: error.message || "Erro ao salvar base de conhecimento.",
@@ -8154,19 +8297,28 @@ app.post("/api/trinks/diagnostics/professionals-raw", async (req, res) => {
 
 app.post("/api/chat", async (req, res) => {
   try {
-    const { establishmentId, message, history, customerContext } = req.body || {};
+    const { establishmentId, message, history, customerContext, tenantCode, tenant, instance, instanceName } = req.body || {};
 
-    if (!establishmentId || !message) {
+    const context = resolveConversationTenantContext({
+      tenantCode,
+      tenantAlias: tenant,
+      instanceName: firstNonEmpty([instance, instanceName]),
+      establishmentId,
+    });
+
+    if (!context.establishmentId || !message) {
       return res.status(400).json({
         message: "Campos obrigatorios: establishmentId, message",
       });
     }
 
     const response = await sendChatMessage({
-      establishmentId: Number(establishmentId),
+      establishmentId: Number(context.establishmentId),
       message: String(message),
       history: Array.isArray(history) ? history : [],
       customerContext: customerContext && typeof customerContext === "object" ? customerContext : null,
+      knowledge: context.knowledge,
+      tenantCode: context.tenantCode,
     });
 
     const text = toNonEmptyString(response?.text || response);
@@ -8881,10 +9033,15 @@ app.post("/webhook/whatsapp", webhookBodyParser, async (req, res) => {
       });
     }
 
+    const conversationContext = resolveConversationTenantContext({
+      instanceName: incoming.instanceName,
+      establishmentId: getConfiguredEstablishmentId(),
+    });
+    const establishmentId = conversationContext.establishmentId;
+
     if (!incoming.messageText) {
       const messageEvent = isLikelyIncomingMessageEvent(incoming);
       if (messageEvent) {
-        const establishmentId = getConfiguredEstablishmentId();
         const knownClient = establishmentId
           ? await findExistingClientByPhone(establishmentId, incoming.senderNumber).catch(() => null)
           : null;
@@ -8983,7 +9140,6 @@ app.post("/webhook/whatsapp", webhookBodyParser, async (req, res) => {
       });
     }
 
-    const establishmentId = getConfiguredEstablishmentId();
     if (!establishmentId) {
       const configError = new Error(
         "Configure TRINKS_ESTABLISHMENT_ID (ou VITE_TRINKS_ESTABLISHMENT_ID) no backend para usar webhook WhatsApp.",
@@ -9172,6 +9328,8 @@ app.post("/webhook/whatsapp", webhookBodyParser, async (req, res) => {
         phone: incoming.senderNumber,
         fromTrinks: Boolean(knownClientName),
       },
+      knowledge: conversationContext.knowledge,
+      tenantCode: conversationContext.tenantCode,
     });
     const answer = toNonEmptyString(answerPayload?.text || answerPayload);
     const marketingMedia = answerPayload?.marketingMedia && typeof answerPayload.marketingMedia === "object"

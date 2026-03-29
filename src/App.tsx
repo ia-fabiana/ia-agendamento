@@ -272,12 +272,16 @@ export default function App() {
 
   useEffect(() => {
     appointmentService.current = new AppointmentService();
+  }, []);
 
+  useEffect(() => {
     const loadKnowledge = async () => {
       if (!appointmentService.current) return;
       setIsLoadingKnowledge(true);
       try {
-        const knowledge = await appointmentService.current.getKnowledge(adminToken);
+        const tenantScopeCode =
+          adminPrincipal?.role === 'superadmin' ? selectedAdminTenantCode.trim() : '';
+        const knowledge = await appointmentService.current.getKnowledge(adminToken, tenantScopeCode);
         setKnowledgeJson(JSON.stringify(knowledge, null, 2));
       } catch (error) {
         const message = error instanceof Error ? error.message : 'Erro ao carregar base de conhecimento.';
@@ -288,7 +292,7 @@ export default function App() {
     };
 
     loadKnowledge();
-  }, []);
+  }, [adminPrincipal?.role, adminToken, selectedAdminTenantCode]);
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -377,7 +381,9 @@ export default function App() {
 
     try {
       const parsed = safeParseKnowledge(knowledgeJson);
-      const saved = await appointmentService.current.saveKnowledge(parsed, adminToken);
+      const tenantScopeCode =
+        adminPrincipal?.role === 'superadmin' ? selectedAdminTenantCode.trim() : '';
+      const saved = await appointmentService.current.saveKnowledge(parsed, adminToken, tenantScopeCode);
       setKnowledgeJson(JSON.stringify(saved, null, 2));
       setKnowledgeStatus('Base de conhecimento salva com sucesso.');
     } catch (error) {

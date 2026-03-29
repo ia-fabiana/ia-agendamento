@@ -230,14 +230,20 @@ export class AppointmentService {
     return data.text as string;
   }
 
-  async getKnowledge(adminToken = "") {
+  async getKnowledge(adminToken = "", tenantCode = "") {
     const headers = new Headers({ "Content-Type": "application/json" });
     const normalizedToken = String(adminToken || "").trim();
+    const normalizedTenantCode = String(tenantCode || "").trim();
     if (normalizedToken) {
       headers.set("x-admin-token", normalizedToken);
     }
 
-    const response = await fetch(this.getBackendEndpoint("/api/knowledge"), {
+    const query = new URLSearchParams();
+    if (normalizedTenantCode) {
+      query.set("tenantCode", normalizedTenantCode);
+    }
+
+    const response = await fetch(this.getBackendEndpoint(`/api/knowledge${query.toString() ? `?${query.toString()}` : ""}`), {
       method: "GET",
       headers,
     });
@@ -250,9 +256,10 @@ export class AppointmentService {
     return data.knowledge || {};
   }
 
-  async saveKnowledge(knowledge: KnowledgePayload, adminToken = "") {
+  async saveKnowledge(knowledge: KnowledgePayload, adminToken = "", tenantCode = "") {
     const headers = new Headers({ "Content-Type": "application/json" });
     const normalizedToken = String(adminToken || "").trim();
+    const normalizedTenantCode = String(tenantCode || "").trim();
     if (normalizedToken) {
       headers.set("x-admin-token", normalizedToken);
     }
@@ -260,7 +267,10 @@ export class AppointmentService {
     const response = await fetch(this.getBackendEndpoint("/api/knowledge"), {
       method: "PUT",
       headers,
-      body: JSON.stringify({ knowledge }),
+      body: JSON.stringify({
+        knowledge,
+        ...(normalizedTenantCode ? { tenantCode: normalizedTenantCode } : {}),
+      }),
     });
 
     if (!response.ok) {
