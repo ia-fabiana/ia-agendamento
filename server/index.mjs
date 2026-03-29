@@ -1,4 +1,4 @@
-import express from "express";
+﻿import express from "express";
 import dotenv from "dotenv";
 import { GoogleGenAI, Type } from "@google/genai";
 import Database from "better-sqlite3";
@@ -2022,7 +2022,7 @@ function detectConfirmationIntent(message) {
   }
 
   if (
-    /\b(nao|não|negativo|melhor nao|melhor nao|cancelar|cancela|desmarcar|desmarca|mudar|trocar|corrigir)\b/.test(
+    /\b(nao|nÃ£o|negativo|melhor nao|melhor nao|cancelar|cancela|desmarcar|desmarca|mudar|trocar|corrigir)\b/.test(
       normalized,
     )
   ) {
@@ -2151,25 +2151,25 @@ function normalizeTrinksPhone(phone) {
   return normalizePhone(`${phone?.ddi || ""}${phone?.ddd || ""}${phone?.telefone || ""}${phone?.numero || ""}`);
 }
 
-// DecompÃµe um telefone brasileiro em { ddi, ddd, numero } para criaÃ§Ã£o de clientes na Trinks
+// DecompÃƒÂµe um telefone brasileiro em { ddi, ddd, numero } para criaÃƒÂ§ÃƒÂ£o de clientes na Trinks
 function parseBrazilianPhone(phone) {
   const digits = normalizePhone(phone);
   if (!digits) return null;
 
-  // Remove DDI 55 se presente no inÃ­cio (55 + 10 ou 11 dÃ­gitos = 12 ou 13 dÃ­gitos)
+  // Remove DDI 55 se presente no inÃƒÂ­cio (55 + 10 ou 11 dÃƒÂ­gitos = 12 ou 13 dÃƒÂ­gitos)
   let local = digits;
   if (local.length >= 12 && local.startsWith("55")) {
     local = local.slice(2);
   }
 
-  // Extrai DDD (2 dÃ­gitos) + nÃºmero (8 ou 9 dÃ­gitos)
+  // Extrai DDD (2 dÃƒÂ­gitos) + nÃƒÂºmero (8 ou 9 dÃƒÂ­gitos)
   if (local.length >= 10) {
     const ddd = local.slice(0, 2);
     const numero = local.slice(2);
     return { ddi: "55", ddd, numero };
   }
 
-  // Sem DDD reconhecÃ­vel â€” retorna sÃ³ o nÃºmero
+  // Sem DDD reconhecÃƒÂ­vel Ã¢â‚¬â€ retorna sÃƒÂ³ o nÃƒÂºmero
   return { ddi: "55", ddd: "", numero: local };
 }
 
@@ -2577,6 +2577,8 @@ function normalizeMarketingConfig(knowledge) {
       const id = toNonEmptyString(item.id) || `marketing_action_${index + 1}`;
       const name = toNonEmptyString(item.name) || `Acao ${index + 1}`;
       const message = toNonEmptyString(item.message || item.text || item.offer);
+      const mediaUrl = toNonEmptyString(item.mediaUrl || item.imageUrl || item.photoUrl);
+      const mediaCaption = toNonEmptyString(item.mediaCaption || item.caption);
       if (!message) {
         return null;
       }
@@ -2588,6 +2590,8 @@ function normalizeMarketingConfig(knowledge) {
         type: normalizeMarketingActionType(item.type),
         trigger: normalizeMarketingActionTrigger(item.trigger),
         message,
+        mediaUrl,
+        mediaCaption,
       };
     })
     .filter(Boolean);
@@ -2647,32 +2651,47 @@ function applyMarketingActionBeforeClosing({
 } = {}) {
   const replyText = toNonEmptyString(assistantReply);
   if (!replyText) {
-    return replyText;
+    return {
+      text: replyText,
+      marketingMedia: null,
+    };
   }
 
   const action = pickMarketingActionForStage(knowledge, "before_closing");
   if (!action) {
-    return replyText;
+    return {
+      text: replyText,
+      marketingMedia: null,
+    };
   }
 
   const customerWantsToClose = textSuggestsConversationClosing(customerMessage);
   const assistantIsClosing = textSuggestsConversationClosing(replyText);
   const shouldGateByClosingSignal = action.trigger !== "always";
   if (shouldGateByClosingSignal && !customerWantsToClose && !assistantIsClosing) {
-    return replyText;
+    return {
+      text: replyText,
+      marketingMedia: null,
+    };
   }
 
   const normalizedReply = normalizeForMatch(replyText);
   const normalizedOfferMessage = normalizeForMatch(action.message);
   if (normalizedOfferMessage && normalizedReply.includes(normalizedOfferMessage)) {
-    return replyText;
+    return {
+      text: replyText,
+      marketingMedia: null,
+    };
   }
 
   if (sessionKey) {
     cleanupMarketingActionSessions();
     const sentState = marketingActionSessions.get(sessionKey);
     if (sentState?.actionId === action.id) {
-      return replyText;
+      return {
+        text: replyText,
+        marketingMedia: null,
+      };
     }
 
     marketingActionSessions.set(sessionKey, {
@@ -2681,7 +2700,23 @@ function applyMarketingActionBeforeClosing({
     });
   }
 
-  return `Antes de finalizarmos: ${action.message}\n\n${replyText}`;
+  const hasMedia = Boolean(toNonEmptyString(action.mediaUrl));
+  if (hasMedia) {
+    return {
+      text: replyText,
+      marketingMedia: {
+        actionId: action.id,
+        actionName: action.name,
+        url: toNonEmptyString(action.mediaUrl),
+        caption: toNonEmptyString(action.mediaCaption || action.message),
+      },
+    };
+  }
+
+  return {
+    text: `Antes de finalizarmos: ${action.message}\n\n${replyText}`,
+    marketingMedia: null,
+  };
 }
 
 function formatKnowledgeForPrompt(knowledge) {
@@ -2713,7 +2748,7 @@ function formatKnowledgeForPrompt(knowledge) {
     ? marketing.actions
         .map(
           (item) =>
-            `- ${item.name} | tipo: ${item.type} | trigger: ${item.trigger} | ativo: ${item.enabled ? "sim" : "nao"} | oferta: ${item.message}`,
+            `- ${item.name} | tipo: ${item.type} | trigger: ${item.trigger} | ativo: ${item.enabled ? "sim" : "nao"} | oferta: ${item.message} | imagem: ${item.mediaUrl ? "sim" : "nao"}`,
         )
         .join("\n")
     : "- Sem acoes de marketing cadastradas";
@@ -2756,7 +2791,7 @@ Diretrizes:
 Fluxo:
 - Identifique o servico desejado.
 - Antes de sugerir horario, consulte disponibilidade real por profissional (checkAvailability).
-- Se a cliente nao tiver preferência de profissional e informar horario desejado, mostre todas as profissionais que executam o servico e estao livres naquele horario.
+- Se a cliente nao tiver preferÃªncia de profissional e informar horario desejado, mostre todas as profissionais que executam o servico e estao livres naquele horario.
 - Para agendar, use bookAppointment.
 - Antes de finalizar o agendamento, sempre valide disponibilidade e apresente um resumo completo para confirmacao explicita da cliente.
 - Se houver mais de um servico, monte todos os itens no campo appointments da ferramenta bookAppointment.
@@ -2765,7 +2800,7 @@ Fluxo:
 - Regra critica: se a cliente pedir alteracao ou cancelamento, nao use bookAppointment antes de concluir reschedule/cancel.
 - Para desmarcar, priorize pedir codigo de confirmacao (TRK). Se a cliente nao tiver codigo, tente localizar pelo telefone da cliente na base Trinks e prossiga com seguranca.
 - Quando a cliente perguntar nomes de profissionais, consulte a ferramenta listProfessionalsForDate e responda apenas com dados reais.
-- Ao receber preferência de profissional e/ou horario desejado, use checkAvailability com professionalName e preferredTime para trazer os horarios mais proximos possiveis.
+- Ao receber preferÃªncia de profissional e/ou horario desejado, use checkAvailability com professionalName e preferredTime para trazer os horarios mais proximos possiveis.
 - Se a profissional preferida nao estiver livre no horario desejado, primeiro mostre os horarios que ela tem no dia e depois pergunte: "Caso esses horarios nao sirvam para voce, quer saber a disponibilidade de outros profissionais?".
 
 Datas:
@@ -3310,8 +3345,8 @@ function buildConversationPrompt(history, message, knowledge, customerContext = 
     knownClientPhone
       ? `- Telefone da cliente (WhatsApp): ${knownClientPhone}.`
       : "- Telefone da cliente (WhatsApp): nao informado.",
-    "- Regra: pergunte sobre preferência de profissional somente quando a cliente estiver tentando agendar horario.",
-    "- Regra: se nao houver preferência de profissional e houver horario desejado, liste todas as profissionais disponiveis naquele horario.",
+    "- Regra: pergunte sobre preferÃªncia de profissional somente quando a cliente estiver tentando agendar horario.",
+    "- Regra: se nao houver preferÃªncia de profissional e houver horario desejado, liste todas as profissionais disponiveis naquele horario.",
     "- Regra: se a profissional preferida estiver indisponivel no horario pedido, primeiro mostre os horarios que ela tem no dia e so depois pergunte se a cliente quer disponibilidade de outros profissionais.",
     "- Regra: antes de efetivar qualquer agendamento, sempre apresente resumo completo e aguarde confirmacao explicita da cliente.",
     "- Regra: se o pedido atual for para cancelar ou alterar, nao abrir novo agendamento ate concluir o cancelamento/alteracao.",
@@ -4344,7 +4379,7 @@ function extractPreferredTimeFromMessage(message) {
   }
 
   const patterns = [
-    /(?:as|a|às)\s*(\d{1,2})(?::(\d{2}))?/i,
+    /(?:as|a|Ã s)\s*(\d{1,2})(?::(\d{2}))?/i,
     /\b(\d{1,2})h(?:\s*(\d{2}))?\b/i,
     /\b(\d{1,2}):(\d{2})\b/,
   ];
@@ -6250,6 +6285,60 @@ async function rescheduleAppointment({ establishmentId, confirmationCode, appoin
   throw failure;
 }
 
+function isLikelyHttpUrl(value) {
+  const raw = toNonEmptyString(value);
+  if (!raw) {
+    return false;
+  }
+  return /^https?:\/\/.+/i.test(raw);
+}
+
+async function sendEvolutionImageMessage({ instance, number, mediaUrl, caption = "" }) {
+  const normalizedInstance = toNonEmptyString(instance);
+  const normalizedNumber = normalizePhone(number);
+  const normalizedMediaUrl = toNonEmptyString(mediaUrl);
+  if (!normalizedInstance || !normalizedNumber || !normalizedMediaUrl) {
+    const error = new Error("Dados obrigatorios ausentes para envio de imagem.");
+    error.status = 400;
+    throw error;
+  }
+
+  if (!isLikelyHttpUrl(normalizedMediaUrl)) {
+    const error = new Error("URL da imagem invalida. Use URL http(s) publica.");
+    error.status = 400;
+    throw error;
+  }
+
+  const payloadCaption = toNonEmptyString(caption);
+  const attempts = [
+    {
+      path: `/message/sendMedia/${normalizedInstance}`,
+      method: "POST",
+      body: {
+        number: normalizedNumber,
+        mediatype: "image",
+        media: normalizedMediaUrl,
+        caption: payloadCaption,
+      },
+    },
+    {
+      path: `/message/sendImage/${normalizedInstance}`,
+      method: "POST",
+      body: {
+        number: normalizedNumber,
+        image: normalizedMediaUrl,
+        caption: payloadCaption,
+      },
+    },
+  ];
+
+  const result = await evolutionRequestWithFallback(attempts);
+  return {
+    payload: result.payload,
+    sourcePath: result.attempt?.path || "",
+  };
+}
+
 async function cancelAppointment({
   establishmentId,
   confirmationCode,
@@ -6316,6 +6405,13 @@ async function sendChatMessage({ establishmentId, message, history, customerCont
   const hasProfessionalHintInHistory = historyHasProfessionalContext(history);
   const pendingSessionKey = resolvePendingSessionKey(establishmentId, customerContext);
   const pendingConfirmation = getPendingBookingConfirmation(pendingSessionKey);
+  const finalizeChatResponse = (text) =>
+    applyMarketingActionBeforeClosing({
+      knowledge,
+      customerMessage: message,
+      assistantReply: text,
+      sessionKey: pendingSessionKey,
+    });
 
   if (pendingConfirmation) {
     const confirmationIntent = detectConfirmationIntent(message);
@@ -6340,11 +6436,11 @@ async function sendChatMessage({ establishmentId, message, history, customerCont
       });
 
       if (execution.successes.length && !execution.failures.length) {
-        return `Perfeito, agendamento confirmado com sucesso:\n${successLines.join("\n")}`;
+        return finalizeChatResponse(`Perfeito, agendamento confirmado com sucesso:\n${successLines.join("\n")}`);
       }
 
       if (execution.successes.length && execution.failures.length) {
-        return [
+        return finalizeChatResponse([
           "Consegui confirmar parte dos agendamentos.",
           "",
           "Confirmados:",
@@ -6352,15 +6448,15 @@ async function sendChatMessage({ establishmentId, message, history, customerCont
           "",
           "Nao confirmados:",
           failureLines.join("\n"),
-        ].join("\n");
+        ].join("\n"));
       }
 
-      return `Nao consegui confirmar os agendamentos solicitados:\n${failureLines.join("\n")}`;
+      return finalizeChatResponse(`Nao consegui confirmar os agendamentos solicitados:\n${failureLines.join("\n")}`);
     }
 
     if (confirmationIntent === "deny") {
       clearPendingBookingConfirmation(pendingSessionKey);
-      return "Perfeito, nao vou confirmar ainda. Me diga o que deseja ajustar (servico, profissional, data ou horario).";
+      return finalizeChatResponse("Perfeito, nao vou confirmar ainda. Me diga o que deseja ajustar (servico, profissional, data ou horario).");
     }
 
     const hasAdjustmentIntent =
@@ -6372,7 +6468,7 @@ async function sendChatMessage({ establishmentId, message, history, customerCont
     if (hasAdjustmentIntent) {
       clearPendingBookingConfirmation(pendingSessionKey);
     } else {
-      return `${buildBookingConfirmationMessage(pendingConfirmation.items)}\n\nSe quiser ajustar algo, me diga o que devo alterar.`;
+      return finalizeChatResponse(`${buildBookingConfirmationMessage(pendingConfirmation.items)}\n\nSe quiser ajustar algo, me diga o que devo alterar.`);
     }
 
   }
@@ -6386,7 +6482,7 @@ async function sendChatMessage({ establishmentId, message, history, customerCont
 
   if (shouldAskPreferenceFirst) {
     const salutation = knownClientName ? `Perfeito, ${knownClientName}. ` : "Perfeito. ";
-    return `${salutation}Antes de eu sugerir os horarios, voce tem preferência por alguma profissional?`;
+    return finalizeChatResponse(`${salutation}Antes de eu sugerir os horarios, voce tem preferÃªncia por alguma profissional?`);
   }
 
   if (shouldLookupProfessionalsDirectly(message)) {
@@ -6424,15 +6520,15 @@ async function sendChatMessage({ establishmentId, message, history, customerCont
     );
 
     if (!names.length) {
-      return `No momento, nao encontrei profissionais disponiveis para ${isoToBrDate(targetDate)}. Posso consultar outra data para voce.`;
+      return finalizeChatResponse(`No momento, nao encontrei profissionais disponiveis para ${isoToBrDate(targetDate)}. Posso consultar outra data para voce.`);
     }
 
-    return `Para ${isoToBrDate(targetDate)}, as profissionais disponiveis sao: ${names.join(", ")}.`;
+    return finalizeChatResponse(`Para ${isoToBrDate(targetDate)}, as profissionais disponiveis sao: ${names.join(", ")}.`);
   }
 
   const faqAnswer = findBestFaqAnswer(knowledge, message);
   if (faqAnswer && !hasSchedulingIntent) {
-    return faqAnswer;
+    return finalizeChatResponse(faqAnswer);
   }
 
   const ai = new GoogleGenAI({ apiKey: ensureEnv("GEMINI_API_KEY") });
@@ -6465,12 +6561,7 @@ async function sendChatMessage({ establishmentId, message, history, customerCont
         text = String(corrected.text || text);
       }
 
-      return applyMarketingActionBeforeClosing({
-        knowledge,
-        customerMessage: message,
-        assistantReply: text,
-        sessionKey: pendingSessionKey,
-      });
+      return finalizeChatResponse(text);
     }
 
     const results = [];
@@ -6736,13 +6827,9 @@ async function sendChatMessage({ establishmentId, message, history, customerCont
     });
   }
 
-  return applyMarketingActionBeforeClosing({
-    knowledge,
-    customerMessage: message,
-    assistantReply:
-      "Tive uma instabilidade momentanea aqui. Consegue repetir sua ultima mensagem para eu continuar seu atendimento?",
-    sessionKey: pendingSessionKey,
-  });
+  return finalizeChatResponse(
+    "Tive uma instabilidade momentanea aqui. Consegue repetir sua ultima mensagem para eu continuar seu atendimento?",
+  );
 }
 
 app.get("/api/health", (req, res) => {
@@ -8081,14 +8168,19 @@ app.post("/api/chat", async (req, res) => {
       });
     }
 
-    const text = await sendChatMessage({
+    const response = await sendChatMessage({
       establishmentId: Number(establishmentId),
       message: String(message),
       history: Array.isArray(history) ? history : [],
       customerContext: customerContext && typeof customerContext === "object" ? customerContext : null,
     });
 
-    return res.json({ text });
+    const text = toNonEmptyString(response?.text || response);
+    const marketingMedia = response?.marketingMedia && typeof response.marketingMedia === "object"
+      ? response.marketingMedia
+      : null;
+
+    return res.json({ text, marketingMedia });
   } catch (error) {
     return res.status(error.status || 500).json({
       message: error.message || "Erro ao processar conversa com a IA.",
@@ -9077,7 +9169,7 @@ app.post("/webhook/whatsapp", webhookBodyParser, async (req, res) => {
       }
     }
 
-    const answer = await sendChatMessage({
+    const answerPayload = await sendChatMessage({
       establishmentId,
       message: incoming.messageText,
       history: previousHistory,
@@ -9087,6 +9179,23 @@ app.post("/webhook/whatsapp", webhookBodyParser, async (req, res) => {
         fromTrinks: Boolean(knownClientName),
       },
     });
+    const answer = toNonEmptyString(answerPayload?.text || answerPayload);
+    const marketingMedia = answerPayload?.marketingMedia && typeof answerPayload.marketingMedia === "object"
+      ? answerPayload.marketingMedia
+      : null;
+
+    if (marketingMedia?.url) {
+      try {
+        await sendEvolutionImageMessage({
+          instance,
+          number: incoming.senderNumber,
+          mediaUrl: marketingMedia.url,
+          caption: toNonEmptyString(marketingMedia.caption),
+        });
+      } catch (mediaError) {
+        console.error("[marketing] failed to send media offer:", mediaError?.message || mediaError);
+      }
+    }
 
     await evolutionRequest(`/message/sendText/${instance}`, {
       method: "POST",
@@ -9108,6 +9217,15 @@ app.post("/webhook/whatsapp", webhookBodyParser, async (req, res) => {
       messageText: incoming.messageText,
       status: "processed",
       reason: "aiResponseSent",
+      details: marketingMedia?.url
+        ? {
+            marketingMedia: {
+              actionId: toNonEmptyString(marketingMedia.actionId),
+              actionName: toNonEmptyString(marketingMedia.actionName),
+              url: toNonEmptyString(marketingMedia.url),
+            },
+          }
+        : null,
     });
 
     return res.status(200).json({
@@ -9199,4 +9317,5 @@ app.use((error, req, res, next) => {
 app.listen(port, () => {
   console.log(`Backend online em http://localhost:${port}`);
 });
+
 

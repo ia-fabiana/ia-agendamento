@@ -2275,6 +2275,8 @@ export default function App() {
                               trigger: 'before_closing',
                               enabled: true,
                               message: '',
+                              mediaUrl: '',
+                              mediaCaption: '',
                             },
                           ],
                         };
@@ -2411,6 +2413,36 @@ export default function App() {
                           }
                           placeholder="Mensagem da acao (ex: Temos pacote de hidratacao com 15% hoje. Quer aproveitar?)"
                           className="w-full rounded-md bg-[#0f1731] border border-white/15 text-white/90 px-3 py-2 text-sm min-h-20"
+                        />
+
+                        <input
+                          value={toText(action?.mediaUrl)}
+                          onChange={(e) =>
+                            updateKnowledge((draft) => {
+                              const currentMarketing =
+                                draft.marketing && typeof draft.marketing === 'object' ? draft.marketing : {};
+                              const currentActions = Array.isArray(currentMarketing.actions) ? currentMarketing.actions : [];
+                              currentActions[idx] = { ...(currentActions[idx] || {}), mediaUrl: e.target.value };
+                              draft.marketing = { ...currentMarketing, actions: currentActions };
+                            })
+                          }
+                          placeholder="URL da imagem (opcional) - ex: https://.../oferta.jpg"
+                          className="w-full rounded-md bg-[#0f1731] border border-white/15 text-white/90 px-3 py-2 text-sm"
+                        />
+
+                        <input
+                          value={toText(action?.mediaCaption)}
+                          onChange={(e) =>
+                            updateKnowledge((draft) => {
+                              const currentMarketing =
+                                draft.marketing && typeof draft.marketing === 'object' ? draft.marketing : {};
+                              const currentActions = Array.isArray(currentMarketing.actions) ? currentMarketing.actions : [];
+                              currentActions[idx] = { ...(currentActions[idx] || {}), mediaCaption: e.target.value };
+                              draft.marketing = { ...currentMarketing, actions: currentActions };
+                            })
+                          }
+                          placeholder="Legenda da imagem (opcional, usa a mensagem da acao se vazio)"
+                          className="w-full rounded-md bg-[#0f1731] border border-white/15 text-white/90 px-3 py-2 text-sm"
                         />
 
                         <button
