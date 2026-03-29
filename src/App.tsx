@@ -277,7 +277,7 @@ export default function App() {
       if (!appointmentService.current) return;
       setIsLoadingKnowledge(true);
       try {
-        const knowledge = await appointmentService.current.getKnowledge();
+        const knowledge = await appointmentService.current.getKnowledge(adminToken);
         setKnowledgeJson(JSON.stringify(knowledge, null, 2));
       } catch (error) {
         const message = error instanceof Error ? error.message : 'Erro ao carregar base de conhecimento.';
@@ -377,7 +377,7 @@ export default function App() {
 
     try {
       const parsed = safeParseKnowledge(knowledgeJson);
-      const saved = await appointmentService.current.saveKnowledge(parsed);
+      const saved = await appointmentService.current.saveKnowledge(parsed, adminToken);
       setKnowledgeJson(JSON.stringify(saved, null, 2));
       setKnowledgeStatus('Base de conhecimento salva com sucesso.');
     } catch (error) {
@@ -2255,216 +2255,17 @@ export default function App() {
                 )}
                 {!faq.length && <p className="text-white/70 text-sm">Nenhum FAQ cadastrado. Clique em + FAQ.</p>}
 
-                <div className="flex items-center justify-between gap-3 flex-wrap pt-4">
-                  <h3 className="heading-bold text-base text-white">Acoes de Marketing</h3>
+                <div className="rounded-lg bg-white/5 border border-white/10 p-4">
+                  <p className="text-sm text-white/80">
+                    As acoes de Marketing (MKT) agora ficam na aba <span className="text-white font-semibold">Base de Conhecimento</span>.
+                  </p>
                   <button
-                    onClick={() =>
-                      updateKnowledge((draft) => {
-                        const currentMarketing =
-                          draft.marketing && typeof draft.marketing === 'object' ? draft.marketing : {};
-                        const currentActions = Array.isArray(currentMarketing.actions) ? currentMarketing.actions : [];
-                        const nextIndex = currentActions.length + 1;
-                        draft.marketing = {
-                          ...currentMarketing,
-                          actions: [
-                            ...currentActions,
-                            {
-                              id: `acao-${nextIndex}`,
-                              name: `Acao ${nextIndex}`,
-                              type: 'upsell',
-                              trigger: 'before_closing',
-                              enabled: true,
-                              message: '',
-                              mediaUrl: '',
-                              mediaCaption: '',
-                            },
-                          ],
-                        };
-                      })
-                    }
-                    className="px-3 py-2 rounded-lg bg-white/10 text-white text-xs uppercase tracking-wider"
+                    onClick={() => setActiveSection('knowledge')}
+                    className="mt-3 px-4 py-2 rounded-lg bg-brand-blue text-white text-xs uppercase tracking-wider"
                   >
-                    + Acao MKT
+                    Ir para Base
                   </button>
                 </div>
-
-                <label className="flex items-center gap-2 text-sm text-white/80">
-                  <input
-                    type="checkbox"
-                    checked={marketingEnabled}
-                    onChange={(e) =>
-                      updateKnowledge((draft) => {
-                        const currentMarketing =
-                          draft.marketing && typeof draft.marketing === 'object' ? draft.marketing : {};
-                        draft.marketing = {
-                          ...currentMarketing,
-                          enabled: e.target.checked,
-                          actions: Array.isArray(currentMarketing.actions) ? currentMarketing.actions : [],
-                        };
-                      })
-                    }
-                  />
-                  Habilitar ambiente de marketing
-                </label>
-
-                {!marketingActions.length && (
-                  <p className="text-white/70 text-sm">
-                    Nenhuma acao cadastrada. Adicione uma acao de upsell/cross-sell para enviar no fechamento.
-                  </p>
-                )}
-                {marketingActions.length > 0 && (
-                  <div className="space-y-3">
-                    {marketingActions.map((action: any, idx: number) => (
-                      <div key={`marketing-action-${idx}`} className="rounded-lg bg-white/5 border border-white/10 p-3 space-y-2">
-                        <div className="grid md:grid-cols-2 gap-2">
-                          <input
-                            value={toText(action?.name)}
-                            onChange={(e) =>
-                              updateKnowledge((draft) => {
-                                const currentMarketing =
-                                  draft.marketing && typeof draft.marketing === 'object' ? draft.marketing : {};
-                                const currentActions = Array.isArray(currentMarketing.actions) ? currentMarketing.actions : [];
-                                currentActions[idx] = { ...(currentActions[idx] || {}), name: e.target.value };
-                                draft.marketing = { ...currentMarketing, actions: currentActions };
-                              })
-                            }
-                            placeholder="Nome da acao"
-                            className="rounded-md bg-[#0f1731] border border-white/15 text-white/90 px-3 py-2 text-sm"
-                          />
-                          <input
-                            value={toText(action?.id)}
-                            onChange={(e) =>
-                              updateKnowledge((draft) => {
-                                const currentMarketing =
-                                  draft.marketing && typeof draft.marketing === 'object' ? draft.marketing : {};
-                                const currentActions = Array.isArray(currentMarketing.actions) ? currentMarketing.actions : [];
-                                currentActions[idx] = { ...(currentActions[idx] || {}), id: e.target.value };
-                                draft.marketing = { ...currentMarketing, actions: currentActions };
-                              })
-                            }
-                            placeholder="ID da acao"
-                            className="rounded-md bg-[#0f1731] border border-white/15 text-white/90 px-3 py-2 text-sm"
-                          />
-                        </div>
-
-                        <div className="grid md:grid-cols-2 gap-2">
-                          <select
-                            value={toText(action?.type) || 'upsell'}
-                            onChange={(e) =>
-                              updateKnowledge((draft) => {
-                                const currentMarketing =
-                                  draft.marketing && typeof draft.marketing === 'object' ? draft.marketing : {};
-                                const currentActions = Array.isArray(currentMarketing.actions) ? currentMarketing.actions : [];
-                                currentActions[idx] = { ...(currentActions[idx] || {}), type: e.target.value };
-                                draft.marketing = { ...currentMarketing, actions: currentActions };
-                              })
-                            }
-                            className="rounded-md bg-[#0f1731] border border-white/15 text-white/90 px-3 py-2 text-sm"
-                          >
-                            <option value="upsell">upsell</option>
-                            <option value="cross_sell">cross_sell</option>
-                            <option value="custom">custom</option>
-                          </select>
-                          <select
-                            value={toText(action?.trigger) || 'before_closing'}
-                            onChange={(e) =>
-                              updateKnowledge((draft) => {
-                                const currentMarketing =
-                                  draft.marketing && typeof draft.marketing === 'object' ? draft.marketing : {};
-                                const currentActions = Array.isArray(currentMarketing.actions) ? currentMarketing.actions : [];
-                                currentActions[idx] = { ...(currentActions[idx] || {}), trigger: e.target.value };
-                                draft.marketing = { ...currentMarketing, actions: currentActions };
-                              })
-                            }
-                            className="rounded-md bg-[#0f1731] border border-white/15 text-white/90 px-3 py-2 text-sm"
-                          >
-                            <option value="before_closing">before_closing (encerrar atendimento)</option>
-                            <option value="always">always (todas respostas)</option>
-                          </select>
-                        </div>
-
-                        <label className="flex items-center gap-2 text-sm text-white/80">
-                          <input
-                            type="checkbox"
-                            checked={action?.enabled !== false}
-                            onChange={(e) =>
-                              updateKnowledge((draft) => {
-                                const currentMarketing =
-                                  draft.marketing && typeof draft.marketing === 'object' ? draft.marketing : {};
-                                const currentActions = Array.isArray(currentMarketing.actions) ? currentMarketing.actions : [];
-                                currentActions[idx] = { ...(currentActions[idx] || {}), enabled: e.target.checked };
-                                draft.marketing = { ...currentMarketing, actions: currentActions };
-                              })
-                            }
-                          />
-                          Acao habilitada
-                        </label>
-
-                        <textarea
-                          value={toText(action?.message)}
-                          onChange={(e) =>
-                            updateKnowledge((draft) => {
-                              const currentMarketing =
-                                draft.marketing && typeof draft.marketing === 'object' ? draft.marketing : {};
-                              const currentActions = Array.isArray(currentMarketing.actions) ? currentMarketing.actions : [];
-                              currentActions[idx] = { ...(currentActions[idx] || {}), message: e.target.value };
-                              draft.marketing = { ...currentMarketing, actions: currentActions };
-                            })
-                          }
-                          placeholder="Mensagem da acao (ex: Temos pacote de hidratacao com 15% hoje. Quer aproveitar?)"
-                          className="w-full rounded-md bg-[#0f1731] border border-white/15 text-white/90 px-3 py-2 text-sm min-h-20"
-                        />
-
-                        <input
-                          value={toText(action?.mediaUrl)}
-                          onChange={(e) =>
-                            updateKnowledge((draft) => {
-                              const currentMarketing =
-                                draft.marketing && typeof draft.marketing === 'object' ? draft.marketing : {};
-                              const currentActions = Array.isArray(currentMarketing.actions) ? currentMarketing.actions : [];
-                              currentActions[idx] = { ...(currentActions[idx] || {}), mediaUrl: e.target.value };
-                              draft.marketing = { ...currentMarketing, actions: currentActions };
-                            })
-                          }
-                          placeholder="URL da imagem (opcional) - ex: https://.../oferta.jpg"
-                          className="w-full rounded-md bg-[#0f1731] border border-white/15 text-white/90 px-3 py-2 text-sm"
-                        />
-
-                        <input
-                          value={toText(action?.mediaCaption)}
-                          onChange={(e) =>
-                            updateKnowledge((draft) => {
-                              const currentMarketing =
-                                draft.marketing && typeof draft.marketing === 'object' ? draft.marketing : {};
-                              const currentActions = Array.isArray(currentMarketing.actions) ? currentMarketing.actions : [];
-                              currentActions[idx] = { ...(currentActions[idx] || {}), mediaCaption: e.target.value };
-                              draft.marketing = { ...currentMarketing, actions: currentActions };
-                            })
-                          }
-                          placeholder="Legenda da imagem (opcional, usa a mensagem da acao se vazio)"
-                          className="w-full rounded-md bg-[#0f1731] border border-white/15 text-white/90 px-3 py-2 text-sm"
-                        />
-
-                        <button
-                          onClick={() =>
-                            updateKnowledge((draft) => {
-                              const currentMarketing =
-                                draft.marketing && typeof draft.marketing === 'object' ? draft.marketing : {};
-                              const currentActions = Array.isArray(currentMarketing.actions) ? currentMarketing.actions : [];
-                              draft.marketing = {
-                                ...currentMarketing,
-                                actions: currentActions.filter((_: any, currentIdx: number) => currentIdx !== idx),
-                              };
-                            })
-                          }
-                          className="text-xs text-red-300 hover:text-red-200"
-                        >
-                          Remover acao
-                        </button>
-                      </div>
-                    ))}
-                  </div>
-                )}
               </>
             )}
 
@@ -2719,6 +2520,217 @@ export default function App() {
                   </div>
                 )}
                 {!faq.length && <p className="text-white/70 text-sm">Nenhum FAQ cadastrado. Clique em + FAQ.</p>}
+
+                <div className="flex items-center justify-between gap-3 flex-wrap pt-4">
+                  <h3 className="heading-bold text-base text-white">Acoes de Marketing</h3>
+                  <button
+                    onClick={() =>
+                      updateKnowledge((draft) => {
+                        const currentMarketing =
+                          draft.marketing && typeof draft.marketing === 'object' ? draft.marketing : {};
+                        const currentActions = Array.isArray(currentMarketing.actions) ? currentMarketing.actions : [];
+                        const nextIndex = currentActions.length + 1;
+                        draft.marketing = {
+                          ...currentMarketing,
+                          actions: [
+                            ...currentActions,
+                            {
+                              id: `acao-${nextIndex}`,
+                              name: `Acao ${nextIndex}`,
+                              type: 'upsell',
+                              trigger: 'before_closing',
+                              enabled: true,
+                              message: '',
+                              mediaUrl: '',
+                              mediaCaption: '',
+                            },
+                          ],
+                        };
+                      })
+                    }
+                    className="px-3 py-2 rounded-lg bg-white/10 text-white text-xs uppercase tracking-wider"
+                  >
+                    + Acao MKT
+                  </button>
+                </div>
+
+                <label className="flex items-center gap-2 text-sm text-white/80">
+                  <input
+                    type="checkbox"
+                    checked={marketingEnabled}
+                    onChange={(e) =>
+                      updateKnowledge((draft) => {
+                        const currentMarketing =
+                          draft.marketing && typeof draft.marketing === 'object' ? draft.marketing : {};
+                        draft.marketing = {
+                          ...currentMarketing,
+                          enabled: e.target.checked,
+                          actions: Array.isArray(currentMarketing.actions) ? currentMarketing.actions : [],
+                        };
+                      })
+                    }
+                  />
+                  Habilitar ambiente de marketing
+                </label>
+
+                {!marketingActions.length && (
+                  <p className="text-white/70 text-sm">
+                    Nenhuma acao cadastrada. Adicione uma acao de upsell/cross-sell para enviar no fechamento.
+                  </p>
+                )}
+                {marketingActions.length > 0 && (
+                  <div className="space-y-3">
+                    {marketingActions.map((action: any, idx: number) => (
+                      <div key={`marketing-action-${idx}`} className="rounded-lg bg-white/5 border border-white/10 p-3 space-y-2">
+                        <div className="grid md:grid-cols-2 gap-2">
+                          <input
+                            value={toText(action?.name)}
+                            onChange={(e) =>
+                              updateKnowledge((draft) => {
+                                const currentMarketing =
+                                  draft.marketing && typeof draft.marketing === 'object' ? draft.marketing : {};
+                                const currentActions = Array.isArray(currentMarketing.actions) ? currentMarketing.actions : [];
+                                currentActions[idx] = { ...(currentActions[idx] || {}), name: e.target.value };
+                                draft.marketing = { ...currentMarketing, actions: currentActions };
+                              })
+                            }
+                            placeholder="Nome da acao"
+                            className="rounded-md bg-[#0f1731] border border-white/15 text-white/90 px-3 py-2 text-sm"
+                          />
+                          <input
+                            value={toText(action?.id)}
+                            onChange={(e) =>
+                              updateKnowledge((draft) => {
+                                const currentMarketing =
+                                  draft.marketing && typeof draft.marketing === 'object' ? draft.marketing : {};
+                                const currentActions = Array.isArray(currentMarketing.actions) ? currentMarketing.actions : [];
+                                currentActions[idx] = { ...(currentActions[idx] || {}), id: e.target.value };
+                                draft.marketing = { ...currentMarketing, actions: currentActions };
+                              })
+                            }
+                            placeholder="ID da acao"
+                            className="rounded-md bg-[#0f1731] border border-white/15 text-white/90 px-3 py-2 text-sm"
+                          />
+                        </div>
+
+                        <div className="grid md:grid-cols-2 gap-2">
+                          <select
+                            value={toText(action?.type) || 'upsell'}
+                            onChange={(e) =>
+                              updateKnowledge((draft) => {
+                                const currentMarketing =
+                                  draft.marketing && typeof draft.marketing === 'object' ? draft.marketing : {};
+                                const currentActions = Array.isArray(currentMarketing.actions) ? currentMarketing.actions : [];
+                                currentActions[idx] = { ...(currentActions[idx] || {}), type: e.target.value };
+                                draft.marketing = { ...currentMarketing, actions: currentActions };
+                              })
+                            }
+                            className="rounded-md bg-[#0f1731] border border-white/15 text-white/90 px-3 py-2 text-sm"
+                          >
+                            <option value="upsell">upsell</option>
+                            <option value="cross_sell">cross_sell</option>
+                            <option value="custom">custom</option>
+                          </select>
+                          <select
+                            value={toText(action?.trigger) || 'before_closing'}
+                            onChange={(e) =>
+                              updateKnowledge((draft) => {
+                                const currentMarketing =
+                                  draft.marketing && typeof draft.marketing === 'object' ? draft.marketing : {};
+                                const currentActions = Array.isArray(currentMarketing.actions) ? currentMarketing.actions : [];
+                                currentActions[idx] = { ...(currentActions[idx] || {}), trigger: e.target.value };
+                                draft.marketing = { ...currentMarketing, actions: currentActions };
+                              })
+                            }
+                            className="rounded-md bg-[#0f1731] border border-white/15 text-white/90 px-3 py-2 text-sm"
+                          >
+                            <option value="before_closing">before_closing (encerrar atendimento)</option>
+                            <option value="always">always (todas respostas)</option>
+                          </select>
+                        </div>
+
+                        <label className="flex items-center gap-2 text-sm text-white/80">
+                          <input
+                            type="checkbox"
+                            checked={action?.enabled !== false}
+                            onChange={(e) =>
+                              updateKnowledge((draft) => {
+                                const currentMarketing =
+                                  draft.marketing && typeof draft.marketing === 'object' ? draft.marketing : {};
+                                const currentActions = Array.isArray(currentMarketing.actions) ? currentMarketing.actions : [];
+                                currentActions[idx] = { ...(currentActions[idx] || {}), enabled: e.target.checked };
+                                draft.marketing = { ...currentMarketing, actions: currentActions };
+                              })
+                            }
+                          />
+                          Acao habilitada
+                        </label>
+
+                        <textarea
+                          value={toText(action?.message)}
+                          onChange={(e) =>
+                            updateKnowledge((draft) => {
+                              const currentMarketing =
+                                draft.marketing && typeof draft.marketing === 'object' ? draft.marketing : {};
+                              const currentActions = Array.isArray(currentMarketing.actions) ? currentMarketing.actions : [];
+                              currentActions[idx] = { ...(currentActions[idx] || {}), message: e.target.value };
+                              draft.marketing = { ...currentMarketing, actions: currentActions };
+                            })
+                          }
+                          placeholder="Mensagem da acao (ex: Temos pacote de hidratacao com 15% hoje. Quer aproveitar?)"
+                          className="w-full rounded-md bg-[#0f1731] border border-white/15 text-white/90 px-3 py-2 text-sm min-h-20"
+                        />
+
+                        <input
+                          value={toText(action?.mediaUrl)}
+                          onChange={(e) =>
+                            updateKnowledge((draft) => {
+                              const currentMarketing =
+                                draft.marketing && typeof draft.marketing === 'object' ? draft.marketing : {};
+                              const currentActions = Array.isArray(currentMarketing.actions) ? currentMarketing.actions : [];
+                              currentActions[idx] = { ...(currentActions[idx] || {}), mediaUrl: e.target.value };
+                              draft.marketing = { ...currentMarketing, actions: currentActions };
+                            })
+                          }
+                          placeholder="URL da imagem (opcional) - ex: https://.../oferta.jpg"
+                          className="w-full rounded-md bg-[#0f1731] border border-white/15 text-white/90 px-3 py-2 text-sm"
+                        />
+
+                        <input
+                          value={toText(action?.mediaCaption)}
+                          onChange={(e) =>
+                            updateKnowledge((draft) => {
+                              const currentMarketing =
+                                draft.marketing && typeof draft.marketing === 'object' ? draft.marketing : {};
+                              const currentActions = Array.isArray(currentMarketing.actions) ? currentMarketing.actions : [];
+                              currentActions[idx] = { ...(currentActions[idx] || {}), mediaCaption: e.target.value };
+                              draft.marketing = { ...currentMarketing, actions: currentActions };
+                            })
+                          }
+                          placeholder="Legenda da imagem (opcional, usa a mensagem da acao se vazio)"
+                          className="w-full rounded-md bg-[#0f1731] border border-white/15 text-white/90 px-3 py-2 text-sm"
+                        />
+
+                        <button
+                          onClick={() =>
+                            updateKnowledge((draft) => {
+                              const currentMarketing =
+                                draft.marketing && typeof draft.marketing === 'object' ? draft.marketing : {};
+                              const currentActions = Array.isArray(currentMarketing.actions) ? currentMarketing.actions : [];
+                              draft.marketing = {
+                                ...currentMarketing,
+                                actions: currentActions.filter((_: any, currentIdx: number) => currentIdx !== idx),
+                              };
+                            })
+                          }
+                          className="text-xs text-red-300 hover:text-red-200"
+                        >
+                          Remover acao
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                )}
               </>
             )}
 

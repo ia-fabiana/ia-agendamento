@@ -230,10 +230,16 @@ export class AppointmentService {
     return data.text as string;
   }
 
-  async getKnowledge() {
+  async getKnowledge(adminToken = "") {
+    const headers = new Headers({ "Content-Type": "application/json" });
+    const normalizedToken = String(adminToken || "").trim();
+    if (normalizedToken) {
+      headers.set("x-admin-token", normalizedToken);
+    }
+
     const response = await fetch(this.getBackendEndpoint("/api/knowledge"), {
       method: "GET",
-      headers: { "Content-Type": "application/json" },
+      headers,
     });
 
     if (!response.ok) {
@@ -244,10 +250,16 @@ export class AppointmentService {
     return data.knowledge || {};
   }
 
-  async saveKnowledge(knowledge: KnowledgePayload) {
+  async saveKnowledge(knowledge: KnowledgePayload, adminToken = "") {
+    const headers = new Headers({ "Content-Type": "application/json" });
+    const normalizedToken = String(adminToken || "").trim();
+    if (normalizedToken) {
+      headers.set("x-admin-token", normalizedToken);
+    }
+
     const response = await fetch(this.getBackendEndpoint("/api/knowledge"), {
       method: "PUT",
-      headers: { "Content-Type": "application/json" },
+      headers,
       body: JSON.stringify({ knowledge }),
     });
 

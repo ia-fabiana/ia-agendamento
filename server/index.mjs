@@ -399,13 +399,7 @@ function ensureEnv(name) {
 }
 
 function isKnowledgeWriteAuthorized(req) {
-  const requiredToken = String(process.env.KNOWLEDGE_ADMIN_TOKEN || "").trim();
-  if (!requiredToken) {
-    return true;
-  }
-
-  const provided = String(req.headers["x-admin-token"] || "").trim();
-  return provided && provided === requiredToken;
+  return Boolean(resolveAdminPrincipal(req));
 }
 
 function getConfiguredEstablishmentId() {
