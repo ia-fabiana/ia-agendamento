@@ -124,6 +124,29 @@ type AdminTenantProviderConfig = {
   updatedAt?: string;
 };
 
+type AdminTenantUser = {
+  id?: number;
+  tenantId?: number;
+  tenantCode?: string;
+  tenantName?: string;
+  username: string;
+  displayName?: string;
+  active?: boolean;
+  lastLoginAt?: string;
+  createdAt?: string;
+  updatedAt?: string;
+};
+
+type AdminPrincipal = {
+  role: "superadmin" | "tenant";
+  tokenType?: string;
+  tenantCode?: string;
+  tenantName?: string;
+  username?: string;
+  displayName?: string;
+  expiresAt?: string;
+};
+
 export class AppointmentService {
   private backendUrl: string;
   private establishmentId: string;
@@ -528,6 +551,7 @@ export class AppointmentService {
       tenant?: AdminTenant;
       identifiers?: AdminTenantIdentifier[];
       providerConfigs?: AdminTenantProviderConfig[];
+      users?: AdminTenantUser[];
     }>(`/api/admin/tenants/${encodeURIComponent(code)}`, adminToken, {
       method: "GET",
     });
@@ -585,6 +609,81 @@ export class AppointmentService {
       adminToken,
       {
         method: "POST",
+        body: JSON.stringify(payload),
+      },
+    );
+  }
+
+  async loginAdminTenantUser(payload: { tenantCode: string; username: string; password: string }) {
+    const response = await fetch(this.getBackendEndpoint("/api/admin/auth/login"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+
+    if (!response.ok) {
+      let message = `Falha no login do tenant (${response.status}).`;
+      try {
+        const data = (await response.json()) as { message?: string };
+        if (data?.message) {
+          message = data.message;
+        }
+      } catch {
+        // Keep fallback message.
+      }
+      throw new Error(message);
+    }
+
+    return (await response.json()) as { token?: string; expiresAt?: string; principal?: AdminPrincipal };
+  }
+
+  async getAdminSession(adminToken: string) {
+    return this.adminRequest<{ principal?: AdminPrincipal }>("/api/admin/auth/me", adminToken, {
+      method: "GET",
+    });
+  }
+
+  async logoutAdminSession(adminToken: string, allDevices = false) {
+    return this.adminRequest<{ status?: string }>("/api/admin/auth/logout", adminToken, {
+      method: "POST",
+      body: JSON.stringify({ allDevices }),
+    });
+  }
+
+  async getAdminTenantUsers(adminToken: string, code: string) {
+    return this.adminRequest<{ users?: AdminTenantUser[] }>(
+      `/api/admin/tenants/${encodeURIComponent(code)}/users`,
+      adminToken,
+      { method: "GET" },
+    );
+  }
+
+  async createAdminTenantUser(
+    adminToken: string,
+    code: string,
+    payload: { username: string; displayName?: string; password: string; active?: boolean },
+  ) {
+    return this.adminRequest<{ users?: AdminTenantUser[] }>(
+      `/api/admin/tenants/${encodeURIComponent(code)}/users`,
+      adminToken,
+      {
+        method: "POST",
+        body: JSON.stringify(payload),
+      },
+    );
+  }
+
+  async updateAdminTenantUser(
+    adminToken: string,
+    code: string,
+    userId: number,
+    payload: { displayName?: string; password?: string; active?: boolean },
+  ) {
+    return this.adminRequest<{ users?: AdminTenantUser[] }>(
+      `/api/admin/tenants/${encodeURIComponent(code)}/users/${encodeURIComponent(String(userId))}`,
+      adminToken,
+      {
+        method: "PUT",
         body: JSON.stringify(payload),
       },
     );

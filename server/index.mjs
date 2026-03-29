@@ -5,6 +5,7 @@ import Database from "better-sqlite3";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import crypto from "node:crypto";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -25,6 +26,8 @@ const BOOKING_SEQUENCE_GAP_MS = Math.max(0, Number(process.env.BOOKING_SEQUENCE_
 const TRINKS_STATUS_ID_CANCELLED = Math.max(1, Number(process.env.TRINKS_STATUS_ID_CANCELLED || 9));
 const SCHEDULING_PROVIDER_TRINKS = "trinks";
 const SCHEDULING_PROVIDER_GOOGLE_CALENDAR = "google_calendar";
+const TENANT_SESSION_TTL_HOURS = Math.max(1, Number(process.env.TENANT_SESSION_TTL_HOURS || 24));
+const TENANT_MIN_PASSWORD_LENGTH = Math.max(8, Number(process.env.TENANT_MIN_PASSWORD_LENGTH || 8));
 const UNSUPPORTED_MESSAGE_REPLY =
   toNonEmptyString(process.env.WHATSAPP_UNSUPPORTED_MESSAGE_REPLY) ||
   "Recebi sua mensagem, mas no momento consigo ler apenas texto. Pode me escrever por texto, por favor?";
@@ -160,6 +163,40 @@ function initDatabase() {
 
     CREATE INDEX IF NOT EXISTS idx_tenant_provider_configs_tenant
       ON tenant_provider_configs(tenant_id);
+
+    CREATE TABLE IF NOT EXISTS tenant_users (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      tenant_id INTEGER NOT NULL,
+      username TEXT NOT NULL,
+      display_name TEXT DEFAULT '',
+      password_hash TEXT NOT NULL,
+      active INTEGER NOT NULL DEFAULT 1,
+      last_login_at TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      UNIQUE(tenant_id, username),
+      FOREIGN KEY(tenant_id) REFERENCES tenants(id) ON DELETE CASCADE
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_tenant_users_tenant
+      ON tenant_users(tenant_id);
+
+    CREATE TABLE IF NOT EXISTS tenant_user_sessions (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      tenant_user_id INTEGER NOT NULL,
+      token_hash TEXT NOT NULL UNIQUE,
+      expires_at TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      last_seen_at TEXT,
+      FOREIGN KEY(tenant_user_id) REFERENCES tenant_users(id) ON DELETE CASCADE
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_tenant_user_sessions_user
+      ON tenant_user_sessions(tenant_user_id);
+
+    CREATE INDEX IF NOT EXISTS idx_tenant_user_sessions_expires_at
+      ON tenant_user_sessions(expires_at);
   `);
 
   return database;
@@ -413,8 +450,473 @@ function firstNonEmpty(values) {
   return "";
 }
 
+function getConfiguredAdminToken() {
+  return String(process.env.KNOWLEDGE_ADMIN_TOKEN || "").trim();
+}
+
+function getAdminTokenFromRequest(req) {
+  return toNonEmptyString(req?.headers?.["x-admin-token"] || "");
+}
+
+function normalizeTenantUsername(value) {
+  const normalized = toNonEmptyString(value)
+    .toLowerCase()
+    .replace(/[^a-z0-9._-]/g, "");
+  return normalized.slice(0, 64);
+}
+
+function hashSha256(value) {
+  return crypto.createHash("sha256").update(String(value || "")).digest("hex");
+}
+
+function hashTenantPassword(password, salt = "") {
+  const normalizedPassword = String(password || "");
+  const effectiveSalt = toNonEmptyString(salt) || crypto.randomBytes(16).toString("hex");
+  const digest = crypto.scryptSync(normalizedPassword, effectiveSalt, 64).toString("hex");
+  return `${effectiveSalt}:${digest}`;
+}
+
+function verifyTenantPassword(password, storedHash) {
+  const rawHash = toNonEmptyString(storedHash);
+  const [salt, expectedHex] = rawHash.split(":");
+  if (!salt || !expectedHex) {
+    return false;
+  }
+
+  try {
+    const expected = Buffer.from(expectedHex, "hex");
+    const actual = crypto.scryptSync(String(password || ""), salt, 64);
+    if (!expected.length || expected.length !== actual.length) {
+      return false;
+    }
+    return crypto.timingSafeEqual(expected, actual);
+  } catch {
+    return false;
+  }
+}
+
+function cleanupExpiredTenantUserSessions() {
+  db.prepare(
+    `
+      DELETE FROM tenant_user_sessions
+      WHERE datetime(expires_at) <= datetime('now')
+    `,
+  ).run();
+}
+
+function isIsoDateExpired(isoDate) {
+  const timestamp = Date.parse(String(isoDate || ""));
+  if (!Number.isFinite(timestamp)) {
+    return true;
+  }
+  return timestamp <= Date.now();
+}
+
+function mapTenantUserRow(row) {
+  if (!row) {
+    return null;
+  }
+
+  return {
+    id: Number(row.id),
+    tenantId: Number(row.tenantId),
+    tenantCode: toNonEmptyString(row.tenantCode),
+    tenantName: toNonEmptyString(row.tenantName),
+    username: toNonEmptyString(row.username),
+    displayName: toNonEmptyString(row.displayName),
+    active: Number(row.active) !== 0,
+    lastLoginAt: toNonEmptyString(row.lastLoginAt),
+    createdAt: toNonEmptyString(row.createdAt),
+    updatedAt: toNonEmptyString(row.updatedAt),
+  };
+}
+
+function listTenantUsersByCode(code) {
+  const tenant = getTenantByCode(code);
+  if (!tenant) {
+    return [];
+  }
+
+  const rows = db.prepare(
+    `
+      SELECT u.id,
+             u.tenant_id AS tenantId,
+             t.code AS tenantCode,
+             t.name AS tenantName,
+             u.username,
+             u.display_name AS displayName,
+             u.active,
+             u.last_login_at AS lastLoginAt,
+             u.created_at AS createdAt,
+             u.updated_at AS updatedAt
+      FROM tenant_users u
+      JOIN tenants t ON t.id = u.tenant_id
+      WHERE t.id = ?
+      ORDER BY u.username COLLATE NOCASE ASC, u.id ASC
+    `,
+  ).all(tenant.id);
+
+  return rows.map(mapTenantUserRow).filter(Boolean);
+}
+
+function createTenantUserByCode(
+  code,
+  { username = "", displayName = "", password = "", active = true } = {},
+) {
+  const tenant = getTenantByCode(code);
+  if (!tenant) {
+    const error = new Error("Tenant nao encontrado.");
+    error.status = 404;
+    throw error;
+  }
+
+  const normalizedUsername = normalizeTenantUsername(username);
+  if (!normalizedUsername) {
+    const error = new Error("Campo obrigatorio: username");
+    error.status = 400;
+    throw error;
+  }
+
+  const rawPassword = String(password || "");
+  if (rawPassword.length < TENANT_MIN_PASSWORD_LENGTH) {
+    const error = new Error(`Senha deve ter pelo menos ${TENANT_MIN_PASSWORD_LENGTH} caracteres.`);
+    error.status = 400;
+    throw error;
+  }
+
+  const now = new Date().toISOString();
+  const passwordHash = hashTenantPassword(rawPassword);
+
+  db.prepare(
+    `
+      INSERT INTO tenant_users (
+        tenant_id, username, display_name, password_hash, active, created_at, updated_at
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `,
+  ).run(
+    tenant.id,
+    normalizedUsername,
+    toNonEmptyString(displayName),
+    passwordHash,
+    active ? 1 : 0,
+    now,
+    now,
+  );
+
+  return listTenantUsersByCode(tenant.code);
+}
+
+function updateTenantUserByCodeAndId(
+  code,
+  userId,
+  { displayName, password, active } = {},
+) {
+  const tenant = getTenantByCode(code);
+  if (!tenant) {
+    const error = new Error("Tenant nao encontrado.");
+    error.status = 404;
+    throw error;
+  }
+
+  const parsedUserId = Number(userId);
+  if (!Number.isFinite(parsedUserId) || parsedUserId <= 0) {
+    const error = new Error("userId invalido.");
+    error.status = 400;
+    throw error;
+  }
+
+  const current = db.prepare(
+    `
+      SELECT id,
+             tenant_id AS tenantId,
+             username,
+             display_name AS displayName,
+             active
+      FROM tenant_users
+      WHERE id = ?
+        AND tenant_id = ?
+      LIMIT 1
+    `,
+  ).get(parsedUserId, tenant.id);
+
+  if (!current) {
+    const error = new Error("Usuario do tenant nao encontrado.");
+    error.status = 404;
+    throw error;
+  }
+
+  const nextDisplayName = displayName == null ? current.displayName : toNonEmptyString(displayName);
+  const nextActive = active == null ? (Number(current.active) !== 0) : Boolean(active);
+  const now = new Date().toISOString();
+
+  let nextPasswordHash = null;
+  if (password != null) {
+    const rawPassword = String(password || "");
+    if (rawPassword.length < TENANT_MIN_PASSWORD_LENGTH) {
+      const error = new Error(`Senha deve ter pelo menos ${TENANT_MIN_PASSWORD_LENGTH} caracteres.`);
+      error.status = 400;
+      throw error;
+    }
+    nextPasswordHash = hashTenantPassword(rawPassword);
+  }
+
+  db.prepare(
+    `
+      UPDATE tenant_users
+      SET display_name = ?,
+          active = ?,
+          password_hash = CASE WHEN ? IS NULL THEN password_hash ELSE ? END,
+          updated_at = ?
+      WHERE id = ?
+        AND tenant_id = ?
+    `,
+  ).run(
+    nextDisplayName,
+    nextActive ? 1 : 0,
+    nextPasswordHash,
+    nextPasswordHash,
+    now,
+    parsedUserId,
+    tenant.id,
+  );
+
+  if (!nextActive) {
+    db.prepare(
+      `
+        DELETE FROM tenant_user_sessions
+        WHERE tenant_user_id = ?
+      `,
+    ).run(parsedUserId);
+  }
+
+  return listTenantUsersByCode(tenant.code);
+}
+
+function findTenantUserForLogin({ tenantCode = "", username = "" } = {}) {
+  const normalizedTenantCode = normalizeTenantCode(tenantCode);
+  const normalizedUsername = normalizeTenantUsername(username);
+  if (!normalizedTenantCode || !normalizedUsername) {
+    return null;
+  }
+
+  const row = db.prepare(
+    `
+      SELECT u.id,
+             u.tenant_id AS tenantId,
+             t.code AS tenantCode,
+             t.name AS tenantName,
+             t.active AS tenantActive,
+             u.username,
+             u.display_name AS displayName,
+             u.password_hash AS passwordHash,
+             u.active AS userActive
+      FROM tenant_users u
+      JOIN tenants t ON t.id = u.tenant_id
+      WHERE t.code = ?
+        AND u.username = ?
+      LIMIT 1
+    `,
+  ).get(normalizedTenantCode, normalizedUsername);
+
+  if (!row) {
+    return null;
+  }
+
+  return {
+    id: Number(row.id),
+    tenantId: Number(row.tenantId),
+    tenantCode: toNonEmptyString(row.tenantCode),
+    tenantName: toNonEmptyString(row.tenantName),
+    tenantActive: Number(row.tenantActive) !== 0,
+    username: toNonEmptyString(row.username),
+    displayName: toNonEmptyString(row.displayName),
+    passwordHash: toNonEmptyString(row.passwordHash),
+    userActive: Number(row.userActive) !== 0,
+  };
+}
+
+function createTenantUserSession({ tenantUserId }) {
+  const parsedUserId = Number(tenantUserId);
+  if (!Number.isFinite(parsedUserId) || parsedUserId <= 0) {
+    const error = new Error("tenantUserId invalido.");
+    error.status = 400;
+    throw error;
+  }
+
+  cleanupExpiredTenantUserSessions();
+
+  const token = crypto.randomBytes(48).toString("hex");
+  const tokenHash = hashSha256(token);
+  const nowDate = new Date();
+  const nowIso = nowDate.toISOString();
+  const expiresAt = new Date(nowDate.getTime() + TENANT_SESSION_TTL_HOURS * 60 * 60 * 1000).toISOString();
+
+  db.prepare(
+    `
+      INSERT INTO tenant_user_sessions (
+        tenant_user_id, token_hash, expires_at, created_at, updated_at, last_seen_at
+      )
+      VALUES (?, ?, ?, ?, ?, ?)
+    `,
+  ).run(parsedUserId, tokenHash, expiresAt, nowIso, nowIso, nowIso);
+
+  return {
+    token,
+    expiresAt,
+  };
+}
+
+function revokeTenantSessionByToken(token) {
+  const normalized = toNonEmptyString(token);
+  if (!normalized) {
+    return;
+  }
+  db.prepare(
+    `
+      DELETE FROM tenant_user_sessions
+      WHERE token_hash = ?
+    `,
+  ).run(hashSha256(normalized));
+}
+
+function revokeTenantSessionsByUserId(userId) {
+  const parsedUserId = Number(userId);
+  if (!Number.isFinite(parsedUserId) || parsedUserId <= 0) {
+    return;
+  }
+  db.prepare(
+    `
+      DELETE FROM tenant_user_sessions
+      WHERE tenant_user_id = ?
+    `,
+  ).run(parsedUserId);
+}
+
+function resolveTenantPrincipalByToken(token) {
+  const normalizedToken = toNonEmptyString(token);
+  if (!normalizedToken) {
+    return null;
+  }
+
+  cleanupExpiredTenantUserSessions();
+
+  const row = db.prepare(
+    `
+      SELECT s.id AS sessionId,
+             s.tenant_user_id AS tenantUserId,
+             s.expires_at AS expiresAt,
+             u.username,
+             u.display_name AS displayName,
+             u.active AS userActive,
+             t.id AS tenantId,
+             t.code AS tenantCode,
+             t.name AS tenantName,
+             t.active AS tenantActive
+      FROM tenant_user_sessions s
+      JOIN tenant_users u ON u.id = s.tenant_user_id
+      JOIN tenants t ON t.id = u.tenant_id
+      WHERE s.token_hash = ?
+      LIMIT 1
+    `,
+  ).get(hashSha256(normalizedToken));
+
+  if (!row) {
+    return null;
+  }
+
+  if (
+    isIsoDateExpired(row.expiresAt)
+    || Number(row.userActive) === 0
+    || Number(row.tenantActive) === 0
+  ) {
+    revokeTenantSessionByToken(normalizedToken);
+    return null;
+  }
+
+  db.prepare(
+    `
+      UPDATE tenant_user_sessions
+      SET last_seen_at = ?,
+          updated_at = ?
+      WHERE id = ?
+    `,
+  ).run(new Date().toISOString(), new Date().toISOString(), Number(row.sessionId));
+
+  return {
+    role: "tenant",
+    tokenType: "tenant_session",
+    sessionId: Number(row.sessionId),
+    tenantUserId: Number(row.tenantUserId),
+    tenantId: Number(row.tenantId),
+    tenantCode: toNonEmptyString(row.tenantCode),
+    tenantName: toNonEmptyString(row.tenantName),
+    username: toNonEmptyString(row.username),
+    displayName: toNonEmptyString(row.displayName),
+    expiresAt: toNonEmptyString(row.expiresAt),
+  };
+}
+
+function resolveAdminPrincipal(req) {
+  const configuredAdminToken = getConfiguredAdminToken();
+  const providedToken = getAdminTokenFromRequest(req);
+
+  if (!configuredAdminToken) {
+    if (!providedToken) {
+      return {
+        role: "superadmin",
+        tokenType: "open_mode",
+      };
+    }
+    return {
+      role: "superadmin",
+      tokenType: "x_admin_token",
+    };
+  }
+
+  if (providedToken && providedToken === configuredAdminToken) {
+    return {
+      role: "superadmin",
+      tokenType: "x_admin_token",
+    };
+  }
+
+  if (!providedToken) {
+    return null;
+  }
+
+  return resolveTenantPrincipalByToken(providedToken);
+}
+
+function requireAdminPrincipal(req, res) {
+  const principal = resolveAdminPrincipal(req);
+  if (!principal) {
+    res.status(401).json({ message: "Nao autorizado." });
+    return null;
+  }
+  return principal;
+}
+
+function ensureSuperAdminPrincipal(principal) {
+  if (!principal || principal.role !== "superadmin") {
+    const error = new Error("Somente administrador global pode executar esta acao.");
+    error.status = 403;
+    throw error;
+  }
+}
+
+function principalCanAccessTenant(principal, tenantCode) {
+  if (!principal) {
+    return false;
+  }
+  if (principal.role === "superadmin") {
+    return true;
+  }
+  return normalizeTenantCode(principal.tenantCode) === normalizeTenantCode(tenantCode);
+}
+
 function isAdminWriteAuthorized(req) {
-  return isKnowledgeWriteAuthorized(req);
+  return Boolean(resolveAdminPrincipal(req));
 }
 
 function normalizeTenantCode(value) {
@@ -6104,6 +6606,9 @@ app.get("/", (req, res) => {
       schedulingProfessionals: "POST /api/scheduling/professionals",
       schedulingReschedule: "POST /api/scheduling/appointments/reschedule",
       schedulingCancel: "POST /api/scheduling/appointments/cancel",
+      adminAuthLogin: "POST /api/admin/auth/login",
+      adminAuthMe: "GET /api/admin/auth/me",
+      adminAuthLogout: "POST /api/admin/auth/logout",
       adminTenantsList: "GET /api/admin/tenants",
       adminTenantsCreate: "POST /api/admin/tenants",
       adminTenantGet: "GET /api/admin/tenants/:code",
@@ -6111,6 +6616,9 @@ app.get("/", (req, res) => {
       adminTenantResolve: "GET /api/admin/tenants/resolve?kind=evolution_instance&value=ia-agendamento",
       adminTenantIdentifiers: "POST /api/admin/tenants/:code/identifiers",
       adminTenantProviders: "POST /api/admin/tenants/:code/providers/:provider",
+      adminTenantUsersList: "GET /api/admin/tenants/:code/users",
+      adminTenantUsersCreate: "POST /api/admin/tenants/:code/users",
+      adminTenantUsersUpdate: "PUT /api/admin/tenants/:code/users/:userId",
       trinksAvailability: "POST /api/trinks/availability",
       trinksAppointments: "POST /api/trinks/appointments",
       trinksAppointmentsDay: "POST /api/trinks/appointments/day",
@@ -6366,20 +6874,137 @@ app.get("/api/evolution/instance/connect", async (req, res) => {
   }
 });
 
-app.get("/api/admin/tenants", (req, res) => {
+app.post("/api/admin/auth/login", (req, res) => {
   try {
-    if (!isAdminWriteAuthorized(req)) {
-      return res.status(401).json({ message: "Nao autorizado." });
+    const tenantCode = toNonEmptyString(req.body?.tenantCode || req.body?.tenant || "");
+    const username = toNonEmptyString(req.body?.username || req.body?.user || "");
+    const password = String(req.body?.password || "");
+
+    if (!tenantCode || !username || !password) {
+      return res.status(400).json({
+        status: "error",
+        message: "Campos obrigatorios: tenantCode, username, password.",
+      });
     }
 
-    const includeInactive = parseBooleanEnv(req.query.includeInactive, false);
+    const tenantUser = findTenantUserForLogin({ tenantCode, username });
+    if (!tenantUser || !verifyTenantPassword(password, tenantUser.passwordHash)) {
+      return res.status(401).json({
+        status: "error",
+        message: "Credenciais invalidas.",
+      });
+    }
+
+    if (!tenantUser.tenantActive || !tenantUser.userActive) {
+      return res.status(403).json({
+        status: "error",
+        message: "Usuario/tenant desativado. Contate o administrador.",
+      });
+    }
+
+    const session = createTenantUserSession({ tenantUserId: tenantUser.id });
+    db.prepare(
+      `
+        UPDATE tenant_users
+        SET last_login_at = ?,
+            updated_at = ?
+        WHERE id = ?
+      `,
+    ).run(new Date().toISOString(), new Date().toISOString(), tenantUser.id);
+
+    return res.json({
+      status: "ok",
+      token: session.token,
+      expiresAt: session.expiresAt,
+      principal: {
+        role: "tenant",
+        tenantCode: tenantUser.tenantCode,
+        tenantName: tenantUser.tenantName,
+        username: tenantUser.username,
+        displayName: tenantUser.displayName,
+      },
+    });
+  } catch (error) {
+    return res.status(error.status || 500).json({
+      status: "error",
+      message: error.message || "Erro ao autenticar usuario do tenant.",
+      details: error.details || null,
+    });
+  }
+});
+
+app.get("/api/admin/auth/me", (req, res) => {
+  try {
+    const principal = requireAdminPrincipal(req, res);
+    if (!principal) {
+      return;
+    }
+
+    return res.json({
+      status: "ok",
+      principal,
+    });
+  } catch (error) {
+    return res.status(error.status || 500).json({
+      status: "error",
+      message: error.message || "Erro ao validar sessao admin.",
+      details: error.details || null,
+    });
+  }
+});
+
+app.post("/api/admin/auth/logout", (req, res) => {
+  try {
+    const principal = requireAdminPrincipal(req, res);
+    if (!principal) {
+      return;
+    }
+
+    if (principal.role === "tenant") {
+      const providedToken = getAdminTokenFromRequest(req);
+      const allDevices = parseBooleanEnv(req.body?.allDevices, false);
+      if (allDevices) {
+        revokeTenantSessionsByUserId(principal.tenantUserId);
+      } else {
+        revokeTenantSessionByToken(providedToken);
+      }
+    }
+
+    return res.json({ status: "ok" });
+  } catch (error) {
+    return res.status(error.status || 500).json({
+      status: "error",
+      message: error.message || "Erro ao encerrar sessao.",
+      details: error.details || null,
+    });
+  }
+});
+
+app.get("/api/admin/tenants", (req, res) => {
+  try {
+    const principal = requireAdminPrincipal(req, res);
+    if (!principal) {
+      return;
+    }
+
+    const includeInactive = principal.role === "superadmin"
+      ? parseBooleanEnv(req.query.includeInactive, false)
+      : false;
     const withDetails = parseBooleanEnv(req.query.withDetails, false);
-    const tenants = listTenants({ includeInactive }).map((tenant) =>
+    const sourceTenants = principal.role === "superadmin"
+      ? listTenants({ includeInactive })
+      : (() => {
+          const ownTenant = getTenantByCode(principal.tenantCode);
+          return ownTenant ? [ownTenant] : [];
+        })();
+
+    const tenants = sourceTenants.map((tenant) =>
       withDetails
         ? {
           ...tenant,
           identifiers: getTenantIdentifiersByCode(tenant.code),
           providerConfigs: getTenantProviderConfigsByCode(tenant.code),
+          users: principal.role === "superadmin" ? listTenantUsersByCode(tenant.code) : undefined,
         }
         : tenant,
     );
@@ -6400,9 +7025,11 @@ app.get("/api/admin/tenants", (req, res) => {
 
 app.post("/api/admin/tenants", (req, res) => {
   try {
-    if (!isAdminWriteAuthorized(req)) {
-      return res.status(401).json({ message: "Nao autorizado." });
+    const principal = requireAdminPrincipal(req, res);
+    if (!principal) {
+      return;
     }
+    ensureSuperAdminPrincipal(principal);
 
     const tenant = createTenant({
       code: req.body?.code,
@@ -6462,9 +7089,11 @@ app.post("/api/admin/tenants", (req, res) => {
 
 app.get("/api/admin/tenants/resolve", (req, res) => {
   try {
-    if (!isAdminWriteAuthorized(req)) {
-      return res.status(401).json({ message: "Nao autorizado." });
+    const principal = requireAdminPrincipal(req, res);
+    if (!principal) {
+      return;
     }
+    ensureSuperAdminPrincipal(principal);
 
     const kind = toNonEmptyString(req.query.kind || "");
     const value = toNonEmptyString(req.query.value || "");
@@ -6491,8 +7120,13 @@ app.get("/api/admin/tenants/resolve", (req, res) => {
 
 app.get("/api/admin/tenants/:code", (req, res) => {
   try {
-    if (!isAdminWriteAuthorized(req)) {
-      return res.status(401).json({ message: "Nao autorizado." });
+    const principal = requireAdminPrincipal(req, res);
+    if (!principal) {
+      return;
+    }
+
+    if (!principalCanAccessTenant(principal, req.params.code)) {
+      return res.status(403).json({ status: "error", message: "Sem permissao para este tenant." });
     }
 
     const tenant = getTenantByCode(req.params.code);
@@ -6505,6 +7139,7 @@ app.get("/api/admin/tenants/:code", (req, res) => {
       tenant,
       identifiers: getTenantIdentifiersByCode(tenant.code),
       providerConfigs: getTenantProviderConfigsByCode(tenant.code),
+      users: principal.role === "superadmin" ? listTenantUsersByCode(tenant.code) : [],
     });
   } catch (error) {
     return res.status(error.status || 500).json({
@@ -6517,8 +7152,28 @@ app.get("/api/admin/tenants/:code", (req, res) => {
 
 app.put("/api/admin/tenants/:code", (req, res) => {
   try {
-    if (!isAdminWriteAuthorized(req)) {
-      return res.status(401).json({ message: "Nao autorizado." });
+    const principal = requireAdminPrincipal(req, res);
+    if (!principal) {
+      return;
+    }
+
+    if (!principalCanAccessTenant(principal, req.params.code)) {
+      return res.status(403).json({ status: "error", message: "Sem permissao para este tenant." });
+    }
+
+    if (
+      principal.role !== "superadmin"
+      && (
+        req.body?.active != null
+        || req.body?.establishmentId != null
+        || req.body?.defaultProvider != null
+        || req.body?.provider != null
+      )
+    ) {
+      return res.status(403).json({
+        status: "error",
+        message: "Perfil do tenant nao pode alterar active/defaultProvider/establishmentId.",
+      });
     }
 
     const tenant = updateTenantByCode(req.params.code, {
@@ -6547,8 +7202,13 @@ app.put("/api/admin/tenants/:code", (req, res) => {
 
 app.get("/api/admin/tenants/:code/identifiers", (req, res) => {
   try {
-    if (!isAdminWriteAuthorized(req)) {
-      return res.status(401).json({ message: "Nao autorizado." });
+    const principal = requireAdminPrincipal(req, res);
+    if (!principal) {
+      return;
+    }
+
+    if (!principalCanAccessTenant(principal, req.params.code)) {
+      return res.status(403).json({ status: "error", message: "Sem permissao para este tenant." });
     }
 
     const tenant = getTenantByCode(req.params.code);
@@ -6572,8 +7232,13 @@ app.get("/api/admin/tenants/:code/identifiers", (req, res) => {
 
 app.post("/api/admin/tenants/:code/identifiers", (req, res) => {
   try {
-    if (!isAdminWriteAuthorized(req)) {
-      return res.status(401).json({ message: "Nao autorizado." });
+    const principal = requireAdminPrincipal(req, res);
+    if (!principal) {
+      return;
+    }
+
+    if (!principalCanAccessTenant(principal, req.params.code)) {
+      return res.status(403).json({ status: "error", message: "Sem permissao para este tenant." });
     }
 
     const identifiers = upsertTenantIdentifierByCode(req.params.code, {
@@ -6596,8 +7261,13 @@ app.post("/api/admin/tenants/:code/identifiers", (req, res) => {
 
 app.delete("/api/admin/tenants/:code/identifiers/:id", (req, res) => {
   try {
-    if (!isAdminWriteAuthorized(req)) {
-      return res.status(401).json({ message: "Nao autorizado." });
+    const principal = requireAdminPrincipal(req, res);
+    if (!principal) {
+      return;
+    }
+
+    if (!principalCanAccessTenant(principal, req.params.code)) {
+      return res.status(403).json({ status: "error", message: "Sem permissao para este tenant." });
     }
 
     const tenant = getTenantByCode(req.params.code);
@@ -6633,8 +7303,13 @@ app.delete("/api/admin/tenants/:code/identifiers/:id", (req, res) => {
 
 app.get("/api/admin/tenants/:code/providers", (req, res) => {
   try {
-    if (!isAdminWriteAuthorized(req)) {
-      return res.status(401).json({ message: "Nao autorizado." });
+    const principal = requireAdminPrincipal(req, res);
+    if (!principal) {
+      return;
+    }
+
+    if (!principalCanAccessTenant(principal, req.params.code)) {
+      return res.status(403).json({ status: "error", message: "Sem permissao para este tenant." });
     }
 
     const tenant = getTenantByCode(req.params.code);
@@ -6658,8 +7333,13 @@ app.get("/api/admin/tenants/:code/providers", (req, res) => {
 
 app.post("/api/admin/tenants/:code/providers/:provider", (req, res) => {
   try {
-    if (!isAdminWriteAuthorized(req)) {
-      return res.status(401).json({ message: "Nao autorizado." });
+    const principal = requireAdminPrincipal(req, res);
+    if (!principal) {
+      return;
+    }
+
+    if (!principalCanAccessTenant(principal, req.params.code)) {
+      return res.status(403).json({ status: "error", message: "Sem permissao para este tenant." });
     }
 
     const providerConfigs = upsertTenantProviderConfigByCode(req.params.code, req.params.provider, {
@@ -6675,6 +7355,94 @@ app.post("/api/admin/tenants/:code/providers/:provider", (req, res) => {
     return res.status(error.status || 500).json({
       status: "error",
       message: error.message || "Erro ao salvar configuracao de provider do tenant.",
+      details: error.details || null,
+    });
+  }
+});
+
+app.get("/api/admin/tenants/:code/users", (req, res) => {
+  try {
+    const principal = requireAdminPrincipal(req, res);
+    if (!principal) {
+      return;
+    }
+    ensureSuperAdminPrincipal(principal);
+
+    const tenant = getTenantByCode(req.params.code);
+    if (!tenant) {
+      return res.status(404).json({ status: "error", message: "Tenant nao encontrado." });
+    }
+
+    return res.json({
+      status: "ok",
+      tenant: { code: tenant.code, name: tenant.name },
+      users: listTenantUsersByCode(tenant.code),
+    });
+  } catch (error) {
+    return res.status(error.status || 500).json({
+      status: "error",
+      message: error.message || "Erro ao listar usuarios do tenant.",
+      details: error.details || null,
+    });
+  }
+});
+
+app.post("/api/admin/tenants/:code/users", (req, res) => {
+  try {
+    const principal = requireAdminPrincipal(req, res);
+    if (!principal) {
+      return;
+    }
+    ensureSuperAdminPrincipal(principal);
+
+    const users = createTenantUserByCode(req.params.code, {
+      username: req.body?.username,
+      displayName: req.body?.displayName || req.body?.name,
+      password: req.body?.password,
+      active: req.body?.active == null ? true : Boolean(req.body.active),
+    });
+
+    return res.status(201).json({
+      status: "ok",
+      users,
+    });
+  } catch (error) {
+    if (String(error?.message || "").includes("UNIQUE constraint failed: tenant_users.tenant_id, tenant_users.username")) {
+      return res.status(409).json({
+        status: "error",
+        message: "Ja existe usuario com esse username neste tenant.",
+      });
+    }
+    return res.status(error.status || 500).json({
+      status: "error",
+      message: error.message || "Erro ao criar usuario do tenant.",
+      details: error.details || null,
+    });
+  }
+});
+
+app.put("/api/admin/tenants/:code/users/:userId", (req, res) => {
+  try {
+    const principal = requireAdminPrincipal(req, res);
+    if (!principal) {
+      return;
+    }
+    ensureSuperAdminPrincipal(principal);
+
+    const users = updateTenantUserByCodeAndId(req.params.code, req.params.userId, {
+      displayName: req.body?.displayName || req.body?.name,
+      password: req.body?.password,
+      active: req.body?.active,
+    });
+
+    return res.json({
+      status: "ok",
+      users,
+    });
+  } catch (error) {
+    return res.status(error.status || 500).json({
+      status: "error",
+      message: error.message || "Erro ao atualizar usuario do tenant.",
       details: error.details || null,
     });
   }

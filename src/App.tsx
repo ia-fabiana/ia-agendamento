@@ -123,6 +123,27 @@ type AdminTenantProviderConfig = {
   config?: Record<string, any>;
 };
 
+type AdminTenantUser = {
+  id?: number;
+  tenantId?: number;
+  tenantCode?: string;
+  tenantName?: string;
+  username: string;
+  displayName?: string;
+  active?: boolean;
+  lastLoginAt?: string;
+};
+
+type AdminPrincipal = {
+  role: 'superadmin' | 'tenant';
+  tokenType?: string;
+  tenantCode?: string;
+  tenantName?: string;
+  username?: string;
+  displayName?: string;
+  expiresAt?: string;
+};
+
 const initialKnowledge = {
   identity: {
     brandName: 'Fabiana Luxury Salon',
@@ -160,6 +181,7 @@ function normalizeDigits(value: string) {
 }
 
 const ADMIN_TOKEN_STORAGE_KEY = 'ia_agendamento_admin_token';
+const TENANT_LOGIN_LAST_STORAGE_KEY = 'ia_agendamento_tenant_last_login';
 
 export default function App() {
   const [messages, setMessages] = useState<Message[]>([
@@ -226,6 +248,21 @@ export default function App() {
   const [adminResolveKind, setAdminResolveKind] = useState('evolution_instance');
   const [adminResolveValue, setAdminResolveValue] = useState('');
   const [adminResolveResult, setAdminResolveResult] = useState('');
+  const [adminPrincipal, setAdminPrincipal] = useState<AdminPrincipal | null>(null);
+  const [tenantLoginCode, setTenantLoginCode] = useState(() => {
+    if (typeof window === 'undefined') return '';
+    return window.localStorage.getItem(TENANT_LOGIN_LAST_STORAGE_KEY) || '';
+  });
+  const [tenantLoginUsername, setTenantLoginUsername] = useState('');
+  const [tenantLoginPassword, setTenantLoginPassword] = useState('');
+  const [adminTenantUsers, setAdminTenantUsers] = useState<AdminTenantUser[]>([]);
+  const [adminCreateUserName, setAdminCreateUserName] = useState('');
+  const [adminCreateUserDisplayName, setAdminCreateUserDisplayName] = useState('');
+  const [adminCreateUserPassword, setAdminCreateUserPassword] = useState('');
+  const [adminCreateUserActive, setAdminCreateUserActive] = useState(true);
+  const [adminResetUserId, setAdminResetUserId] = useState('');
+  const [adminResetUserPassword, setAdminResetUserPassword] = useState('');
+  const [adminResetUserActive, setAdminResetUserActive] = useState(true);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const appointmentService = useRef<AppointmentService | null>(null);
 
@@ -279,9 +316,9 @@ export default function App() {
 
   useEffect(() => {
     if (activeSection === 'admin' && adminToken) {
-      loadAdminTenants();
+      loadAdminTenants(adminToken);
     }
-  }, [activeSection]);
+  }, [activeSection, adminToken]);
 
   const handleSend = async () => {
     if (!input.trim() || isLoading) return;
@@ -654,15 +691,36 @@ export default function App() {
     }
   };
 
-  const loadAdminTenants = async () => {
-    if (!appointmentService.current || !adminToken || isLoadingAdmin) return;
+  const loadAdminSession = async (tokenOverride?: string) => {
+    if (!appointmentService.current) return null;
+    const tokenToUse = (tokenOverride ?? adminToken).trim();
+    if (!tokenToUse) {
+      setAdminPrincipal(null);
+      return null;
+    }
+
+    const payload = await appointmentService.current.getAdminSession(tokenToUse);
+    const principal = payload.principal || null;
+    setAdminPrincipal(principal);
+    return principal;
+  };
+
+  const loadAdminTenants = async (tokenOverride?: string) => {
+    if (!appointmentService.current || isLoadingAdmin) return;
+    const tokenToUse = (tokenOverride ?? adminToken).trim();
+    if (!tokenToUse) return;
     setIsLoadingAdmin(true);
     setAdminStatus('');
 
     try {
-      const tenants = await appointmentService.current.getAdminTenants(adminToken, {
+      const principal = await loadAdminSession(tokenToUse);
+      if (!principal) {
+        throw new Error('Sessao admin invalida. Faça login novamente.');
+      }
+
+      const tenants = await appointmentService.current.getAdminTenants(tokenToUse, {
         withDetails: true,
-        includeInactive: true,
+        includeInactive: principal.role === 'superadmin',
       });
       setAdminTenants(tenants);
 
@@ -673,10 +731,11 @@ export default function App() {
 
       setSelectedAdminTenantCode(nextCode);
       if (nextCode) {
-        await loadAdminTenant(nextCode);
+        await loadAdminTenant(nextCode, tokenToUse);
       } else {
         setAdminTenantIdentifiers([]);
         setAdminTenantProviderConfigs([]);
+        setAdminTenantUsers([]);
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Erro ao carregar tenants.';
@@ -686,15 +745,22 @@ export default function App() {
     }
   };
 
-  const loadAdminTenant = async (code: string) => {
-    if (!appointmentService.current || !adminToken || !code) return;
+  const loadAdminTenant = async (code: string, tokenOverride?: string) => {
+    if (!appointmentService.current || !code) return;
+    const tokenToUse = (tokenOverride ?? adminToken).trim();
+    if (!tokenToUse) return;
     setIsLoadingAdmin(true);
     setAdminStatus('');
     try {
-      const payload = await appointmentService.current.getAdminTenant(adminToken, code);
+      const principal = adminPrincipal || (await loadAdminSession(tokenToUse));
+      if (!principal) {
+        throw new Error('Sessao admin invalida.');
+      }
+      const payload = await appointmentService.current.getAdminTenant(tokenToUse, code);
       const tenant = payload.tenant;
       setAdminTenantIdentifiers(Array.isArray(payload.identifiers) ? payload.identifiers : []);
       setAdminTenantProviderConfigs(Array.isArray(payload.providerConfigs) ? payload.providerConfigs : []);
+      setAdminTenantUsers(Array.isArray(payload.users) ? payload.users : []);
 
       if (tenant) {
         setAdminEditName(tenant.name || '');
@@ -704,6 +770,11 @@ export default function App() {
           tenant.establishmentId === null || tenant.establishmentId === undefined ? '' : String(tenant.establishmentId),
         );
         setAdminEditActive(Boolean(tenant.active));
+      }
+
+      if (principal.role === 'superadmin') {
+        const usersPayload = await appointmentService.current.getAdminTenantUsers(tokenToUse, code);
+        setAdminTenantUsers(Array.isArray(usersPayload.users) ? usersPayload.users : []);
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Erro ao carregar tenant.';
@@ -722,7 +793,8 @@ export default function App() {
     try {
       window.localStorage.setItem(ADMIN_TOKEN_STORAGE_KEY, normalized);
       setAdminStatus('Token salvo. Validando acesso...');
-      await loadAdminTenants();
+      await loadAdminSession(normalized);
+      await loadAdminTenants(normalized);
       setAdminStatus('Token validado com sucesso.');
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Erro ao validar token admin.';
@@ -733,6 +805,10 @@ export default function App() {
   const handleCreateTenant = async () => {
     if (!appointmentService.current || !adminToken || !adminCreateName.trim()) {
       setAdminStatus('Informe pelo menos o nome do tenant.');
+      return;
+    }
+    if (!isSuperAdminSession) {
+      setAdminStatus('Apenas superadmin pode criar tenants.');
       return;
     }
     setIsLoadingAdmin(true);
@@ -766,6 +842,64 @@ export default function App() {
     }
   };
 
+  const handleTenantLogin = async () => {
+    if (!appointmentService.current) return;
+    if (!tenantLoginCode.trim() || !tenantLoginUsername.trim() || !tenantLoginPassword) {
+      setAdminStatus('Informe tenant, usuario e senha para entrar.');
+      return;
+    }
+
+    setIsLoadingAdmin(true);
+    setAdminStatus('');
+    try {
+      const response = await appointmentService.current.loginAdminTenantUser({
+        tenantCode: tenantLoginCode.trim(),
+        username: tenantLoginUsername.trim(),
+        password: tenantLoginPassword,
+      });
+
+      const token = (response.token || '').trim();
+      if (!token) {
+        throw new Error('Login retornou sem token de sessao.');
+      }
+
+      setAdminToken(token);
+      setTenantLoginPassword('');
+      window.localStorage.setItem(ADMIN_TOKEN_STORAGE_KEY, token);
+      window.localStorage.setItem(TENANT_LOGIN_LAST_STORAGE_KEY, tenantLoginCode.trim());
+
+      await loadAdminSession(token);
+      await loadAdminTenants(token);
+      setAdminStatus('Login do tenant realizado com sucesso.');
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Erro ao entrar como tenant.';
+      setAdminStatus(message);
+    } finally {
+      setIsLoadingAdmin(false);
+    }
+  };
+
+  const handleAdminLogout = async () => {
+    if (!appointmentService.current || !adminToken.trim()) return;
+    setIsLoadingAdmin(true);
+    try {
+      await appointmentService.current.logoutAdminSession(adminToken.trim());
+    } catch {
+      // Ignore backend logout failure and clear local session anyway.
+    } finally {
+      window.localStorage.removeItem(ADMIN_TOKEN_STORAGE_KEY);
+      setAdminToken('');
+      setAdminPrincipal(null);
+      setAdminTenants([]);
+      setSelectedAdminTenantCode('');
+      setAdminTenantIdentifiers([]);
+      setAdminTenantProviderConfigs([]);
+      setAdminTenantUsers([]);
+      setAdminStatus('Sessao encerrada.');
+      setIsLoadingAdmin(false);
+    }
+  };
+
   const handleUpdateTenant = async () => {
     if (!appointmentService.current || !adminToken || !selectedAdminTenantCode) {
       setAdminStatus('Selecione um tenant para atualizar.');
@@ -774,13 +908,26 @@ export default function App() {
     setIsLoadingAdmin(true);
     setAdminStatus('');
     try {
-      await appointmentService.current.updateAdminTenant(adminToken, selectedAdminTenantCode, {
+      const payload: {
+        name?: string;
+        segment?: string;
+        defaultProvider?: string;
+        establishmentId?: number;
+        active?: boolean;
+      } = {
         name: adminEditName.trim(),
         segment: adminEditSegment.trim(),
-        defaultProvider: adminEditProvider,
-        establishmentId: adminEditEstablishmentId.trim() ? Number(adminEditEstablishmentId.trim()) : undefined,
-        active: adminEditActive,
-      });
+      };
+
+      if (isSuperAdminSession) {
+        payload.defaultProvider = adminEditProvider;
+        payload.establishmentId = adminEditEstablishmentId.trim()
+          ? Number(adminEditEstablishmentId.trim())
+          : undefined;
+        payload.active = adminEditActive;
+      }
+
+      await appointmentService.current.updateAdminTenant(adminToken, selectedAdminTenantCode, payload);
       await loadAdminTenants();
       await loadAdminTenant(selectedAdminTenantCode);
       setAdminStatus('Tenant atualizado com sucesso.');
@@ -854,6 +1001,10 @@ export default function App() {
       setAdminResolveResult('Informe tipo e valor para resolver.');
       return;
     }
+    if (!isSuperAdminSession) {
+      setAdminResolveResult('Disponivel apenas para superadmin.');
+      return;
+    }
     setIsLoadingAdmin(true);
     setAdminResolveResult('');
     try {
@@ -877,7 +1028,84 @@ export default function App() {
     }
   };
 
+  const handleCreateTenantUser = async () => {
+    if (!appointmentService.current || !adminToken || !selectedAdminTenantCode) {
+      setAdminStatus('Selecione um tenant para criar usuario.');
+      return;
+    }
+    if (!adminCreateUserName.trim() || !adminCreateUserPassword.trim()) {
+      setAdminStatus('Informe username e senha para o usuario do tenant.');
+      return;
+    }
+
+    setIsLoadingAdmin(true);
+    setAdminStatus('');
+    try {
+      const response = await appointmentService.current.createAdminTenantUser(
+        adminToken,
+        selectedAdminTenantCode,
+        {
+          username: adminCreateUserName.trim(),
+          displayName: adminCreateUserDisplayName.trim(),
+          password: adminCreateUserPassword,
+          active: adminCreateUserActive,
+        },
+      );
+      setAdminTenantUsers(Array.isArray(response.users) ? response.users : []);
+      setAdminCreateUserName('');
+      setAdminCreateUserDisplayName('');
+      setAdminCreateUserPassword('');
+      setAdminCreateUserActive(true);
+      setAdminStatus('Usuario do tenant criado com sucesso.');
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Erro ao criar usuario do tenant.';
+      setAdminStatus(message);
+    } finally {
+      setIsLoadingAdmin(false);
+    }
+  };
+
+  const handleResetTenantUser = async () => {
+    if (!appointmentService.current || !adminToken || !selectedAdminTenantCode) {
+      setAdminStatus('Selecione um tenant para atualizar usuario.');
+      return;
+    }
+    const parsedUserId = Number(adminResetUserId);
+    if (!Number.isFinite(parsedUserId) || parsedUserId <= 0) {
+      setAdminStatus('Selecione um usuario valido para atualizar.');
+      return;
+    }
+    if (!adminResetUserPassword.trim()) {
+      setAdminStatus('Informe a nova senha do usuario.');
+      return;
+    }
+
+    setIsLoadingAdmin(true);
+    setAdminStatus('');
+    try {
+      const response = await appointmentService.current.updateAdminTenantUser(
+        adminToken,
+        selectedAdminTenantCode,
+        parsedUserId,
+        {
+          password: adminResetUserPassword,
+          active: adminResetUserActive,
+        },
+      );
+      setAdminTenantUsers(Array.isArray(response.users) ? response.users : []);
+      setAdminResetUserPassword('');
+      setAdminStatus('Usuario atualizado com sucesso.');
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Erro ao atualizar usuario do tenant.';
+      setAdminStatus(message);
+    } finally {
+      setIsLoadingAdmin(false);
+    }
+  };
+
   const selectedAdminTenant = adminTenants.find((item) => item.code === selectedAdminTenantCode) || null;
+  const isSuperAdminSession = adminPrincipal?.role === 'superadmin';
+  const isTenantSession = adminPrincipal?.role === 'tenant';
 
   return (
     <div className="min-h-screen flex flex-col luxury-gradient">
@@ -1335,6 +1563,52 @@ export default function App() {
                     >
                       Salvar token
                     </button>
+                    <button
+                      onClick={handleAdminLogout}
+                      disabled={isLoadingAdmin || !adminToken.trim()}
+                      className="px-4 py-2 rounded-lg bg-white/10 text-white text-xs uppercase tracking-wider disabled:opacity-50"
+                    >
+                      Sair
+                    </button>
+                  </div>
+                  {adminPrincipal && (
+                    <p className="text-xs text-white/80">
+                      Sessao atual: <strong>{adminPrincipal.role}</strong>
+                      {adminPrincipal.tenantCode ? ` | tenant: ${adminPrincipal.tenantCode}` : ''}
+                      {adminPrincipal.username ? ` | usuario: ${adminPrincipal.username}` : ''}
+                    </p>
+                  )}
+
+                  <div className="pt-3 border-t border-white/10 space-y-2">
+                    <p className="text-xs uppercase tracking-wider text-white/60">Login cliente (tenant)</p>
+                    <div className="grid md:grid-cols-3 gap-2">
+                      <input
+                        value={tenantLoginCode}
+                        onChange={(e) => setTenantLoginCode(e.target.value)}
+                        placeholder="tenant code"
+                        className="rounded-md bg-[#0f1731] border border-white/15 text-white/90 px-3 py-2 text-sm"
+                      />
+                      <input
+                        value={tenantLoginUsername}
+                        onChange={(e) => setTenantLoginUsername(e.target.value)}
+                        placeholder="usuario"
+                        className="rounded-md bg-[#0f1731] border border-white/15 text-white/90 px-3 py-2 text-sm"
+                      />
+                      <input
+                        type="password"
+                        value={tenantLoginPassword}
+                        onChange={(e) => setTenantLoginPassword(e.target.value)}
+                        placeholder="senha"
+                        className="rounded-md bg-[#0f1731] border border-white/15 text-white/90 px-3 py-2 text-sm"
+                      />
+                    </div>
+                    <button
+                      onClick={handleTenantLogin}
+                      disabled={isLoadingAdmin}
+                      className="px-4 py-2 rounded-lg bg-brand-blue text-white text-xs uppercase tracking-wider disabled:opacity-50"
+                    >
+                      Entrar como cliente
+                    </button>
                   </div>
                   {adminStatus && <p className="text-xs text-brand-green">{adminStatus}</p>}
                 </div>
@@ -1367,50 +1641,52 @@ export default function App() {
                       ))}
                     </div>
 
-                    <div className="pt-3 border-t border-white/10 space-y-2">
-                      <p className="text-xs uppercase tracking-wider text-white/60">Novo tenant</p>
-                      <input
-                        value={adminCreateName}
-                        onChange={(e) => setAdminCreateName(e.target.value)}
-                        placeholder="Nome"
-                        className="w-full rounded-md bg-[#0f1731] border border-white/15 text-white/90 px-3 py-2 text-sm"
-                      />
-                      <input
-                        value={adminCreateCode}
-                        onChange={(e) => setAdminCreateCode(e.target.value)}
-                        placeholder="Code (opcional)"
-                        className="w-full rounded-md bg-[#0f1731] border border-white/15 text-white/90 px-3 py-2 text-sm"
-                      />
-                      <input
-                        value={adminCreateSegment}
-                        onChange={(e) => setAdminCreateSegment(e.target.value)}
-                        placeholder="Segmento"
-                        className="w-full rounded-md bg-[#0f1731] border border-white/15 text-white/90 px-3 py-2 text-sm"
-                      />
-                      <div className="grid grid-cols-2 gap-2">
-                        <select
-                          value={adminCreateProvider}
-                          onChange={(e) => setAdminCreateProvider(e.target.value)}
-                          className="rounded-md bg-[#0f1731] border border-white/15 text-white/90 px-3 py-2 text-sm"
-                        >
-                          <option value="trinks">trinks</option>
-                          <option value="google_calendar">google_calendar</option>
-                        </select>
+                    {isSuperAdminSession && (
+                      <div className="pt-3 border-t border-white/10 space-y-2">
+                        <p className="text-xs uppercase tracking-wider text-white/60">Novo tenant</p>
                         <input
-                          value={adminCreateEstablishmentId}
-                          onChange={(e) => setAdminCreateEstablishmentId(e.target.value)}
-                          placeholder="Estab. ID"
-                          className="rounded-md bg-[#0f1731] border border-white/15 text-white/90 px-3 py-2 text-sm"
+                          value={adminCreateName}
+                          onChange={(e) => setAdminCreateName(e.target.value)}
+                          placeholder="Nome"
+                          className="w-full rounded-md bg-[#0f1731] border border-white/15 text-white/90 px-3 py-2 text-sm"
                         />
+                        <input
+                          value={adminCreateCode}
+                          onChange={(e) => setAdminCreateCode(e.target.value)}
+                          placeholder="Code (opcional)"
+                          className="w-full rounded-md bg-[#0f1731] border border-white/15 text-white/90 px-3 py-2 text-sm"
+                        />
+                        <input
+                          value={adminCreateSegment}
+                          onChange={(e) => setAdminCreateSegment(e.target.value)}
+                          placeholder="Segmento"
+                          className="w-full rounded-md bg-[#0f1731] border border-white/15 text-white/90 px-3 py-2 text-sm"
+                        />
+                        <div className="grid grid-cols-2 gap-2">
+                          <select
+                            value={adminCreateProvider}
+                            onChange={(e) => setAdminCreateProvider(e.target.value)}
+                            className="rounded-md bg-[#0f1731] border border-white/15 text-white/90 px-3 py-2 text-sm"
+                          >
+                            <option value="trinks">trinks</option>
+                            <option value="google_calendar">google_calendar</option>
+                          </select>
+                          <input
+                            value={adminCreateEstablishmentId}
+                            onChange={(e) => setAdminCreateEstablishmentId(e.target.value)}
+                            placeholder="Estab. ID"
+                            className="rounded-md bg-[#0f1731] border border-white/15 text-white/90 px-3 py-2 text-sm"
+                          />
+                        </div>
+                        <button
+                          onClick={handleCreateTenant}
+                          disabled={isLoadingAdmin || !adminToken.trim()}
+                          className="w-full px-4 py-2 rounded-lg bg-brand-blue text-white text-xs uppercase tracking-wider disabled:opacity-50"
+                        >
+                          Criar tenant
+                        </button>
                       </div>
-                      <button
-                        onClick={handleCreateTenant}
-                        disabled={isLoadingAdmin || !adminToken.trim()}
-                        className="w-full px-4 py-2 rounded-lg bg-brand-blue text-white text-xs uppercase tracking-wider disabled:opacity-50"
-                      >
-                        Criar tenant
-                      </button>
-                    </div>
+                    )}
                   </div>
 
                   <div className="rounded-xl bg-white/5 border border-white/10 p-4 space-y-4">
@@ -1435,29 +1711,35 @@ export default function App() {
                               placeholder="Segmento"
                               className="rounded-md bg-[#0f1731] border border-white/15 text-white/90 px-3 py-2 text-sm"
                             />
-                            <select
-                              value={adminEditProvider}
-                              onChange={(e) => setAdminEditProvider(e.target.value)}
-                              className="rounded-md bg-[#0f1731] border border-white/15 text-white/90 px-3 py-2 text-sm"
-                            >
-                              <option value="trinks">trinks</option>
-                              <option value="google_calendar">google_calendar</option>
-                            </select>
-                            <input
-                              value={adminEditEstablishmentId}
-                              onChange={(e) => setAdminEditEstablishmentId(e.target.value)}
-                              placeholder="Establishment ID"
-                              className="rounded-md bg-[#0f1731] border border-white/15 text-white/90 px-3 py-2 text-sm"
-                            />
+                            {isSuperAdminSession && (
+                              <select
+                                value={adminEditProvider}
+                                onChange={(e) => setAdminEditProvider(e.target.value)}
+                                className="rounded-md bg-[#0f1731] border border-white/15 text-white/90 px-3 py-2 text-sm"
+                              >
+                                <option value="trinks">trinks</option>
+                                <option value="google_calendar">google_calendar</option>
+                              </select>
+                            )}
+                            {isSuperAdminSession && (
+                              <input
+                                value={adminEditEstablishmentId}
+                                onChange={(e) => setAdminEditEstablishmentId(e.target.value)}
+                                placeholder="Establishment ID"
+                                className="rounded-md bg-[#0f1731] border border-white/15 text-white/90 px-3 py-2 text-sm"
+                              />
+                            )}
                           </div>
-                          <label className="flex items-center gap-2 text-sm text-white/80">
-                            <input
-                              type="checkbox"
-                              checked={adminEditActive}
-                              onChange={(e) => setAdminEditActive(e.target.checked)}
-                            />
-                            Tenant ativo
-                          </label>
+                          {isSuperAdminSession && (
+                            <label className="flex items-center gap-2 text-sm text-white/80">
+                              <input
+                                type="checkbox"
+                                checked={adminEditActive}
+                                onChange={(e) => setAdminEditActive(e.target.checked)}
+                              />
+                              Tenant ativo
+                            </label>
+                          )}
                           <button
                             onClick={handleUpdateTenant}
                             disabled={isLoadingAdmin || !adminToken.trim()}
@@ -1548,7 +1830,102 @@ export default function App() {
                           </button>
                         </div>
 
-                        <div className="space-y-2 pt-3 border-t border-white/10">
+                        {isSuperAdminSession && (
+                          <div className="space-y-2 pt-3 border-t border-white/10">
+                            <p className="text-xs uppercase tracking-wider text-white/60">Acesso de usuarios do tenant</p>
+                            <div className="flex flex-wrap gap-2">
+                              {adminTenantUsers.map((user) => (
+                                <span key={`tenant-user-${user.id}`} className="text-xs rounded-full px-3 py-1 bg-white/10 text-white/80">
+                                  {user.username} ({user.active ? 'ativo' : 'inativo'})
+                                </span>
+                              ))}
+                              {!adminTenantUsers.length && (
+                                <span className="text-xs text-white/60">Nenhum usuario neste tenant.</span>
+                              )}
+                            </div>
+
+                            <div className="grid md:grid-cols-2 gap-2">
+                              <input
+                                value={adminCreateUserName}
+                                onChange={(e) => setAdminCreateUserName(e.target.value)}
+                                placeholder="username (ex: leopoldina)"
+                                className="rounded-md bg-[#0f1731] border border-white/15 text-white/90 px-3 py-2 text-sm"
+                              />
+                              <input
+                                value={adminCreateUserDisplayName}
+                                onChange={(e) => setAdminCreateUserDisplayName(e.target.value)}
+                                placeholder="nome exibicao"
+                                className="rounded-md bg-[#0f1731] border border-white/15 text-white/90 px-3 py-2 text-sm"
+                              />
+                              <input
+                                type="password"
+                                value={adminCreateUserPassword}
+                                onChange={(e) => setAdminCreateUserPassword(e.target.value)}
+                                placeholder="senha inicial"
+                                className="rounded-md bg-[#0f1731] border border-white/15 text-white/90 px-3 py-2 text-sm"
+                              />
+                              <label className="flex items-center gap-2 text-sm text-white/80">
+                                <input
+                                  type="checkbox"
+                                  checked={adminCreateUserActive}
+                                  onChange={(e) => setAdminCreateUserActive(e.target.checked)}
+                                />
+                                usuario ativo
+                              </label>
+                            </div>
+                            <button
+                              onClick={handleCreateTenantUser}
+                              disabled={isLoadingAdmin || !adminToken.trim()}
+                              className="px-4 py-2 rounded-lg bg-brand-green text-black text-xs uppercase tracking-wider disabled:opacity-50"
+                            >
+                              Criar usuario do tenant
+                            </button>
+
+                            <div className="grid md:grid-cols-[180px_1fr_auto] gap-2 pt-2">
+                              <select
+                                value={adminResetUserId}
+                                onChange={(e) => {
+                                  const selected = adminTenantUsers.find((item) => String(item.id) === e.target.value);
+                                  setAdminResetUserId(e.target.value);
+                                  setAdminResetUserActive(Boolean(selected?.active));
+                                }}
+                                className="rounded-md bg-[#0f1731] border border-white/15 text-white/90 px-3 py-2 text-sm"
+                              >
+                                <option value="">Selecionar usuario</option>
+                                {adminTenantUsers.map((user) => (
+                                  <option key={`opt-user-${user.id}`} value={String(user.id)}>
+                                    {user.username}
+                                  </option>
+                                ))}
+                              </select>
+                              <input
+                                type="password"
+                                value={adminResetUserPassword}
+                                onChange={(e) => setAdminResetUserPassword(e.target.value)}
+                                placeholder="nova senha"
+                                className="rounded-md bg-[#0f1731] border border-white/15 text-white/90 px-3 py-2 text-sm"
+                              />
+                              <button
+                                onClick={handleResetTenantUser}
+                                disabled={isLoadingAdmin || !adminToken.trim()}
+                                className="px-4 py-2 rounded-lg bg-white/10 text-white text-xs uppercase tracking-wider disabled:opacity-50"
+                              >
+                                Atualizar usuario
+                              </button>
+                            </div>
+                            <label className="flex items-center gap-2 text-sm text-white/80">
+                              <input
+                                type="checkbox"
+                                checked={adminResetUserActive}
+                                onChange={(e) => setAdminResetUserActive(e.target.checked)}
+                              />
+                              manter usuario ativo
+                            </label>
+                          </div>
+                        )}
+
+                        {isSuperAdminSession && (
+                          <div className="space-y-2 pt-3 border-t border-white/10">
                           <p className="text-xs uppercase tracking-wider text-white/60">Resolver por identificador</p>
                           <div className="grid md:grid-cols-[220px_1fr_auto] gap-2">
                             <select
@@ -1577,7 +1954,8 @@ export default function App() {
                             </button>
                           </div>
                           {adminResolveResult && <p className="text-xs text-white/80">{adminResolveResult}</p>}
-                        </div>
+                          </div>
+                        )}
                       </>
                     )}
                   </div>
