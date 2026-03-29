@@ -20,6 +20,10 @@ const SQLITE_DB_PATH = process.env.IA_DB_PATH?.trim() || path.join(DATA_DIR_PATH
 const MAX_WHATSAPP_HISTORY_MESSAGES = 20;
 const BOOKING_CONFIRMATION_TTL_MS = 20 * 60 * 1000;
 const HUMAN_HANDOFF_TTL_MS = 12 * 60 * 60 * 1000;
+const MARKETING_ACTION_SESSION_TTL_MS = Math.max(
+  10 * 60 * 1000,
+  Number(process.env.MARKETING_ACTION_SESSION_TTL_MS || 6 * 60 * 60 * 1000),
+);
 const TRINKS_MAX_RETRIES = Math.max(1, Number(process.env.TRINKS_MAX_RETRIES || 4));
 const TRINKS_RETRY_BASE_MS = Math.max(200, Number(process.env.TRINKS_RETRY_BASE_MS || 700));
 const BOOKING_SEQUENCE_GAP_MS = Math.max(0, Number(process.env.BOOKING_SEQUENCE_GAP_MS || 450));
@@ -35,6 +39,7 @@ const whatsappConversations = new Map();
 const recentWebhookMessages = new Map();
 const pendingBookingConfirmations = new Map();
 const humanHandoffSessions = new Map();
+const marketingActionSessions = new Map();
 const WEBHOOK_DEDUPE_WINDOW_MS = 30_000;
 const db = initDatabase();
 
@@ -2518,12 +2523,174 @@ function saveSalonKnowledge(nextKnowledge) {
   return nextKnowledge;
 }
 
+function normalizeMarketingActionType(value) {
+  const normalized = normalizeForMatch(value).replace(/\s+/g, "_");
+  if (!normalized) {
+    return "custom";
+  }
+
+  if (normalized === "upsell") {
+    return "upsell";
+  }
+
+  if (normalized === "cross_sell" || normalized === "crosssell") {
+    return "cross_sell";
+  }
+
+  return "custom";
+}
+
+function normalizeMarketingActionTrigger(value) {
+  const normalized = normalizeForMatch(value).replace(/\s+/g, "_");
+  if (!normalized) {
+    return "before_closing";
+  }
+
+  if (
+    normalized === "before_closing"
+    || normalized === "encerramento"
+    || normalized === "finalizacao"
+    || normalized === "before_farewell"
+  ) {
+    return "before_closing";
+  }
+
+  if (normalized === "always" || normalized === "all_messages" || normalized === "every_message") {
+    return "always";
+  }
+
+  return "before_closing";
+}
+
+function normalizeMarketingConfig(knowledge) {
+  const source = knowledge?.marketing && typeof knowledge.marketing === "object"
+    ? knowledge.marketing
+    : {};
+  const actions = Array.isArray(source?.actions) ? source.actions : [];
+
+  const normalizedActions = actions
+    .map((item, index) => {
+      if (!item || typeof item !== "object") {
+        return null;
+      }
+
+      const id = toNonEmptyString(item.id) || `marketing_action_${index + 1}`;
+      const name = toNonEmptyString(item.name) || `Acao ${index + 1}`;
+      const message = toNonEmptyString(item.message || item.text || item.offer);
+      if (!message) {
+        return null;
+      }
+
+      return {
+        id,
+        name,
+        enabled: item.enabled == null ? true : Boolean(item.enabled),
+        type: normalizeMarketingActionType(item.type),
+        trigger: normalizeMarketingActionTrigger(item.trigger),
+        message,
+      };
+    })
+    .filter(Boolean);
+
+  return {
+    enabled: source?.enabled == null ? false : Boolean(source.enabled),
+    actions: normalizedActions,
+  };
+}
+
+function cleanupMarketingActionSessions(now = Date.now()) {
+  for (const [key, value] of marketingActionSessions.entries()) {
+    if (!value) {
+      marketingActionSessions.delete(key);
+      continue;
+    }
+
+    const sentAt = Number(value.sentAt || 0);
+    if (!sentAt || now - sentAt > MARKETING_ACTION_SESSION_TTL_MS) {
+      marketingActionSessions.delete(key);
+    }
+  }
+}
+
+function textSuggestsConversationClosing(text) {
+  const normalized = normalizeForMatch(text);
+  if (!normalized) {
+    return false;
+  }
+
+  return (
+    /\b(mais alguma coisa|algo mais|se precisar|fico a disposicao|estou a disposicao)\b/.test(normalized)
+    || /\b(ate logo|ate mais|tchau|obrigad|tenha um otimo dia|tenha um excelente dia)\b/.test(normalized)
+    || /\b(encerrar|finalizar atendimento)\b/.test(normalized)
+    || /\b(agendamento confirmado com sucesso)\b/.test(normalized)
+  );
+}
+
+function pickMarketingActionForStage(knowledge, stage = "before_closing") {
+  const config = normalizeMarketingConfig(knowledge);
+  if (!config.enabled) {
+    return null;
+  }
+
+  return (
+    config.actions.find((item) => item.enabled && item.trigger === stage)
+    || config.actions.find((item) => item.enabled && item.trigger === "always")
+    || null
+  );
+}
+
+function applyMarketingActionBeforeClosing({
+  knowledge,
+  customerMessage = "",
+  assistantReply = "",
+  sessionKey = "",
+} = {}) {
+  const replyText = toNonEmptyString(assistantReply);
+  if (!replyText) {
+    return replyText;
+  }
+
+  const action = pickMarketingActionForStage(knowledge, "before_closing");
+  if (!action) {
+    return replyText;
+  }
+
+  const customerWantsToClose = textSuggestsConversationClosing(customerMessage);
+  const assistantIsClosing = textSuggestsConversationClosing(replyText);
+  const shouldGateByClosingSignal = action.trigger !== "always";
+  if (shouldGateByClosingSignal && !customerWantsToClose && !assistantIsClosing) {
+    return replyText;
+  }
+
+  const normalizedReply = normalizeForMatch(replyText);
+  const normalizedOfferMessage = normalizeForMatch(action.message);
+  if (normalizedOfferMessage && normalizedReply.includes(normalizedOfferMessage)) {
+    return replyText;
+  }
+
+  if (sessionKey) {
+    cleanupMarketingActionSessions();
+    const sentState = marketingActionSessions.get(sessionKey);
+    if (sentState?.actionId === action.id) {
+      return replyText;
+    }
+
+    marketingActionSessions.set(sessionKey, {
+      actionId: action.id,
+      sentAt: Date.now(),
+    });
+  }
+
+  return `Antes de finalizarmos: ${action.message}\n\n${replyText}`;
+}
+
 function formatKnowledgeForPrompt(knowledge) {
   const identity = knowledge?.identity || {};
   const policies = knowledge?.policies || {};
   const business = knowledge?.business || {};
   const services = Array.isArray(knowledge?.services) ? knowledge.services : [];
   const faq = Array.isArray(knowledge?.faq) ? knowledge.faq : [];
+  const marketing = normalizeMarketingConfig(knowledge);
 
   const servicesText = services.length
     ? services
@@ -2542,6 +2709,15 @@ function formatKnowledgeForPrompt(knowledge) {
         .join("\n")
     : "- Sem perguntas frequentes cadastradas";
 
+  const marketingText = marketing.actions.length
+    ? marketing.actions
+        .map(
+          (item) =>
+            `- ${item.name} | tipo: ${item.type} | trigger: ${item.trigger} | ativo: ${item.enabled ? "sim" : "nao"} | oferta: ${item.message}`,
+        )
+        .join("\n")
+    : "- Sem acoes de marketing cadastradas";
+
   return [
     "Base de conhecimento do salao (fonte oficial):",
     `- Nome comercial: ${identity?.brandName || "Nao informado"}`,
@@ -2558,6 +2734,10 @@ function formatKnowledgeForPrompt(knowledge) {
     "",
     "FAQ:",
     faqText,
+    "",
+    "Marketing e ofertas:",
+    `- Ambiente de marketing habilitado: ${marketing.enabled ? "sim" : "nao"}`,
+    marketingText,
     "",
     "Regra: sempre priorize esta base para responder duvidas comerciais do salao.",
   ].join("\n");
@@ -6272,7 +6452,7 @@ async function sendChatMessage({ establishmentId, message, history, customerCont
   for (let attempt = 0; attempt < 3; attempt += 1) {
     const calls = response.functionCalls || [];
     if (!calls.length) {
-      const text = String(response.text || "");
+      let text = String(response.text || "");
       if (
         relativeDate &&
         /(\d{1,2}\/\d{1,2}(?:\/\d{2,4})?|\d{4}-\d{2}-\d{2})/.test(text) &&
@@ -6282,9 +6462,15 @@ async function sendChatMessage({ establishmentId, message, history, customerCont
         const corrected = await chat.sendMessage({
           message: `Correcao obrigatoria: para esta conversa, "${relativeDate.label}" = ${relativeDate.iso} (${relativeDate.br}). Reescreva a ultima resposta com a data correta, sem alterar o restante do sentido.`,
         });
-        return String(corrected.text || text);
+        text = String(corrected.text || text);
       }
-      return text;
+
+      return applyMarketingActionBeforeClosing({
+        knowledge,
+        customerMessage: message,
+        assistantReply: text,
+        sessionKey: pendingSessionKey,
+      });
     }
 
     const results = [];
@@ -6550,7 +6736,13 @@ async function sendChatMessage({ establishmentId, message, history, customerCont
     });
   }
 
-  return "Tive uma instabilidade momentanea aqui. Consegue repetir sua ultima mensagem para eu continuar seu atendimento?";
+  return applyMarketingActionBeforeClosing({
+    knowledge,
+    customerMessage: message,
+    assistantReply:
+      "Tive uma instabilidade momentanea aqui. Consegue repetir sua ultima mensagem para eu continuar seu atendimento?",
+    sessionKey: pendingSessionKey,
+  });
 }
 
 app.get("/api/health", (req, res) => {
