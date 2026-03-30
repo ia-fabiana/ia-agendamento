@@ -1153,6 +1153,8 @@ export default function App() {
   const selectedAdminTenant = adminTenants.find((item) => item.code === selectedAdminTenantCode) || null;
   const isSuperAdminSession = adminPrincipal?.role === 'superadmin';
   const isTenantSession = adminPrincipal?.role === 'tenant';
+  const sessionTenantName = String(adminPrincipal?.tenantName || selectedAdminTenant?.name || '').trim();
+  const sessionTenantCode = String(adminPrincipal?.tenantCode || selectedAdminTenant?.code || '').trim();
 
   return (
     <div className="min-h-screen flex flex-col luxury-gradient">
@@ -1619,11 +1621,18 @@ export default function App() {
                     </button>
                   </div>
                   {adminPrincipal && (
-                    <p className="text-xs text-white/80">
-                      Sessao atual: <strong>{adminPrincipal.role}</strong>
-                      {adminPrincipal.tenantCode ? ` | tenant: ${adminPrincipal.tenantCode}` : ''}
-                      {adminPrincipal.username ? ` | usuario: ${adminPrincipal.username}` : ''}
-                    </p>
+                    <div className="flex flex-wrap items-center gap-2 text-xs text-white/80">
+                      <span>
+                        Sessao atual: <strong>{adminPrincipal.role}</strong>
+                      </span>
+                      {sessionTenantName && (
+                        <span className="inline-flex items-center rounded-full px-3 py-1 bg-brand-blue/20 border border-brand-blue/40 text-brand-blue font-semibold">
+                          Tenant: {sessionTenantName}
+                          {sessionTenantCode ? ` (${sessionTenantCode})` : ''}
+                        </span>
+                      )}
+                      {adminPrincipal.username && <span>| usuario: {adminPrincipal.username}</span>}
+                    </div>
                   )}
 
                   <div className="pt-3 border-t border-white/10 space-y-2">
