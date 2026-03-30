@@ -2705,6 +2705,37 @@ function normalizeMarketingActionTrigger(value) {
   return "before_closing";
 }
 
+function normalizeMarketingActionEndDate(value) {
+  const raw = toNonEmptyString(value);
+  if (!raw) {
+    return "";
+  }
+
+  const isoMatch = raw.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (isoMatch) {
+    return `${isoMatch[1]}-${isoMatch[2]}-${isoMatch[3]}`;
+  }
+
+  const brMatch = raw.match(/^(\d{2})\/(\d{2})\/(\d{4})$/);
+  if (brMatch) {
+    return `${brMatch[3]}-${brMatch[2]}-${brMatch[1]}`;
+  }
+
+  return "";
+}
+
+function isMarketingActionWithinDate(action, todayIso = "") {
+  const untilDate = toNonEmptyString(action?.endDate);
+  if (!untilDate) {
+    return true;
+  }
+  const today = toNonEmptyString(todayIso) || getSaoPauloDateContext().isoToday;
+  if (!today) {
+    return true;
+  }
+  return today <= untilDate;
+}
+
 function normalizeMarketingConfig(knowledge) {
   const source = knowledge?.marketing && typeof knowledge.marketing === "object"
     ? knowledge.marketing
@@ -2722,6 +2753,9 @@ function normalizeMarketingConfig(knowledge) {
       const message = toNonEmptyString(item.message || item.text || item.offer);
       const mediaUrl = toNonEmptyString(item.mediaUrl || item.imageUrl || item.photoUrl);
       const mediaCaption = toNonEmptyString(item.mediaCaption || item.caption);
+      const endDate = normalizeMarketingActionEndDate(
+        item.endDate || item.validUntil || item.untilDate || item.dateUntil || item.ate,
+      );
       if (!message) {
         return null;
       }
@@ -2735,6 +2769,7 @@ function normalizeMarketingConfig(knowledge) {
         message,
         mediaUrl,
         mediaCaption,
+        endDate,
       };
     })
     .filter(Boolean);
@@ -2778,10 +2813,11 @@ function pickMarketingActionForStage(knowledge, stage = "before_closing") {
   if (!config.enabled) {
     return null;
   }
+  const todayIso = getSaoPauloDateContext().isoToday;
 
   return (
-    config.actions.find((item) => item.enabled && item.trigger === stage)
-    || config.actions.find((item) => item.enabled && item.trigger === "always")
+    config.actions.find((item) => item.enabled && item.trigger === stage && isMarketingActionWithinDate(item, todayIso))
+    || config.actions.find((item) => item.enabled && item.trigger === "always" && isMarketingActionWithinDate(item, todayIso))
     || null
   );
 }
@@ -2891,7 +2927,7 @@ function formatKnowledgeForPrompt(knowledge) {
     ? marketing.actions
         .map(
           (item) =>
-            `- ${item.name} | tipo: ${item.type} | trigger: ${item.trigger} | ativo: ${item.enabled ? "sim" : "nao"} | oferta: ${item.message} | imagem: ${item.mediaUrl ? "sim" : "nao"}`,
+            `- ${item.name} | tipo: ${item.type} | trigger: ${item.trigger} | ativo: ${item.enabled ? "sim" : "nao"} | validade ate: ${item.endDate || "sem limite"} | oferta: ${item.message} | imagem: ${item.mediaUrl ? "sim" : "nao"}`,
         )
         .join("\n")
     : "- Sem acoes de marketing cadastradas";

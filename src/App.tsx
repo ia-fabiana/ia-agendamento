@@ -2578,6 +2578,7 @@ export default function App() {
                               trigger: 'before_closing',
                               enabled: true,
                               message: '',
+                              endDate: '',
                               mediaUrl: '',
                               mediaCaption: '',
                             },
@@ -2684,6 +2685,26 @@ export default function App() {
                             <option value="before_closing">before_closing (encerrar atendimento)</option>
                             <option value="always">always (todas respostas)</option>
                           </select>
+                        </div>
+
+                        <div className="grid md:grid-cols-2 gap-2">
+                          <input
+                            type="date"
+                            value={toText(action?.endDate)}
+                            onChange={(e) =>
+                              updateKnowledge((draft) => {
+                                const currentMarketing =
+                                  draft.marketing && typeof draft.marketing === 'object' ? draft.marketing : {};
+                                const currentActions = Array.isArray(currentMarketing.actions) ? currentMarketing.actions : [];
+                                currentActions[idx] = { ...(currentActions[idx] || {}), endDate: e.target.value };
+                                draft.marketing = { ...currentMarketing, actions: currentActions };
+                              })
+                            }
+                            className="rounded-md bg-[#0f1731] border border-white/15 text-white/90 px-3 py-2 text-sm"
+                          />
+                          <div className="text-xs text-white/65 flex items-center px-2">
+                            Data final da acao (inclusive). Se vencer, nao envia.
+                          </div>
                         </div>
 
                         <label className="flex items-center gap-2 text-sm text-white/80">
