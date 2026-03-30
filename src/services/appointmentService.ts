@@ -196,6 +196,24 @@ export class AppointmentService {
     return (await response.json()) as T;
   }
 
+  private fileToDataUrl(file: File): Promise<string> {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => {
+        const result = typeof reader.result === "string" ? reader.result : "";
+        if (!result) {
+          reject(new Error("Nao foi possivel ler a imagem selecionada."));
+          return;
+        }
+        resolve(result);
+      };
+      reader.onerror = () => {
+        reject(new Error("Falha ao carregar a imagem para upload."));
+      };
+      reader.readAsDataURL(file);
+    });
+  }
+
   async sendMessage(message: string, history: ChatHistoryItem[] = []) {
     if (!this.establishmentId) {
       throw new Error("VITE_TRINKS_ESTABLISHMENT_ID nao configurado.");
@@ -288,6 +306,34 @@ export class AppointmentService {
 
     const data = (await response.json()) as { knowledge?: KnowledgePayload };
     return data.knowledge || {};
+  }
+
+  async uploadMarketingImage(file: File, adminToken: string, tenantCode = "") {
+    if (!file) {
+      throw new Error("Selecione uma imagem para upload.");
+    }
+    if (!file.type.startsWith("image/")) {
+      throw new Error("Arquivo invalido. Envie uma imagem (png, jpg, webp ou gif).");
+    }
+
+    const imageDataUrl = await this.fileToDataUrl(file);
+    const payload = await this.adminRequest<{
+      url?: string;
+      message?: string;
+    }>("/api/admin/uploads/marketing-image", adminToken, {
+      method: "POST",
+      body: JSON.stringify({
+        imageDataUrl,
+        fileName: file.name,
+        ...(String(tenantCode || "").trim() ? { tenantCode: String(tenantCode || "").trim() } : {}),
+      }),
+    });
+
+    const url = String(payload?.url || "").trim();
+    if (!url) {
+      throw new Error(payload?.message || "Nao foi possivel obter a URL da imagem enviada.");
+    }
+    return url;
   }
 
   async createEvolutionInstance(instance: string) {

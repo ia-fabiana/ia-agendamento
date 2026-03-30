@@ -16,7 +16,13 @@ const app = express();
 const port = Number(process.env.PORT || 3001);
 const KNOWLEDGE_FILE_PATH = path.join(__dirname, "salonKnowledge.json");
 const DATA_DIR_PATH = path.join(__dirname, "data");
+const PUBLIC_UPLOADS_DIR_PATH = path.join(DATA_DIR_PATH, "uploads");
+const MARKETING_UPLOADS_DIR_PATH = path.join(PUBLIC_UPLOADS_DIR_PATH, "marketing");
 const SQLITE_DB_PATH = process.env.IA_DB_PATH?.trim() || path.join(DATA_DIR_PATH, "ia_agendamento.sqlite");
+const MARKETING_UPLOAD_MAX_BYTES = Math.max(
+  256 * 1024,
+  Number(process.env.MARKETING_UPLOAD_MAX_BYTES || 5 * 1024 * 1024),
+);
 const MAX_WHATSAPP_HISTORY_MESSAGES = 20;
 const BOOKING_CONFIRMATION_TTL_MS = 20 * 60 * 1000;
 const HUMAN_HANDOFF_TTL_MS = 12 * 60 * 60 * 1000;
@@ -45,6 +51,7 @@ const db = initDatabase();
 
 function initDatabase() {
   mkdirSync(DATA_DIR_PATH, { recursive: true });
+  mkdirSync(MARKETING_UPLOADS_DIR_PATH, { recursive: true });
   const database = new Database(SQLITE_DB_PATH);
   database.pragma("journal_mode = WAL");
   database.pragma("foreign_keys = ON");
@@ -371,7 +378,7 @@ function unsupportedInboundPlaceholder(incoming) {
   return `[mensagem sem texto: ${type}]`;
 }
 
-const jsonBodyParser = express.json({ limit: "2mb" });
+const jsonBodyParser = express.json({ limit: "12mb" });
 const webhookBodyParser = express.text({ type: "*/*", limit: "2mb" });
 
 app.use((req, res, next) => {
@@ -389,6 +396,7 @@ app.use((req, res, next) => {
   }
   next();
 });
+app.use("/uploads", express.static(PUBLIC_UPLOADS_DIR_PATH));
 
 function ensureEnv(name) {
   const value = process.env[name];
@@ -447,6 +455,73 @@ function firstNonEmpty(values) {
     }
   }
   return "";
+}
+
+function marketingUploadMimeToExtension(mime) {
+  const normalized = toNonEmptyString(mime).toLowerCase();
+  if (normalized === "image/jpeg" || normalized === "image/jpg") {
+    return "jpg";
+  }
+  if (normalized === "image/png") {
+    return "png";
+  }
+  if (normalized === "image/webp") {
+    return "webp";
+  }
+  if (normalized === "image/gif") {
+    return "gif";
+  }
+  return "";
+}
+
+function parseImageDataUrl(dataUrl) {
+  const raw = toNonEmptyString(dataUrl);
+  if (!raw) {
+    return null;
+  }
+
+  const match = raw.match(/^data:(image\/(?:png|jpe?g|webp|gif));base64,([A-Za-z0-9+/=\s]+)$/i);
+  if (!match) {
+    return null;
+  }
+
+  return {
+    mime: toNonEmptyString(match[1]).toLowerCase(),
+    base64: String(match[2] || "").replace(/\s+/g, ""),
+  };
+}
+
+function sanitizeUploadFileStem(value) {
+  const raw = toNonEmptyString(value).replace(/\.[A-Za-z0-9]+$/, "");
+  const normalized = raw
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^A-Za-z0-9._-]+/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 72);
+  return normalized || "imagem";
+}
+
+function getPublicBackendBaseUrl(req) {
+  const envBase = toNonEmptyString(
+    process.env.BACKEND_PUBLIC_BASE_URL
+    || process.env.PUBLIC_BACKEND_URL
+    || process.env.WEBHOOK_PUBLIC_BASE_URL,
+  );
+  if (envBase) {
+    return envBase.replace(/\/+$/g, "");
+  }
+
+  const forwardedProto = toNonEmptyString(req?.headers?.["x-forwarded-proto"]).split(",")[0];
+  const forwardedHost = toNonEmptyString(req?.headers?.["x-forwarded-host"]).split(",")[0];
+  const host = forwardedHost || toNonEmptyString(req?.headers?.host);
+  const protocol = forwardedProto || "https";
+
+  if (!host) {
+    return "";
+  }
+  return `${protocol}://${host}`;
 }
 
 function getConfiguredAdminToken() {
@@ -7008,6 +7083,74 @@ app.put("/api/knowledge", (req, res) => {
   }
 });
 
+app.post("/api/admin/uploads/marketing-image", (req, res) => {
+  try {
+    const principal = requireAdminPrincipal(req, res);
+    if (!principal) {
+      return;
+    }
+
+    const parsed = parseImageDataUrl(req.body?.imageDataUrl);
+    if (!parsed) {
+      return res.status(400).json({
+        message: "Envie imageDataUrl em formato data URL (png, jpg, webp ou gif).",
+      });
+    }
+
+    const extension = marketingUploadMimeToExtension(parsed.mime);
+    if (!extension) {
+      return res.status(400).json({
+        message: "Formato de imagem nao suportado. Use png, jpg, webp ou gif.",
+      });
+    }
+
+    const buffer = Buffer.from(parsed.base64, "base64");
+    if (!buffer.length) {
+      return res.status(400).json({
+        message: "Conteudo da imagem vazio.",
+      });
+    }
+    if (buffer.length > MARKETING_UPLOAD_MAX_BYTES) {
+      return res.status(400).json({
+        message: `Imagem acima do limite (${Math.round(MARKETING_UPLOAD_MAX_BYTES / (1024 * 1024))}MB).`,
+      });
+    }
+
+    const requestedTenantCode = normalizeTenantCode(req.body?.tenantCode || req.body?.tenant || "");
+    const effectiveTenantCode = principal.role === "tenant"
+      ? normalizeTenantCode(principal.tenantCode)
+      : requestedTenantCode;
+    const tenantSegment = effectiveTenantCode || "global";
+    const tenantDirPath = path.join(MARKETING_UPLOADS_DIR_PATH, tenantSegment);
+    mkdirSync(tenantDirPath, { recursive: true });
+
+    const timestamp = new Date().toISOString().replace(/[-:.TZ]/g, "").slice(0, 14);
+    const randomSuffix = crypto.randomBytes(6).toString("hex");
+    const fileStem = sanitizeUploadFileStem(req.body?.fileName || req.body?.name || "imagem");
+    const fileName = `${fileStem}_${timestamp}_${randomSuffix}.${extension}`;
+    const absolutePath = path.join(tenantDirPath, fileName);
+    writeFileSync(absolutePath, buffer);
+
+    const relativePath = `/uploads/marketing/${tenantSegment}/${fileName}`;
+    const publicBaseUrl = getPublicBackendBaseUrl(req);
+    const url = publicBaseUrl ? `${publicBaseUrl}${relativePath}` : relativePath;
+
+    return res.json({
+      status: "ok",
+      url,
+      path: relativePath,
+      mime: parsed.mime,
+      size: buffer.length,
+      tenantCode: effectiveTenantCode || null,
+    });
+  } catch (error) {
+    return res.status(error?.status || 500).json({
+      message: error?.message || "Erro ao fazer upload da imagem de marketing.",
+      details: error?.details || null,
+    });
+  }
+});
+
 app.get("/", (req, res) => {
   res.json({
     name: "IA.AGENDAMENTO Backend",
@@ -7035,6 +7178,7 @@ app.get("/", (req, res) => {
       adminTenantUsersList: "GET /api/admin/tenants/:code/users",
       adminTenantUsersCreate: "POST /api/admin/tenants/:code/users",
       adminTenantUsersUpdate: "PUT /api/admin/tenants/:code/users/:userId",
+      adminUploadMarketingImage: "POST /api/admin/uploads/marketing-image",
       trinksAvailability: "POST /api/trinks/availability",
       trinksAppointments: "POST /api/trinks/appointments",
       trinksAppointmentsDay: "POST /api/trinks/appointments/day",

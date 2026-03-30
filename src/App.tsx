@@ -267,8 +267,12 @@ export default function App() {
   const [adminResetUserId, setAdminResetUserId] = useState('');
   const [adminResetUserPassword, setAdminResetUserPassword] = useState('');
   const [adminResetUserActive, setAdminResetUserActive] = useState(true);
+  const [uploadingMarketingIndex, setUploadingMarketingIndex] = useState<number | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const appointmentService = useRef<AppointmentService | null>(null);
+
+  const resolveKnowledgeTenantScopeCode = () =>
+    adminPrincipal?.role === 'superadmin' ? selectedAdminTenantCode.trim() : '';
 
   useEffect(() => {
     appointmentService.current = new AppointmentService();
@@ -279,8 +283,7 @@ export default function App() {
       if (!appointmentService.current) return;
       setIsLoadingKnowledge(true);
       try {
-        const tenantScopeCode =
-          adminPrincipal?.role === 'superadmin' ? selectedAdminTenantCode.trim() : '';
+        const tenantScopeCode = resolveKnowledgeTenantScopeCode();
         const knowledge = await appointmentService.current.getKnowledge(adminToken, tenantScopeCode);
         setKnowledgeJson(JSON.stringify(knowledge, null, 2));
       } catch (error) {
@@ -381,8 +384,7 @@ export default function App() {
 
     try {
       const parsed = safeParseKnowledge(knowledgeJson);
-      const tenantScopeCode =
-        adminPrincipal?.role === 'superadmin' ? selectedAdminTenantCode.trim() : '';
+      const tenantScopeCode = resolveKnowledgeTenantScopeCode();
       const saved = await appointmentService.current.saveKnowledge(parsed, adminToken, tenantScopeCode);
       setKnowledgeJson(JSON.stringify(saved, null, 2));
       setKnowledgeStatus('Base de conhecimento salva com sucesso.');
@@ -391,6 +393,35 @@ export default function App() {
       setKnowledgeStatus(message);
     } finally {
       setIsSavingKnowledge(false);
+    }
+  };
+
+  const handleUploadMarketingImage = async (actionIndex: number, file: File | null) => {
+    if (!appointmentService.current || !file) return;
+    if (!adminToken.trim()) {
+      setKnowledgeStatus('Faça login no Admin para enviar imagem de MKT.');
+      return;
+    }
+
+    setUploadingMarketingIndex(actionIndex);
+    setKnowledgeStatus('Enviando imagem de marketing...');
+    try {
+      const tenantScopeCode = resolveKnowledgeTenantScopeCode();
+      const uploadedUrl = await appointmentService.current.uploadMarketingImage(file, adminToken, tenantScopeCode);
+
+      updateKnowledge((draft) => {
+        const currentMarketing =
+          draft.marketing && typeof draft.marketing === 'object' ? draft.marketing : {};
+        const currentActions = Array.isArray(currentMarketing.actions) ? currentMarketing.actions : [];
+        currentActions[actionIndex] = { ...(currentActions[actionIndex] || {}), mediaUrl: uploadedUrl };
+        draft.marketing = { ...currentMarketing, actions: currentActions };
+      });
+      setKnowledgeStatus('Imagem enviada com sucesso. Clique em Salvar para persistir.');
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Erro ao enviar imagem de marketing.';
+      setKnowledgeStatus(message);
+    } finally {
+      setUploadingMarketingIndex(null);
     }
   };
 
@@ -2716,6 +2747,43 @@ export default function App() {
                           placeholder="Legenda da imagem (opcional, usa a mensagem da acao se vazio)"
                           className="w-full rounded-md bg-[#0f1731] border border-white/15 text-white/90 px-3 py-2 text-sm"
                         />
+
+                        <div className="flex items-center gap-2 flex-wrap">
+                          <label
+                            className={`px-3 py-2 rounded-md text-xs uppercase tracking-wider border ${
+                              uploadingMarketingIndex === idx
+                                ? 'bg-white/5 border-white/10 text-white/50 cursor-not-allowed'
+                                : 'bg-white/10 border-white/20 text-white cursor-pointer hover:bg-white/15'
+                            }`}
+                          >
+                            <input
+                              type="file"
+                              accept="image/png,image/jpeg,image/jpg,image/webp,image/gif"
+                              className="hidden"
+                              disabled={uploadingMarketingIndex !== null}
+                              onChange={(e) => {
+                                const file = e.target.files?.[0] || null;
+                                e.currentTarget.value = '';
+                                void handleUploadMarketingImage(idx, file);
+                              }}
+                            />
+                            {uploadingMarketingIndex === idx ? 'Enviando imagem...' : 'Upload imagem'}
+                          </label>
+
+                          {toText(action?.mediaUrl) && (
+                            <a
+                              href={toText(action?.mediaUrl)}
+                              target="_blank"
+                              rel="noreferrer"
+                              className="text-xs text-brand-blue hover:text-white"
+                            >
+                              Abrir imagem atual
+                            </a>
+                          )}
+                        </div>
+                        <p className="text-[11px] text-white/60">
+                          Upload direto pela plataforma (png, jpg, webp ou gif).
+                        </p>
 
                         <button
                           onClick={() =>
