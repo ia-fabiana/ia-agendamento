@@ -1120,6 +1120,14 @@ export class AppointmentService {
     );
   }
 
+  async handoffCrmFlow(adminToken: string, code: string, flowId: number, reason?: string) {
+    return this.adminRequest<{ message?: string }>(
+      `/api/admin/tenants/${encodeURIComponent(code)}/crm/flows/${flowId}/handoff`,
+      adminToken,
+      { method: "POST", body: JSON.stringify({ reason: reason || "crm_manual_handoff" }) },
+    );
+  }
+
   async getCrmFlowEvents(adminToken: string, code: string, flowId: number) {
     return this.adminRequest<{ events?: unknown[] }>(
       `/api/admin/tenants/${encodeURIComponent(code)}/crm/flows/${flowId}/events`,
@@ -1128,4 +1136,3 @@ export class AppointmentService {
     );
   }
 }
-

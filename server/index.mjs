@@ -3174,6 +3174,77 @@ function findVeryRecentBookingAuditForPhone(tenantCode, phone, withinSeconds = 1
   ).get(normalizeTenantScopeCode(tenantCode), normalizedPhone, cutoff) || null;
 }
 
+function isCrmPhoneBlockedForTenantCode(code, phone) {
+  const normalizedPhone = normalizePhone(phone);
+  if (!normalizedPhone || !code) {
+    return false;
+  }
+  return listCrmClientBlocksByCode(code, { phone: normalizedPhone }).some((item) => item.isBlocked);
+}
+
+function getSaoPauloClockTime(at = new Date()) {
+  return new Intl.DateTimeFormat("en-GB", {
+    timeZone: "America/Sao_Paulo",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  }).format(at);
+}
+
+function isTimeWithinCrmWindow(currentTime = "", start = "", end = "") {
+  const normalizedCurrent = normalizeTimeValue(currentTime);
+  const normalizedStart = normalizeTimeValue(start);
+  const normalizedEnd = normalizeTimeValue(end);
+  if (!normalizedCurrent || !normalizedStart || !normalizedEnd) {
+    return true;
+  }
+  if (normalizedStart <= normalizedEnd) {
+    return normalizedCurrent >= normalizedStart && normalizedCurrent <= normalizedEnd;
+  }
+  return normalizedCurrent >= normalizedStart || normalizedCurrent <= normalizedEnd;
+}
+
+function getSaoPauloUtcRangeForIsoDate(isoDate = "") {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(String(isoDate || ""))) {
+    return { start: "", end: "" };
+  }
+  const start = new Date(`${isoDate}T00:00:00-03:00`).toISOString();
+  const end = new Date(`${addDaysToIsoDate(isoDate, 1)}T00:00:00-03:00`).toISOString();
+  return { start, end };
+}
+
+function countTenantCrmStepSentOnIsoDate(tenantId, isoDate = "") {
+  const { start, end } = getSaoPauloUtcRangeForIsoDate(isoDate);
+  if (!tenantId || !start || !end) {
+    return 0;
+  }
+  const row = db.prepare(
+    `
+      SELECT COUNT(1) AS total
+      FROM crm_flow_events
+      WHERE tenant_id = ?
+        AND event_type = 'step_sent'
+        AND created_at >= ?
+        AND created_at < ?
+    `,
+  ).get(tenantId, start, end);
+  return Number.isFinite(Number(row?.total)) ? Number(row.total) : 0;
+}
+
+function stopCrmFlowForSystemReason(flowId, tenantId, reason, metadata = {}) {
+  updateCrmFlowStatus(flowId, tenantId, {
+    flow_status: reason === "opt_out" ? "opted_out" : "stopped",
+    stop_reason: toNonEmptyString(reason),
+    next_scheduled_send_at: "",
+  });
+  recordCrmFlowEvent({
+    flowId,
+    tenantId,
+    eventType: reason === "future_booking" ? "future_booking_detected" : "stopped",
+    metadata,
+  });
+}
+
 function materializeCrmFlowCandidate(tenant, candidate, crmMode = "beta") {
   const phone = normalizePhone(candidate.phone);
   const now = new Date().toISOString();
@@ -4565,6 +4636,251 @@ async function notifyHumanAlertPhones({
     sent: sent.length,
     failed: failed.length,
     details: { sent, failed },
+  };
+}
+
+function listCrmHumanHandoffTargets(crmSettings = {}) {
+  const targets = [];
+  const configured = normalizePhone(crmSettings?.humanHandoffInternalNumber || "");
+  if (configured) {
+    targets.push(configured);
+  }
+  for (const phone of listHumanAlertPhones()) {
+    const normalized = normalizePhone(phone);
+    if (normalized && !targets.includes(normalized)) {
+      targets.push(normalized);
+    }
+  }
+  return targets;
+}
+
+function buildCrmHumanHandoffClientMessage({ tenant, flow = null, crmSettings = {}, customerName = "" } = {}) {
+  const humanNumber = toNonEmptyString(crmSettings?.humanHandoffClientNumber);
+  const fallbackTemplate = humanNumber
+    ? "Perfeito, {{client_name}}. Vou encaminhar seu atendimento para nossa equipe humana agora. Se preferir falar direto, este e o numero: {{human_number}}."
+    : "Perfeito, {{client_name}}. Vou encaminhar seu atendimento para nossa equipe humana agora.";
+  const template = toNonEmptyString(crmSettings?.humanHandoffMessageTemplate) || fallbackTemplate;
+  const message = formatCrmStepMessage(template, {
+    clientName: toNonEmptyString(customerName || flow?.client_name || flow?.clientName),
+    serviceName: toNonEmptyString(flow?.origin_service_name || flow?.originServiceName),
+    lastVisitAt: toNonEmptyString(flow?.last_visit_at || flow?.lastVisitAt),
+    humanNumber,
+  });
+  return toNonEmptyString(message);
+}
+
+function buildCrmHumanHandoffInternalSummary({
+  tenant,
+  flow = null,
+  customerPhone = "",
+  customerName = "",
+  customerMessage = "",
+  triggerReason = "",
+  initiatedBy = "",
+} = {}) {
+  const now = new Date();
+  const tenantLabel = toNonEmptyString(tenant?.name || tenant?.code) || "Tenant sem nome";
+  const clientLabel = toNonEmptyString(customerName || flow?.client_name || flow?.clientName) || "Cliente sem nome";
+  const serviceLabel = toNonEmptyString(flow?.origin_service_name || flow?.originServiceName) || "-";
+  const categoryLabel = toNonEmptyString(flow?.origin_category_name || flow?.originCategoryName) || "-";
+  const lastVisitLabel = isoToBrDate(toNonEmptyString(flow?.last_visit_at || flow?.lastVisitAt))
+    || toNonEmptyString(flow?.last_visit_at || flow?.lastVisitAt)
+    || "-";
+  const professionalName = toNonEmptyString(flow?.last_professional_name || flow?.lastProfessionalName) || "-";
+  const professionalActive = flow?.last_professional_active == null && flow?.lastProfessionalActive == null
+    ? null
+    : (
+      flow?.last_professional_active == null
+        ? Boolean(flow?.lastProfessionalActive)
+        : Number(flow?.last_professional_active) !== 0
+    );
+  const professionalStatus = professionalActive == null ? "nao validado" : (professionalActive ? "ativo" : "inativo");
+  const flowStep = Number(flow?.current_step || flow?.currentStep || 0);
+  const flowStatus = toNonEmptyString(flow?.flow_status || flow?.flowStatus) || "-";
+
+  return [
+    "CRM - HANDOFF HUMANO",
+    `Tenant: ${tenantLabel}`,
+    `Cliente: ${clientLabel}`,
+    `WhatsApp: ${normalizePhone(customerPhone) || "-"}`,
+    `Servico de origem: ${serviceLabel}`,
+    `Categoria: ${categoryLabel}`,
+    `Ultima visita: ${lastVisitLabel}`,
+    `Ultimo profissional: ${professionalName} (${professionalStatus})`,
+    `Etapa/status do fluxo: ${flowStep} / ${flowStatus}`,
+    `Motivo: ${toNonEmptyString(triggerReason) || "Solicitacao de atendimento humano"}`,
+    `Mensagem da cliente: ${toNonEmptyString(customerMessage) || "-"}`,
+    `Acionado por: ${toNonEmptyString(initiatedBy) || "sistema"}`,
+    `Horario: ${new Intl.DateTimeFormat("pt-BR", {
+      timeZone: "America/Sao_Paulo",
+      dateStyle: "short",
+      timeStyle: "short",
+    }).format(now)}`,
+  ].join("\n");
+}
+
+async function notifyCrmHumanHandoffTargets({
+  instance,
+  tenantCode = "",
+  targets = [],
+  text = "",
+} = {}) {
+  const normalizedTargets = [...new Set((Array.isArray(targets) ? targets : []).map((item) => normalizePhone(item)).filter(Boolean))];
+  if (!normalizedTargets.length || !toNonEmptyString(text)) {
+    return { sent: 0, failed: 0, targets: normalizedTargets, details: { sent: [], failed: [] } };
+  }
+
+  const sent = [];
+  const failed = [];
+  for (const target of normalizedTargets) {
+    try {
+      const result = await evolutionRequest(`/message/sendText/${instance}`, {
+        method: "POST",
+        body: { number: target, text },
+        tenantCode,
+        instanceName: instance,
+      });
+      sent.push({ phone: target, result });
+    } catch (error) {
+      failed.push({
+        phone: target,
+        message: error?.message || "Erro ao enviar resumo interno.",
+        status: error?.status || null,
+      });
+    }
+  }
+
+  return {
+    sent: sent.length,
+    failed: failed.length,
+    targets: normalizedTargets,
+    details: { sent, failed },
+  };
+}
+
+async function activateCrmHumanHandoff({
+  tenant,
+  flow = null,
+  crmSettings = {},
+  instance = "",
+  phone = "",
+  customerName = "",
+  customerMessage = "",
+  triggerSource = "",
+  triggerReason = "",
+  initiatedBy = "",
+} = {}) {
+  if (!tenant?.id || !tenant?.code) {
+    const error = new Error("Tenant invalido para handoff do CRM.");
+    error.status = 400;
+    throw error;
+  }
+
+  const normalizedPhone = normalizePhone(phone || flow?.phone || "");
+  if (!normalizedPhone) {
+    const error = new Error("Telefone da cliente ausente para handoff do CRM.");
+    error.status = 400;
+    throw error;
+  }
+
+  const resolvedInstance = toNonEmptyString(instance) || resolveEvolutionInstance(null, { tenantCode: tenant.code });
+  if (!resolvedInstance) {
+    const error = new Error("Instancia Evolution nao configurada para handoff do CRM.");
+    error.status = 500;
+    throw error;
+  }
+
+  const resolvedSettings = crmSettings && typeof crmSettings === "object"
+    ? crmSettings
+    : (getTenantCrmSettingsByCode(tenant.code)?.config || getDefaultCrmSettings());
+  const shouldPauseAi = resolvedSettings.humanHandoffPauseAi == null
+    ? true
+    : Boolean(resolvedSettings.humanHandoffPauseAi);
+  const resolvedCustomerName = toNonEmptyString(customerName || flow?.client_name || flow?.clientName);
+
+  const clientMessage = buildCrmHumanHandoffClientMessage({
+    tenant,
+    flow,
+    crmSettings: resolvedSettings,
+    customerName: resolvedCustomerName,
+  });
+  if (clientMessage) {
+    await evolutionRequest(`/message/sendText/${resolvedInstance}`, {
+      method: "POST",
+      body: { number: normalizedPhone, text: clientMessage },
+      tenantCode: tenant.code,
+      instanceName: resolvedInstance,
+    });
+    pushWhatsappHistory(normalizedPhone, "assistant", clientMessage, "", {
+      tenantCode: tenant.code,
+    });
+  }
+
+  const summaryText = buildCrmHumanHandoffInternalSummary({
+    tenant,
+    flow,
+    customerPhone: normalizedPhone,
+    customerName: resolvedCustomerName,
+    customerMessage,
+    triggerReason,
+    initiatedBy,
+  });
+  const internalTargets = resolvedSettings.humanHandoffSendInternalSummary === false
+    ? []
+    : listCrmHumanHandoffTargets(resolvedSettings);
+  const internalAlert = await notifyCrmHumanHandoffTargets({
+    instance: resolvedInstance,
+    tenantCode: tenant.code,
+    targets: internalTargets,
+    text: summaryText,
+  });
+
+  const session = shouldPauseAi
+    ? setHumanHandoffSession(normalizedPhone, {
+      source: triggerSource || "crm",
+      reason: triggerReason || "Handoff CRM",
+      establishmentId: tenant.establishmentId || null,
+      customerName: resolvedCustomerName,
+      messageId: "",
+      flowId: Number.isFinite(Number(flow?.id)) ? Number(flow.id) : null,
+      tenantCode: tenant.code,
+    })
+    : null;
+
+  if (flow?.id) {
+    if (shouldPauseAi) {
+      stopCrmFlowForSystemReason(flow.id, tenant.id, "human_handoff", {
+        source: triggerSource || "crm",
+        initiatedBy: toNonEmptyString(initiatedBy),
+        phone: normalizedPhone,
+      });
+    }
+    recordCrmFlowEvent({
+      flowId: flow.id,
+      tenantId: tenant.id,
+      eventType: "human_handoff",
+      step: Number(flow.current_step || flow.currentStep || 0) || null,
+      metadata: {
+        source: toNonEmptyString(triggerSource) || "crm",
+        reason: toNonEmptyString(triggerReason) || "Handoff CRM",
+        initiatedBy: toNonEmptyString(initiatedBy),
+        clientMessageSent: Boolean(clientMessage),
+        internalTargets: internalAlert.targets || [],
+        internalSummarySentCount: Number(internalAlert.sent || 0),
+        pauseAi: shouldPauseAi,
+      },
+      messagePreview: clientMessage.slice(0, 200),
+      messageSent: clientMessage,
+      replySummary: toNonEmptyString(customerMessage).slice(0, 300),
+    });
+  }
+
+  return {
+    clientMessage,
+    internalAlert,
+    shouldPauseAi,
+    session,
+    instance: resolvedInstance,
   };
 }
 
@@ -12320,6 +12636,35 @@ app.post("/api/admin/tenants/:code/crm/flows/:id/approve", async (req, res) => {
       });
     }
     const crmSettings = getTenantCrmSettingsByCode(req.params.code)?.config || getDefaultCrmSettings();
+    if (isCrmPhoneBlockedForTenantCode(tenant.code, flow.phone)) {
+      stopCrmFlowForSystemReason(flowId, tenant.id, "client_blocked", {
+        source: "approve",
+        phone: normalizePhone(flow.phone),
+      });
+      return res.status(409).json({
+        status: "error",
+        message: "Esta cliente esta bloqueada no CRM. O fluxo foi encerrado.",
+      });
+    }
+    if (crmSettings.stopFlowOnAnyFutureBooking) {
+      const futureBooking = await detectFutureBookingForPhone(
+        tenant,
+        flow.phone,
+        new Map(),
+        getSaoPauloDateContext().isoToday,
+      );
+      if (futureBooking?.hasFutureBooking) {
+        stopCrmFlowForSystemReason(flowId, tenant.id, "future_booking", {
+          source: "approve",
+          phone: normalizePhone(flow.phone),
+          firstFutureBooking: futureBooking.firstFutureBooking || null,
+        });
+        return res.status(409).json({
+          status: "error",
+          message: "A cliente ja possui agendamento futuro. O fluxo foi encerrado.",
+        });
+      }
+    }
     const serviceRule = db.prepare(
       `SELECT * FROM tenant_service_return_rules WHERE tenant_id = ? AND service_key = ? LIMIT 1`,
     ).get(tenant.id, flow.origin_service_key);
@@ -12403,6 +12748,54 @@ app.post("/api/admin/tenants/:code/crm/flows/:id/stop", (req, res) => {
     return res.status(error.status || 500).json({
       status: "error",
       message: error.message || "Erro ao encerrar fluxo.",
+    });
+  }
+});
+
+app.post("/api/admin/tenants/:code/crm/flows/:id/handoff", async (req, res) => {
+  try {
+    const principal = requireAdminPrincipal(req, res);
+    if (!principal) return;
+    if (!principalCanAccessTenant(principal, req.params.code)) {
+      return res.status(403).json({ status: "error", message: "Sem permissao para este tenant." });
+    }
+    const tenant = getTenantByCode(req.params.code);
+    if (!tenant) return res.status(404).json({ status: "error", message: "Tenant nao encontrado." });
+    const flowId = Number(req.params.id);
+    if (!flowId) return res.status(400).json({ status: "error", message: "ID invalido." });
+    const flow = getCrmFlowById(flowId, tenant.id);
+    if (!flow) return res.status(404).json({ status: "error", message: "Fluxo nao encontrado." });
+    if (["converted", "stopped", "expired"].includes(toNonEmptyString(flow.flow_status || flow.flowStatus))) {
+      return res.status(400).json({
+        status: "error",
+        message: `Fluxo nao permite handoff no status atual: ${flow.flow_status || flow.flowStatus}`,
+      });
+    }
+
+    const crmSettings = getTenantCrmSettingsByCode(req.params.code)?.config || getDefaultCrmSettings();
+    const initiatedBy = toNonEmptyString(principal.displayName || principal.username || principal.tenantCode || "admin");
+    const handoffResult = await activateCrmHumanHandoff({
+      tenant,
+      flow,
+      crmSettings,
+      triggerSource: "crm_admin",
+      triggerReason: toNonEmptyString(req.body?.reason) || "Encaminhado manualmente pelo CRM",
+      customerMessage: toNonEmptyString(req.body?.customerMessage),
+      initiatedBy,
+    });
+
+    return res.json({
+      status: "ok",
+      message: "Handoff humano acionado com sucesso.",
+      handoff: handoffResult,
+      flow: getCrmFlowById(flowId, tenant.id),
+      events: getCrmFlowEventsByFlowId(flowId, tenant.id),
+    });
+  } catch (error) {
+    return res.status(error.status || 500).json({
+      status: "error",
+      message: error.message || "Erro ao acionar handoff humano do CRM.",
+      details: error.details || null,
     });
   }
 });
@@ -13953,6 +14346,13 @@ app.post("/webhook/whatsapp", webhookBodyParser, async (req, res) => {
     pushWhatsappHistory(incoming.senderNumber, "user", incoming.messageText, effectiveClientName, {
       tenantCode: webhookTenantCode,
     });
+    const webhookTenant = webhookTenantCode ? getTenantByCode(webhookTenantCode) : null;
+    const activeCrmFlow = webhookTenant?.id
+      ? getActiveCrmFlowForPhone(webhookTenant.id, incoming.senderNumber)
+      : null;
+    const webhookCrmSettings = webhookTenant?.code
+      ? (getTenantCrmSettingsByCode(webhookTenant.code)?.config || getDefaultCrmSettings())
+      : null;
 
     const activeBotSession = getBotAutoClosedSession(incoming.senderNumber, webhookTenantCode);
     if (activeBotSession?.active) {
@@ -14109,37 +14509,58 @@ app.post("/webhook/whatsapp", webhookBodyParser, async (req, res) => {
       }
 
       if (askedHuman) {
-        const session = setHumanHandoffSession(incoming.senderNumber, {
-          source: "customerRequest",
-          reason: incoming.messageText,
-          establishmentId,
-          customerName: effectiveClientName,
-          messageId: incoming.messageId || "",
-          tenantCode: webhookTenantCode,
-        });
+        let session = null;
+        let alertResult = null;
+        let ackMessage = "";
+        if (webhookTenant && webhookCrmSettings?.humanHandoffEnabled) {
+          const handoffResult = await activateCrmHumanHandoff({
+            tenant: webhookTenant,
+            flow: activeCrmFlow,
+            crmSettings: webhookCrmSettings,
+            instance,
+            phone: incoming.senderNumber,
+            customerName: effectiveClientName,
+            customerMessage: incoming.messageText,
+            triggerSource: "customer_request",
+            triggerReason: incoming.messageText,
+            initiatedBy: "cliente_whatsapp",
+          });
+          session = handoffResult.session;
+          alertResult = handoffResult.internalAlert;
+          ackMessage = handoffResult.clientMessage;
+        } else {
+          session = setHumanHandoffSession(incoming.senderNumber, {
+            source: "customerRequest",
+            reason: incoming.messageText,
+            establishmentId,
+            customerName: effectiveClientName,
+            messageId: incoming.messageId || "",
+            tenantCode: webhookTenantCode,
+          });
 
-        const ackMessage =
-          toNonEmptyString(process.env.HUMAN_HANDOFF_ACK_MESSAGE) ||
-          "Perfeito. Vou acionar nossa recepcao agora e um atendente humano segue com voce.";
+          ackMessage =
+            toNonEmptyString(process.env.HUMAN_HANDOFF_ACK_MESSAGE) ||
+            "Perfeito. Vou acionar nossa recepcao agora e um atendente humano segue com voce.";
 
-        await evolutionRequest(`/message/sendText/${instance}`, {
-          method: "POST",
-          body: {
-            number: incoming.senderNumber,
-            text: ackMessage,
-          },
-        });
-        pushWhatsappHistory(incoming.senderNumber, "assistant", ackMessage, "", {
-          tenantCode: webhookTenantCode,
-        });
+          await evolutionRequest(`/message/sendText/${instance}`, {
+            method: "POST",
+            body: {
+              number: incoming.senderNumber,
+              text: ackMessage,
+            },
+          });
+          pushWhatsappHistory(incoming.senderNumber, "assistant", ackMessage, "", {
+            tenantCode: webhookTenantCode,
+          });
 
-        const alertResult = await notifyHumanAlertPhones({
-          instance,
-          establishmentId,
-          customerPhone: incoming.senderNumber,
-          customerName: effectiveClientName,
-          customerMessage: incoming.messageText,
-        });
+          alertResult = await notifyHumanAlertPhones({
+            instance,
+            establishmentId,
+            customerPhone: incoming.senderNumber,
+            customerName: effectiveClientName,
+            customerMessage: incoming.messageText,
+          });
+        }
         recordWebhookEvent({
           tenantCode: webhookTenantCode,
           event: incoming.event,
@@ -14230,17 +14651,22 @@ app.post("/webhook/whatsapp", webhookBodyParser, async (req, res) => {
     }
 
     // ---- CRM Phase 6: reply detection, opt-out, context injection ----
-    const webhookTenant = webhookTenantCode ? getTenantByCode(webhookTenantCode) : null;
-    const activeCrmFlow = webhookTenant?.id
-      ? getActiveCrmFlowForPhone(webhookTenant.id, incoming.senderNumber)
-      : null;
     let crmContext = null;
 
     if (activeCrmFlow) {
       if (isCrmOptOutText(incoming.messageText)) {
-        updateCrmFlowStatus(activeCrmFlow.id, webhookTenant.id, {
-          flow_status: "opted_out",
-          stop_reason: "opt_out",
+        upsertCrmClientBlockByCode(webhookTenant.code, {
+          clientId: activeCrmFlow.client_id,
+          clientName: toNonEmptyString(activeCrmFlow.client_name || effectiveClientName),
+          phone: incoming.senderNumber,
+          isBlocked: true,
+          blockReason: "opt_out",
+          blockNotes: "Bloqueio automatico por pedido da cliente no fluxo CRM.",
+          blockedBy: "crm_opt_out",
+        });
+        stopCrmFlowForSystemReason(activeCrmFlow.id, webhookTenant.id, "opt_out", {
+          source: "webhook",
+          phone: normalizePhone(incoming.senderNumber),
         });
         recordCrmFlowEvent({
           flowId: activeCrmFlow.id,
@@ -14534,6 +14960,22 @@ async function runCrmReturnFlowScheduler() {
       if (!tenant.id || !tenant.code) continue;
       const settings = getTenantCrmSettingsByCode(tenant.code)?.config;
       if (!settings?.crmReturnEnabled) continue;
+      const { isoToday } = getSaoPauloDateContext();
+      const currentClockTime = getSaoPauloClockTime();
+      if (
+        !isTimeWithinCrmWindow(
+          currentClockTime,
+          settings.messageSendingWindowStart,
+          settings.messageSendingWindowEnd,
+        )
+      ) {
+        continue;
+      }
+      const dailyLimit = Number(settings.messageDailyLimit || 0);
+      let sentTodayCount = countTenantCrmStepSentOnIsoDate(tenant.id, isoToday);
+      if (dailyLimit > 0 && sentTodayCount >= dailyLimit) {
+        continue;
+      }
       const nowIso = new Date().toISOString();
       const dueFlows = db.prepare(
         `SELECT * FROM crm_return_flows
@@ -14546,8 +14988,35 @@ async function runCrmReturnFlowScheduler() {
       if (!dueFlows.length) continue;
       const instance = resolveEvolutionInstance(null, { tenantCode: tenant.code });
       if (!instance) continue;
+      const futureBookingCache = new Map();
       for (const flow of dueFlows) {
+        if (dailyLimit > 0 && sentTodayCount >= dailyLimit) {
+          break;
+        }
         try {
+          if (isCrmPhoneBlockedForTenantCode(tenant.code, flow.phone)) {
+            stopCrmFlowForSystemReason(flow.id, tenant.id, "client_blocked", {
+              source: "scheduler",
+              phone: normalizePhone(flow.phone),
+            });
+            continue;
+          }
+          if (settings.stopFlowOnAnyFutureBooking) {
+            const futureBooking = await detectFutureBookingForPhone(
+              tenant,
+              flow.phone,
+              futureBookingCache,
+              isoToday,
+            );
+            if (futureBooking?.hasFutureBooking) {
+              stopCrmFlowForSystemReason(flow.id, tenant.id, "future_booking", {
+                source: "scheduler",
+                phone: normalizePhone(flow.phone),
+                firstFutureBooking: futureBooking.firstFutureBooking || null,
+              });
+              continue;
+            }
+          }
           const stepNumber = flow.flow_status === "scheduled_step_2" ? 2 : 3;
           const serviceRule = db.prepare(
             `SELECT * FROM tenant_service_return_rules WHERE tenant_id = ? AND service_key = ? LIMIT 1`,
@@ -14587,6 +15056,7 @@ async function runCrmReturnFlowScheduler() {
             messageSent: msg,
             messagePreview: msg.slice(0, 200),
           });
+          sentTodayCount += 1;
         } catch (innerErr) {
           console.error(`[crm-scheduler] flow ${flow.id} step error:`, innerErr?.message);
         }
@@ -14598,5 +15068,3 @@ async function runCrmReturnFlowScheduler() {
 }
 
 setInterval(runCrmReturnFlowScheduler, 5 * 60 * 1000);
-
-

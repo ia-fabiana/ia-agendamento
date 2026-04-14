@@ -212,16 +212,24 @@ type CrmFlowItem = {
   clientId?: number | null;
   clientName?: string;
   phone?: string;
+  originServiceKey?: string;
   originServiceName?: string;
+  originCategoryKey?: string;
   originCategoryName?: string;
   lastVisitAt?: string;
+  lastProfessionalId?: number | null;
   lastProfessionalName?: string;
   lastProfessionalActive?: boolean | null;
   flowStatus?: string;
   currentStep?: number;
+  enteredFlowAt?: string;
   stopReason?: string;
   lastMessageSentAt?: string;
+  nextScheduledSendAt?: string;
+  convertedAppointmentId?: number | null;
   convertedAt?: string;
+  createdAt?: string;
+  updatedAt?: string;
 };
 
 type CrmFlowEvent = {
@@ -330,6 +338,65 @@ function normalizeDigits(value: string) {
   return String(value || '').replace(/\D/g, '');
 }
 
+function normalizeSearchText(value: string) {
+  return String(value || '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .trim()
+    .toLowerCase();
+}
+
+function formatDateTimePtBr(value?: string | null) {
+  if (!value) return '';
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) return String(value);
+  return parsed.toLocaleString('pt-BR');
+}
+
+function buildCrmFlowTiming(flow: CrmFlowItem) {
+  const now = Date.now();
+  const status = String(flow.flowStatus || '').trim();
+  const createdAt = flow.enteredFlowAt || flow.createdAt || flow.lastVisitAt || '';
+  const nextAt = flow.nextScheduledSendAt || '';
+
+  const buildState = (tone: 'neutral' | 'info' | 'warning' | 'success', label: string, date?: string | null) => ({
+    tone,
+    label,
+    dateLabel: formatDateTimePtBr(date),
+  });
+
+  if (['pending_approval', 'eligible', 'scheduled_step_1'].includes(status)) {
+    const reference = createdAt ? new Date(createdAt) : null;
+    const isLate = reference ? now - reference.getTime() > 24 * 60 * 60 * 1000 : false;
+    return buildState(isLate ? 'warning' : 'info', isLate ? 'Etapa 1 atrasada' : 'Etapa 1 em dia', createdAt);
+  }
+
+  if (['scheduled_step_2', 'scheduled_step_3'].includes(status)) {
+    const step = status === 'scheduled_step_2' ? 2 : 3;
+    const dueAt = nextAt ? new Date(nextAt) : null;
+    const isLate = dueAt ? dueAt.getTime() <= now : false;
+    return buildState(isLate ? 'warning' : 'info', isLate ? `Etapa ${step} atrasada` : `Etapa ${step} prevista`, nextAt);
+  }
+
+  if (status === 'in_progress') {
+    return buildState('neutral', 'Conversa em andamento', flow.lastMessageSentAt || createdAt);
+  }
+
+  if (status === 'converted') {
+    return buildState('success', 'Fluxo convertido', flow.convertedAt || flow.updatedAt);
+  }
+
+  if (status === 'stopped') {
+    return buildState('neutral', 'Fluxo encerrado', flow.updatedAt || flow.lastMessageSentAt || createdAt);
+  }
+
+  if (status === 'expired') {
+    return buildState('neutral', 'Fluxo expirado', flow.updatedAt || flow.lastMessageSentAt || createdAt);
+  }
+
+  return buildState('neutral', 'Sem proxima acao definida', createdAt);
+}
+
 function mergeCrmSettings(input?: CrmSettings | null): CrmSettings {
   return {
     ...defaultCrmSettings,
@@ -417,6 +484,17 @@ const defaultCrmSettings: CrmSettings = {
   allowOnlyWhitelistedPhonesInBeta: false,
   betaTestPhones: [],
 };
+
+function buildDefaultCrmStepTemplates() {
+  return {
+    step1MessageTemplate:
+      'Oi {{client_name}}! Tudo bem? Ja faz um tempinho desde sua ultima visita para {{service_name}}. Se quiser, eu posso te ajudar a encontrar um novo horario.',
+    step2MessageTemplate:
+      'Oi {{client_name}}! Passando para lembrar do seu retorno de {{service_name}}. Desde {{last_visit_at}}, talvez ja seja um bom momento para reservar seu proximo horario.',
+    step3MessageTemplate:
+      'Oi {{client_name}}! Este e meu ultimo lembrete sobre {{service_name}}. Se quiser, posso verificar agora um horario para voce com toda praticidade.',
+  };
+}
 
 function normalizeToneToken(value: string) {
   return String(value || '')
@@ -536,6 +614,9 @@ export default function App() {
   const [crmBlockClientName, setCrmBlockClientName] = useState('');
   const [crmBlockReason, setCrmBlockReason] = useState('manual_block');
   const [crmBlockNotes, setCrmBlockNotes] = useState('');
+  const [crmServiceSearch, setCrmServiceSearch] = useState('');
+  const [crmServiceCategoryFilter, setCrmServiceCategoryFilter] = useState('all');
+  const [crmShowOnlySelectedServices, setCrmShowOnlySelectedServices] = useState(true);
   const [uploadingMarketingIndex, setUploadingMarketingIndex] = useState<number | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const appointmentService = useRef<AppointmentService | null>(null);
@@ -1718,6 +1799,10 @@ export default function App() {
     setCrmServiceCatalog((current) =>
       current.map((item) => {
         if (item.serviceKey !== serviceKey) return item;
+        const shouldInjectSuggestedMessages =
+          patch.active === true &&
+          (!item.rule?.step1MessageTemplate && !item.rule?.step2MessageTemplate && !item.rule?.step3MessageTemplate);
+        const suggestedTemplates = shouldInjectSuggestedMessages ? buildDefaultCrmStepTemplates() : null;
         const nextRule: CrmServiceRule = {
           serviceKey: item.serviceKey,
           serviceName: item.serviceName,
@@ -1727,6 +1812,7 @@ export default function App() {
           useDefaultFlow: true,
           priority: 'medium',
           ...(item.rule || {}),
+          ...(suggestedTemplates || {}),
           ...patch,
         };
         return { ...item, rule: nextRule };
@@ -1888,6 +1974,34 @@ export default function App() {
     }
   };
 
+  const handleRefreshCrmEligibleNow = async () => {
+    if (!appointmentService.current || !adminToken.trim()) return;
+    const tenantCode = resolveCrmTenantScopeCode();
+    if (!tenantCode) {
+      setCrmStatus('Selecione um tenant para atualizar as clientes elegiveis.');
+      return;
+    }
+
+    setIsLoadingCrm(true);
+    setCrmStatus('');
+    try {
+      const response = await appointmentService.current.runTenantCrmPreview(adminToken, tenantCode, {
+        lookbackDays: crmPreviewLookbackDays,
+        materialize: true,
+        limit: 250,
+      });
+      setCrmPreview(response.preview || null);
+      setCrmDashboard(response.dashboard || null);
+      await loadCrmData();
+      setCrmStatus('Clientes elegiveis recalculadas e atualizadas no CRM.');
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Erro ao atualizar elegiveis do CRM.';
+      setCrmStatus(message);
+    } finally {
+      setIsLoadingCrm(false);
+    }
+  };
+
   const handleApproveCrmFlow = async (flowId: number) => {
     if (!appointmentService.current || !adminToken.trim()) return;
     const tenantCode = resolveCrmTenantScopeCode();
@@ -1924,6 +2038,24 @@ export default function App() {
     }
   };
 
+  const handleHandoffCrmFlow = async (flowId: number) => {
+    if (!appointmentService.current || !adminToken.trim()) return;
+    const tenantCode = resolveCrmTenantScopeCode();
+    if (!tenantCode || !flowId) return;
+    setCrmFlowActionLoading(flowId);
+    setCrmStatus('');
+    try {
+      await appointmentService.current.handoffCrmFlow(adminToken, tenantCode, flowId);
+      setCrmStatus('Handoff humano acionado para este fluxo.');
+      await loadCrmData();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Erro ao acionar handoff humano.';
+      setCrmStatus(message);
+    } finally {
+      setCrmFlowActionLoading(null);
+    }
+  };
+
   const handleToggleCrmFlowEvents = async (flowId: number) => {
     if (expandedFlowId === flowId) {
       setExpandedFlowId(null);
@@ -1951,6 +2083,34 @@ export default function App() {
   const showSuperAdminEntry =
     typeof window !== 'undefined' && new URLSearchParams(window.location.search).get('admin') === '1';
   const tenantEvolutionInstance = extractEvolutionInstanceFromIdentifiers(adminTenantIdentifiers);
+  const crmServiceCategoryOptions = Array.from(
+    new Map(
+      crmServiceCatalog
+        .map((item) => [String(item.categoryKey || '').trim(), String(item.categoryName || '').trim()] as const)
+        .filter(([categoryKey, categoryName]) => categoryKey && categoryName),
+    ).entries(),
+  )
+    .map(([categoryKey, categoryName]) => ({ categoryKey, categoryName }))
+    .sort((left, right) => left.categoryName.localeCompare(right.categoryName, 'pt-BR'));
+  const crmEnabledServices = crmServiceCatalog.filter((item) => Boolean(item.rule?.active));
+  const crmServiceSearchToken = normalizeSearchText(crmServiceSearch);
+  const crmFilteredServiceCatalog = crmServiceCatalog.filter((item) => {
+    if (crmShowOnlySelectedServices && !item.rule?.active) {
+      return false;
+    }
+    if (crmServiceCategoryFilter !== 'all' && item.categoryKey !== crmServiceCategoryFilter) {
+      return false;
+    }
+    if (!crmServiceSearchToken) {
+      return true;
+    }
+    const haystack = normalizeSearchText([
+      item.serviceName,
+      item.categoryName,
+      item.rule?.notes,
+    ].filter(Boolean).join(' '));
+    return haystack.includes(crmServiceSearchToken);
+  });
 
   useEffect(() => {
     if (!isAuthenticated) {
@@ -2549,6 +2709,14 @@ export default function App() {
                       Materializar
                     </button>
                     <button
+                      onClick={handleRefreshCrmEligibleNow}
+                      disabled={isLoadingCrm || !adminToken.trim()}
+                      className="px-4 py-2 rounded-lg bg-emerald-500/80 text-slate-950 text-xs uppercase tracking-wider disabled:opacity-50"
+                      title="Recalcula quem esta elegivel agora e atualiza a lista operacional"
+                    >
+                      Atualizar elegiveis
+                    </button>
+                    <button
                       onClick={loadCrmData}
                       disabled={isLoadingCrm || !adminToken.trim()}
                       className="px-4 py-2 rounded-lg bg-white/10 text-white text-xs uppercase tracking-wider disabled:opacity-50"
@@ -2773,20 +2941,87 @@ export default function App() {
 
                 <div className="rounded-xl bg-white/5 border border-white/10 p-4 space-y-4">
                   <div className="flex items-center justify-between gap-3 flex-wrap">
-                    <h3 className="text-sm uppercase tracking-wider text-white/70">Regras Por Servico</h3>
-                    <button
-                      onClick={handleSaveCrmServiceRules}
-                      disabled={isLoadingCrm || !adminToken.trim()}
-                      className="px-4 py-2 rounded-lg bg-brand-blue text-white text-xs uppercase tracking-wider disabled:opacity-50"
-                    >
-                      Salvar servicos
-                    </button>
+                    <div>
+                      <h3 className="text-sm uppercase tracking-wider text-white/70">Regras Por Servico</h3>
+                      <p className="text-xs text-white/55 mt-1">
+                        Catalogo carregado do Trinks para este tenant. Voce habilita so o que quer usar no CRM.
+                      </p>
+                    </div>
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <span className="text-xs text-white/55">
+                        {crmEnabledServices.length} habilitado(s) de {crmServiceCatalog.length}
+                      </span>
+                      <button
+                        onClick={handleSaveCrmServiceRules}
+                        disabled={isLoadingCrm || !adminToken.trim()}
+                        className="px-4 py-2 rounded-lg bg-brand-blue text-white text-xs uppercase tracking-wider disabled:opacity-50"
+                      >
+                        Salvar servicos
+                      </button>
+                    </div>
                   </div>
+
+                  <div className="rounded-lg border border-white/10 bg-white/5 p-3 space-y-3">
+                    <div className="grid xl:grid-cols-[minmax(0,1.2fr)_220px_auto] gap-3">
+                      <input
+                        value={crmServiceSearch}
+                        onChange={(e) => setCrmServiceSearch(e.target.value)}
+                        placeholder="Buscar servico do Trinks por nome ou categoria"
+                        className="rounded-md bg-[#0f1731] border border-white/15 text-white/90 px-3 py-2 text-sm"
+                      />
+                      <select
+                        value={crmServiceCategoryFilter}
+                        onChange={(e) => setCrmServiceCategoryFilter(e.target.value)}
+                        className="rounded-md bg-[#0f1731] border border-white/15 text-white/90 px-3 py-2 text-sm"
+                      >
+                        <option value="all">Todas as categorias</option>
+                        {crmServiceCategoryOptions.map((item) => (
+                          <option key={item.categoryKey} value={item.categoryKey}>
+                            {item.categoryName}
+                          </option>
+                        ))}
+                      </select>
+                      <label className="flex items-center gap-2 text-sm text-white/80">
+                        <input
+                          type="checkbox"
+                          checked={crmShowOnlySelectedServices}
+                          onChange={(e) => setCrmShowOnlySelectedServices(e.target.checked)}
+                        />
+                        Mostrar so habilitados
+                      </label>
+                    </div>
+                    <p className="text-[11px] text-white/50">
+                      Variaveis disponiveis nas mensagens: <span className="text-white/75">{'{{client_name}}'}</span>, <span className="text-white/75">{'{{service_name}}'}</span>, <span className="text-white/75">{'{{last_visit_at}}'}</span> e <span className="text-white/75">{'{{human_number}}'}</span>.
+                    </p>
+                    {!!crmEnabledServices.length && (
+                      <div className="space-y-2">
+                        <p className="text-xs uppercase tracking-wider text-white/55">Servicos habilitados no CRM</p>
+                        <div className="flex flex-wrap gap-2">
+                          {crmEnabledServices.map((item) => (
+                            <button
+                              key={`crm-enabled-${item.serviceKey}`}
+                              type="button"
+                              onClick={() => {
+                                setCrmServiceSearch(item.serviceName || '');
+                                setCrmServiceCategoryFilter(item.categoryKey || 'all');
+                                setCrmShowOnlySelectedServices(true);
+                              }}
+                              className="px-3 py-1.5 rounded-full bg-emerald-500/15 border border-emerald-400/20 text-emerald-100 text-xs"
+                              title="Filtrar para este servico habilitado"
+                            >
+                              {item.serviceName}
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+
                   <div className="overflow-x-auto">
                     <table className="w-full text-left text-xs text-white/85">
                       <thead className="text-white/60">
                         <tr>
-                          <th className="py-2 pr-3">Ativo</th>
+                          <th className="py-2 pr-3">Usar</th>
                           <th className="py-2 pr-3">Servico</th>
                           <th className="py-2 pr-3">Categoria</th>
                           <th className="py-2 pr-3">Retorno</th>
@@ -2802,14 +3037,27 @@ export default function App() {
                             <td colSpan={8} className="py-3 text-white/60">Nenhum servico carregado do Trinks ainda.</td>
                           </tr>
                         )}
-                        {crmServiceCatalog.map((item) => (
+                        {!!crmServiceCatalog.length && !crmFilteredServiceCatalog.length && (
+                          <tr>
+                            <td colSpan={8} className="py-3 text-white/60">
+                              Nenhum servico encontrado com os filtros atuais.
+                            </td>
+                          </tr>
+                        )}
+                        {crmFilteredServiceCatalog.map((item) => (
                           <tr key={item.serviceKey} className="border-t border-white/10 align-top">
                             <td className="py-2 pr-3">
-                              <input
-                                type="checkbox"
-                                checked={Boolean(item.rule?.active)}
-                                onChange={(e) => handleServiceRuleChange(item.serviceKey, { active: e.target.checked })}
-                              />
+                              <button
+                                type="button"
+                                onClick={() => handleServiceRuleChange(item.serviceKey, { active: !item.rule?.active })}
+                                className={`px-3 py-1 rounded-full text-[11px] font-medium border ${
+                                  item.rule?.active
+                                    ? 'bg-emerald-500/15 border-emerald-400/30 text-emerald-100'
+                                    : 'bg-white/5 border-white/10 text-white/65'
+                                }`}
+                              >
+                                {item.rule?.active ? 'Habilitado' : 'Adicionar'}
+                              </button>
                             </td>
                             <td className="py-2 pr-3">
                               <div className="font-medium">{item.serviceName}</div>
@@ -2824,40 +3072,45 @@ export default function App() {
                                 type="number"
                                 min={0}
                                 value={item.rule?.returnDays ?? ''}
+                                disabled={!item.rule?.active}
                                 onChange={(e) =>
                                   handleServiceRuleChange(item.serviceKey, {
                                     returnDays: e.target.value ? Number(e.target.value) : null,
                                   })
                                 }
-                                className="w-20 rounded-md bg-[#0f1731] border border-white/15 text-white/90 px-2 py-1 text-xs"
+                                className="w-20 rounded-md bg-[#0f1731] border border-white/15 text-white/90 px-2 py-1 text-xs disabled:opacity-40"
                               />
                             </td>
                             <td className="py-2 pr-3">
                               <textarea
                                 value={item.rule?.step1MessageTemplate || ''}
+                                disabled={!item.rule?.active}
                                 onChange={(e) => handleServiceRuleChange(item.serviceKey, { step1MessageTemplate: e.target.value })}
-                                className="w-44 rounded-md bg-[#0f1731] border border-white/15 text-white/90 px-2 py-1 text-xs min-h-16"
+                                className="w-44 rounded-md bg-[#0f1731] border border-white/15 text-white/90 px-2 py-1 text-xs min-h-16 disabled:opacity-40"
                               />
                             </td>
                             <td className="py-2 pr-3">
                               <textarea
                                 value={item.rule?.step2MessageTemplate || ''}
+                                disabled={!item.rule?.active}
                                 onChange={(e) => handleServiceRuleChange(item.serviceKey, { step2MessageTemplate: e.target.value })}
-                                className="w-44 rounded-md bg-[#0f1731] border border-white/15 text-white/90 px-2 py-1 text-xs min-h-16"
+                                className="w-44 rounded-md bg-[#0f1731] border border-white/15 text-white/90 px-2 py-1 text-xs min-h-16 disabled:opacity-40"
                               />
                             </td>
                             <td className="py-2 pr-3">
                               <textarea
                                 value={item.rule?.step3MessageTemplate || ''}
+                                disabled={!item.rule?.active}
                                 onChange={(e) => handleServiceRuleChange(item.serviceKey, { step3MessageTemplate: e.target.value })}
-                                className="w-44 rounded-md bg-[#0f1731] border border-white/15 text-white/90 px-2 py-1 text-xs min-h-16"
+                                className="w-44 rounded-md bg-[#0f1731] border border-white/15 text-white/90 px-2 py-1 text-xs min-h-16 disabled:opacity-40"
                               />
                             </td>
                             <td className="py-2 pr-0">
                               <textarea
                                 value={item.rule?.notes || ''}
+                                disabled={!item.rule?.active}
                                 onChange={(e) => handleServiceRuleChange(item.serviceKey, { notes: e.target.value })}
-                                className="w-40 rounded-md bg-[#0f1731] border border-white/15 text-white/90 px-2 py-1 text-xs min-h-16"
+                                className="w-40 rounded-md bg-[#0f1731] border border-white/15 text-white/90 px-2 py-1 text-xs min-h-16 disabled:opacity-40"
                               />
                             </td>
                           </tr>
@@ -3020,7 +3273,17 @@ export default function App() {
                         const isExpanded = expandedFlowId === flowId;
                         const isActionable = ['pending_approval', 'eligible', 'scheduled_step_1'].includes(item.flowStatus || '');
                         const isStoppable = !['converted', 'stopped', 'expired', 'opted_out'].includes(item.flowStatus || '');
+                        const canHandoff = !['converted', 'stopped', 'expired'].includes(item.flowStatus || '');
                         const isLoadingThis = crmFlowActionLoading === flowId;
+                        const flowTiming = buildCrmFlowTiming(item);
+                        const flowTimingClass =
+                          flowTiming.tone === 'warning'
+                            ? 'bg-amber-500/15 border-amber-400/20 text-amber-100'
+                            : flowTiming.tone === 'success'
+                              ? 'bg-emerald-500/15 border-emerald-400/20 text-emerald-100'
+                              : flowTiming.tone === 'info'
+                                ? 'bg-sky-500/15 border-sky-400/20 text-sky-100'
+                                : 'bg-white/5 border-white/10 text-white/70';
                         return (
                           <div key={`crm-flow-${flowId || item.phone}`} className="rounded-lg bg-white/5 border border-white/10 p-3 space-y-2">
                             <div className="flex items-start justify-between gap-2">
@@ -3032,6 +3295,28 @@ export default function App() {
                                 <div className="text-xs text-white/75">
                                   Ultimo profissional: {item.lastProfessionalName || 'nao informado'}
                                   {item.lastProfessionalActive === false ? ' (inativo)' : ''}
+                                </div>
+                                <div className="mt-2 flex flex-wrap items-center gap-2">
+                                  <span className={`px-2 py-1 rounded-full border text-[11px] ${flowTimingClass}`}>
+                                    {flowTiming.label}
+                                  </span>
+                                  {flowTiming.dateLabel && (
+                                    <span className="text-[11px] text-white/60">{flowTiming.dateLabel}</span>
+                                  )}
+                                </div>
+                                <div className="mt-2 grid md:grid-cols-3 gap-2 text-[11px] text-white/55">
+                                  <div>
+                                    Entrada no fluxo:
+                                    <span className="text-white/80"> {formatDateTimePtBr(item.enteredFlowAt || item.createdAt) || '-'}</span>
+                                  </div>
+                                  <div>
+                                    Ultimo envio:
+                                    <span className="text-white/80"> {formatDateTimePtBr(item.lastMessageSentAt) || '-'}</span>
+                                  </div>
+                                  <div>
+                                    Proxima acao:
+                                    <span className="text-white/80"> {formatDateTimePtBr(item.nextScheduledSendAt) || '-'}</span>
+                                  </div>
                                 </div>
                               </div>
                               <div className="flex gap-1 flex-shrink-0">
@@ -3053,6 +3338,16 @@ export default function App() {
                                     title="Encerrar este fluxo"
                                   >
                                     {isLoadingThis ? '...' : 'Parar'}
+                                  </button>
+                                )}
+                                {canHandoff && flowId > 0 && (
+                                  <button
+                                    onClick={() => handleHandoffCrmFlow(flowId)}
+                                    disabled={isLoadingThis}
+                                    className="px-2 py-1 rounded bg-amber-500/80 text-slate-950 text-xs font-medium disabled:opacity-50"
+                                    title="Encaminhar este fluxo para atendimento humano"
+                                  >
+                                    {isLoadingThis ? '...' : 'Humano'}
                                   </button>
                                 )}
                                 {flowId > 0 && (
