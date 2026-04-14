@@ -9943,7 +9943,27 @@ function appointmentLooksCanceled(item) {
     return true;
   }
 
-  const statusText = normalizeForMatch(firstNonEmpty([item?.status, item?.situacao, item?.state, item?.estado]));
+  const statusId = Number(
+    firstNonEmpty([
+      item?.statusId,
+      item?.status?.id,
+      item?.situacaoId,
+      item?.stateId,
+      item?.estadoId,
+    ]),
+  );
+  if (Number.isFinite(statusId) && statusId === TRINKS_STATUS_ID_CANCELLED) {
+    return true;
+  }
+
+  const statusText = normalizeForMatch(firstNonEmpty([
+    item?.status,
+    item?.status?.nome,
+    item?.status?.name,
+    item?.situacao,
+    item?.state,
+    item?.estado,
+  ]));
   return statusText.includes("cancel");
 }
 
