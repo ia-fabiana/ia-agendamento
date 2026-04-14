@@ -26,6 +26,23 @@ const MARKETING_UPLOAD_MAX_BYTES = Math.max(
 const MAX_WHATSAPP_HISTORY_MESSAGES = 20;
 const BOOKING_CONFIRMATION_TTL_MS = 20 * 60 * 1000;
 const HUMAN_HANDOFF_TTL_MS = 12 * 60 * 60 * 1000;
+const BOT_AUTOCLOSE_TTL_MS = Math.max(
+  10 * 60 * 1000,
+  Number(process.env.BOT_AUTOCLOSE_TTL_MS || 12 * 60 * 60 * 1000),
+);
+const BOOKING_MAX_DAYS_AHEAD = Math.max(1, Number(process.env.BOOKING_MAX_DAYS_AHEAD || 60));
+const BOOKING_MAX_DAYS_AHEAD_TENANTS = new Set(
+  String(process.env.BOOKING_MAX_DAYS_AHEAD_TENANTS || "jacques-janine-leo,essencia")
+    .split(/[,;\s]+/g)
+    .map((item) => normalizeTenantCode(item))
+    .filter(Boolean),
+);
+const BOOKING_MAX_DAYS_AHEAD_ESTABLISHMENTS = new Set(
+  String(process.env.BOOKING_MAX_DAYS_AHEAD_ESTABLISHMENT_IDS || "62260,62217")
+    .split(/[,;\s]+/g)
+    .map((item) => Number(item))
+    .filter((item) => Number.isFinite(item) && item > 0),
+);
 const MARKETING_ACTION_SESSION_TTL_MS = Math.max(
   10 * 60 * 1000,
   Number(process.env.MARKETING_ACTION_SESSION_TTL_MS || 6 * 60 * 60 * 1000),
@@ -38,6 +55,14 @@ const SCHEDULING_PROVIDER_TRINKS = "trinks";
 const SCHEDULING_PROVIDER_GOOGLE_CALENDAR = "google_calendar";
 const TENANT_SESSION_TTL_HOURS = Math.max(1, Number(process.env.TENANT_SESSION_TTL_HOURS || 24));
 const TENANT_MIN_PASSWORD_LENGTH = Math.max(8, Number(process.env.TENANT_MIN_PASSWORD_LENGTH || 8));
+const STRICT_TEST_BOOKING_GUARD_ENABLED =
+  !["0", "false", "off", "no", "nao"].includes(
+    String(process.env.STRICT_TEST_BOOKING_GUARD_ENABLED || "true").trim().toLowerCase(),
+  );
+const TEST_BOOKING_MARKER = toNonEmptyString(process.env.TEST_BOOKING_MARKER || "#TESTE");
+const INTERNAL_TEST_PHONE_SET = new Set(
+  parsePhoneList(process.env.INTERNAL_TEST_PHONES || process.env.TEST_INTERNAL_PHONES || ""),
+);
 const UNSUPPORTED_MESSAGE_REPLY =
   toNonEmptyString(process.env.WHATSAPP_UNSUPPORTED_MESSAGE_REPLY) ||
   "Recebi sua mensagem, mas no momento consigo ler apenas texto. Pode me escrever por texto, por favor?";
@@ -45,6 +70,7 @@ const whatsappConversations = new Map();
 const recentWebhookMessages = new Map();
 const pendingBookingConfirmations = new Map();
 const humanHandoffSessions = new Map();
+const botAutoClosedSessions = new Map();
 const marketingActionSessions = new Map();
 const WEBHOOK_DEDUPE_WINDOW_MS = 30_000;
 const db = initDatabase();
@@ -59,6 +85,7 @@ function initDatabase() {
   database.exec(`
     CREATE TABLE IF NOT EXISTS whatsapp_messages (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
+      tenant_code TEXT DEFAULT '',
       phone TEXT NOT NULL,
       role TEXT NOT NULL,
       content TEXT NOT NULL,
@@ -72,6 +99,7 @@ function initDatabase() {
 
     CREATE TABLE IF NOT EXISTS appointment_audit (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
+      tenant_code TEXT DEFAULT '',
       event_type TEXT NOT NULL,
       status TEXT NOT NULL,
       establishment_id INTEGER,
@@ -97,6 +125,7 @@ function initDatabase() {
 
     CREATE TABLE IF NOT EXISTS webhook_events (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
+      tenant_code TEXT DEFAULT '',
       event TEXT,
       instance_name TEXT,
       sender_raw TEXT,
@@ -209,9 +238,223 @@ function initDatabase() {
 
     CREATE INDEX IF NOT EXISTS idx_tenant_user_sessions_expires_at
       ON tenant_user_sessions(expires_at);
+
+    CREATE TABLE IF NOT EXISTS tenant_crm_settings (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      tenant_id INTEGER NOT NULL UNIQUE,
+      config_json TEXT DEFAULT '{}',
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      FOREIGN KEY(tenant_id) REFERENCES tenants(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS tenant_service_return_rules (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      tenant_id INTEGER NOT NULL,
+      service_key TEXT NOT NULL,
+      service_name TEXT NOT NULL,
+      category_key TEXT DEFAULT '',
+      category_name TEXT DEFAULT '',
+      active INTEGER NOT NULL DEFAULT 0,
+      return_days INTEGER,
+      use_default_flow INTEGER NOT NULL DEFAULT 1,
+      step1_delay_days INTEGER,
+      step1_message_template TEXT DEFAULT '',
+      step2_delay_days INTEGER,
+      step2_message_template TEXT DEFAULT '',
+      step3_delay_days INTEGER,
+      step3_message_template TEXT DEFAULT '',
+      priority TEXT DEFAULT 'medium',
+      notes TEXT DEFAULT '',
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      UNIQUE(tenant_id, service_key),
+      FOREIGN KEY(tenant_id) REFERENCES tenants(id) ON DELETE CASCADE
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_tenant_service_return_rules_tenant
+      ON tenant_service_return_rules(tenant_id, category_key, service_name);
+
+    CREATE TABLE IF NOT EXISTS tenant_category_opportunity_rules (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      tenant_id INTEGER NOT NULL,
+      category_key TEXT NOT NULL,
+      category_name TEXT NOT NULL,
+      opportunity_tracking_enabled INTEGER NOT NULL DEFAULT 1,
+      opportunity_days_without_return INTEGER,
+      opportunity_priority TEXT DEFAULT 'medium',
+      allow_manual_campaign INTEGER NOT NULL DEFAULT 1,
+      suggested_message_template TEXT DEFAULT '',
+      notes TEXT DEFAULT '',
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      UNIQUE(tenant_id, category_key),
+      FOREIGN KEY(tenant_id) REFERENCES tenants(id) ON DELETE CASCADE
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_tenant_category_opportunity_rules_tenant
+      ON tenant_category_opportunity_rules(tenant_id, category_key, category_name);
+
+    CREATE TABLE IF NOT EXISTS crm_client_blocks (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      tenant_id INTEGER NOT NULL,
+      client_id INTEGER,
+      client_name TEXT DEFAULT '',
+      phone TEXT NOT NULL,
+      is_blocked INTEGER NOT NULL DEFAULT 1,
+      block_reason TEXT DEFAULT '',
+      block_notes TEXT DEFAULT '',
+      blocked_at TEXT,
+      blocked_by TEXT DEFAULT '',
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      UNIQUE(tenant_id, phone),
+      FOREIGN KEY(tenant_id) REFERENCES tenants(id) ON DELETE CASCADE
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_crm_client_blocks_tenant
+      ON crm_client_blocks(tenant_id, phone, is_blocked);
+
+    CREATE TABLE IF NOT EXISTS crm_return_flows (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      tenant_id INTEGER NOT NULL,
+      client_id INTEGER,
+      client_name TEXT DEFAULT '',
+      phone TEXT NOT NULL,
+      origin_service_key TEXT DEFAULT '',
+      origin_service_name TEXT DEFAULT '',
+      origin_category_key TEXT DEFAULT '',
+      origin_category_name TEXT DEFAULT '',
+      last_visit_at TEXT DEFAULT '',
+      last_professional_id INTEGER,
+      last_professional_name TEXT DEFAULT '',
+      last_professional_active INTEGER,
+      flow_status TEXT NOT NULL DEFAULT 'eligible',
+      current_step INTEGER NOT NULL DEFAULT 0,
+      entered_flow_at TEXT,
+      last_message_sent_at TEXT,
+      next_scheduled_send_at TEXT,
+      stop_reason TEXT DEFAULT '',
+      converted_appointment_id INTEGER,
+      converted_at TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      FOREIGN KEY(tenant_id) REFERENCES tenants(id) ON DELETE CASCADE
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_crm_return_flows_tenant
+      ON crm_return_flows(tenant_id, flow_status, updated_at DESC);
+
+    CREATE TABLE IF NOT EXISTS crm_flow_events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      flow_id INTEGER,
+      tenant_id INTEGER NOT NULL,
+      event_type TEXT NOT NULL,
+      step INTEGER,
+      message_preview TEXT DEFAULT '',
+      message_sent TEXT DEFAULT '',
+      reply_summary TEXT DEFAULT '',
+      booking_id INTEGER,
+      metadata_json TEXT DEFAULT '{}',
+      created_at TEXT NOT NULL,
+      FOREIGN KEY(flow_id) REFERENCES crm_return_flows(id) ON DELETE CASCADE,
+      FOREIGN KEY(tenant_id) REFERENCES tenants(id) ON DELETE CASCADE
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_crm_flow_events_flow
+      ON crm_flow_events(flow_id, created_at DESC);
+
+    CREATE TABLE IF NOT EXISTS crm_category_opportunities (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      tenant_id INTEGER NOT NULL,
+      client_id INTEGER,
+      client_name TEXT DEFAULT '',
+      phone TEXT DEFAULT '',
+      category_key TEXT NOT NULL,
+      category_name TEXT NOT NULL,
+      source_service_key TEXT DEFAULT '',
+      source_service_name TEXT DEFAULT '',
+      last_relevant_visit_at TEXT DEFAULT '',
+      days_without_return INTEGER,
+      last_professional_id INTEGER,
+      last_professional_name TEXT DEFAULT '',
+      last_professional_active INTEGER,
+      opportunity_status TEXT NOT NULL DEFAULT 'open',
+      priority TEXT DEFAULT 'medium',
+      owner TEXT DEFAULT '',
+      notes TEXT DEFAULT '',
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      FOREIGN KEY(tenant_id) REFERENCES tenants(id) ON DELETE CASCADE
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_crm_category_opportunities_tenant
+      ON crm_category_opportunities(tenant_id, opportunity_status, category_key, updated_at DESC);
   `);
 
+  ensureTenantIsolationColumns(database);
+  backfillLegacyTenantCodes(database);
+
   return database;
+}
+
+function tableHasColumn(database, tableName, columnName) {
+  const rows = database.prepare(`PRAGMA table_info(${tableName})`).all();
+  return rows.some((row) => String(row?.name || "").toLowerCase() === String(columnName || "").toLowerCase());
+}
+
+function ensureTenantIsolationColumns(database) {
+  if (!tableHasColumn(database, "whatsapp_messages", "tenant_code")) {
+    database.exec("ALTER TABLE whatsapp_messages ADD COLUMN tenant_code TEXT DEFAULT ''");
+  }
+  if (!tableHasColumn(database, "appointment_audit", "tenant_code")) {
+    database.exec("ALTER TABLE appointment_audit ADD COLUMN tenant_code TEXT DEFAULT ''");
+  }
+  if (!tableHasColumn(database, "webhook_events", "tenant_code")) {
+    database.exec("ALTER TABLE webhook_events ADD COLUMN tenant_code TEXT DEFAULT ''");
+  }
+
+  database.exec(`
+    CREATE INDEX IF NOT EXISTS idx_whatsapp_messages_tenant_phone_at
+      ON whatsapp_messages(tenant_code, phone, at DESC);
+    CREATE INDEX IF NOT EXISTS idx_appointment_audit_tenant_created_at
+      ON appointment_audit(tenant_code, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_webhook_events_tenant_received_at
+      ON webhook_events(tenant_code, received_at DESC);
+  `);
+}
+
+function backfillLegacyTenantCodes(database) {
+  // Legacy rows (before multi-tenant tracking) are associated with the first tenant.
+  const firstTenant = database.prepare("SELECT code FROM tenants ORDER BY id ASC LIMIT 1").get();
+  const legacyTenantCode = normalizeTenantCode(firstTenant?.code || "");
+  if (!legacyTenantCode) {
+    return;
+  }
+
+  database.prepare(
+    `
+      UPDATE whatsapp_messages
+      SET tenant_code = ?
+      WHERE COALESCE(TRIM(tenant_code), '') = ''
+    `,
+  ).run(legacyTenantCode);
+
+  database.prepare(
+    `
+      UPDATE appointment_audit
+      SET tenant_code = ?
+      WHERE COALESCE(TRIM(tenant_code), '') = ''
+    `,
+  ).run(legacyTenantCode);
+
+  database.prepare(
+    `
+      UPDATE webhook_events
+      SET tenant_code = ?
+      WHERE COALESCE(TRIM(tenant_code), '') = ''
+    `,
+  ).run(legacyTenantCode);
 }
 
 function safeJsonStringify(value) {
@@ -319,6 +562,7 @@ function parseWebhookPayload(rawBody) {
 }
 
 function recordWebhookEvent({
+  tenantCode = "",
   event = "",
   instanceName = "",
   senderRaw = "",
@@ -335,12 +579,13 @@ function recordWebhookEvent({
     db.prepare(
       `
         INSERT INTO webhook_events (
-          event, instance_name, sender_raw, sender_number, sender_name,
+          tenant_code, event, instance_name, sender_raw, sender_number, sender_name,
           message_id, message_type, message_text, status, reason, details, received_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `,
     ).run(
+      normalizeTenantScopeCode(tenantCode),
       String(event || ""),
       String(instanceName || ""),
       String(senderRaw || ""),
@@ -431,6 +676,27 @@ function normalizePhone(phone) {
   return String(phone || "").replace(/\D/g, "");
 }
 
+function parsePhoneList(value) {
+  const raw = toNonEmptyString(value);
+  if (!raw) {
+    return [];
+  }
+  return [...new Set(
+    raw
+      .split(/[,;\s]+/g)
+      .map((item) => normalizePhone(item))
+      .filter(Boolean),
+  )];
+}
+
+function isInternalTestPhone(phone) {
+  const normalized = normalizePhone(phone);
+  if (!normalized) {
+    return false;
+  }
+  return INTERNAL_TEST_PHONE_SET.has(normalized);
+}
+
 function normalizeWhatsappNumber(value) {
   const raw = String(value || "").trim();
   if (!raw) {
@@ -455,6 +721,86 @@ function firstNonEmpty(values) {
     }
   }
   return "";
+}
+
+function detectTestSignal({ message = "", internalTester = false, explicitTestMode = false } = {}) {
+  const normalizedMessage = normalizeForMatch(message);
+  const normalizedMarker = normalizeForMatch(TEST_BOOKING_MARKER || "#TESTE");
+  const hasMarker = normalizedMarker ? normalizedMessage.includes(normalizedMarker) : false;
+  const hasTestKeyword = /\b(teste|testar|simulacao|homolog|mock|fantasma)\b/.test(normalizedMessage);
+  const inferredTest = Boolean(explicitTestMode) || hasMarker || (Boolean(internalTester) && hasTestKeyword);
+  return {
+    inferredTest,
+    hasMarker,
+    hasTestKeyword,
+    internalTester: Boolean(internalTester),
+    explicitTestMode: Boolean(explicitTestMode),
+  };
+}
+
+function normalizeTestAuthorization(input) {
+  if (!input || typeof input !== "object" || Array.isArray(input)) {
+    return null;
+  }
+  const approvedBy = firstNonEmpty([input.approvedBy, input.authorizedBy, input.aprovadoPor]);
+  const reason = firstNonEmpty([input.reason, input.motivo, input.justification]);
+  const approvedAt = firstNonEmpty([input.approvedAt, input.authorizedAt, input.aprovadoEm]) || new Date().toISOString();
+  return {
+    approved: Boolean(input.approved),
+    approvedBy,
+    reason,
+    approvedAt,
+    principalRole: toNonEmptyString(input.principalRole),
+    principalName: toNonEmptyString(input.principalName),
+  };
+}
+
+function hasValidTestAuthorization(authorization) {
+  const normalized = normalizeTestAuthorization(authorization);
+  if (!normalized) {
+    return false;
+  }
+  return Boolean(normalized.approved && normalized.approvedBy && normalized.reason);
+}
+
+function buildTestAuthorizationBlock({ signal }) {
+  return {
+    status: "blocked_requires_admin_authorization",
+    message:
+      "Detectei tentativa de agendamento em modo teste. Para proteger a agenda real, so permito teste com autorizacao explicita de admin.",
+    required: {
+      marker: TEST_BOOKING_MARKER || "#TESTE",
+      testAuthorization: {
+        approved: true,
+        approvedBy: "nome do admin responsavel",
+        reason: "motivo e escopo do teste",
+      },
+      credential:
+        "Enviar X-Admin-Token valido (ou sessao de tenant autenticada) junto da requisicao de teste.",
+    },
+    signal: signal || null,
+  };
+}
+
+function detectDirectBookingTestSignal(body = {}) {
+  const explicitTestMode = Boolean(body?.testMode || body?.isTest || body?.mode === "test");
+  const internalTester = isInternalTestPhone(body?.clientPhone);
+  const probeText = [
+    body?.message,
+    body?.notes,
+    body?.observacoes,
+    body?.observation,
+    body?.clientName,
+    body?.service,
+  ]
+    .map((item) => toNonEmptyString(item))
+    .filter(Boolean)
+    .join(" ");
+  return detectTestSignal({
+    message: probeText,
+    internalTester,
+    explicitTestMode,
+  });
 }
 
 function marketingUploadMimeToExtension(mime) {
@@ -971,6 +1317,48 @@ function requireAdminPrincipal(req, res) {
   return principal;
 }
 
+function resolveTrustedTestAuthorizationFromRequest(req, candidate) {
+  const normalized = normalizeTestAuthorization(candidate);
+  if (!normalized) {
+    return null;
+  }
+
+  const principal = resolveAdminPrincipal(req);
+  if (!principal) {
+    return {
+      ...normalized,
+      approved: false,
+      principalRole: "",
+      principalName: "",
+    };
+  }
+
+  const configuredAdminToken = getConfiguredAdminToken();
+  const explicitToken = firstNonEmpty([
+    getAdminTokenFromRequest(req),
+    candidate?.adminToken,
+    candidate?.token,
+  ]);
+  const hasTrustedCredential = configuredAdminToken
+    ? explicitToken === configuredAdminToken || principal.role === "tenant"
+    : Boolean(explicitToken) || principal.role === "tenant";
+
+  const principalName = firstNonEmpty([
+    principal.displayName,
+    principal.username,
+    normalized.approvedBy,
+    principal.role,
+  ]);
+
+  return {
+    ...normalized,
+    approved: Boolean(normalized.approved && hasTrustedCredential),
+    approvedBy: normalized.approvedBy || principalName,
+    principalRole: toNonEmptyString(principal.role),
+    principalName,
+  };
+}
+
 function ensureSuperAdminPrincipal(principal) {
   if (!principal || principal.role !== "superadmin") {
     const error = new Error("Somente administrador global pode executar esta acao.");
@@ -1053,6 +1441,28 @@ function parseJsonObjectLoose(value, fallback = {}) {
     return fallback;
   }
   return parsed;
+}
+
+function getActiveTenantCount() {
+  try {
+    const row = db.prepare("SELECT COUNT(1) AS total FROM tenants WHERE active = 1").get();
+    const parsed = Number(row?.total);
+    return Number.isFinite(parsed) && parsed >= 0 ? parsed : 0;
+  } catch {
+    return 0;
+  }
+}
+
+function isMultiTenantModeActive() {
+  return getActiveTenantCount() > 1;
+}
+
+function resolveConversationTenantFallbackEstablishmentId() {
+  const configured = getConfiguredEstablishmentId();
+  if (!configured) {
+    return null;
+  }
+  return isMultiTenantModeActive() ? null : configured;
 }
 
 function mapTenantRow(row) {
@@ -1195,11 +1605,12 @@ function resolveConversationTenantContext({
     tenant = getActiveTenantByEstablishmentId(parsedEstablishmentId);
   }
 
-  const resolvedEstablishmentId = Number.isFinite(parsedEstablishmentId) && parsedEstablishmentId > 0
-    ? parsedEstablishmentId
-    : (Number.isFinite(Number(tenant?.establishmentId)) && Number(tenant.establishmentId) > 0
-      ? Number(tenant.establishmentId)
-      : null);
+  const tenantEstablishmentId = Number(tenant?.establishmentId);
+  const hasTenantEstablishmentId = Number.isFinite(tenantEstablishmentId) && tenantEstablishmentId > 0;
+  const hasParsedEstablishmentId = Number.isFinite(parsedEstablishmentId) && parsedEstablishmentId > 0;
+  const resolvedEstablishmentId = hasTenantEstablishmentId
+    ? tenantEstablishmentId
+    : (hasParsedEstablishmentId ? parsedEstablishmentId : null);
 
   const tenantKnowledge = tenant?.knowledge && typeof tenant.knowledge === "object" && !Array.isArray(tenant.knowledge)
     ? tenant.knowledge
@@ -1254,6 +1665,221 @@ function getTenantProviderConfigsByCode(code) {
     createdAt: toNonEmptyString(row.createdAt),
     updatedAt: toNonEmptyString(row.updatedAt),
   }));
+}
+
+function getTenantProviderConfigByCode(code, provider) {
+  const normalizedCode = normalizeTenantCode(code);
+  if (!normalizedCode) {
+    return null;
+  }
+
+  const normalizedProvider = resolveSchedulingProvider(provider);
+  if (!normalizedProvider) {
+    return null;
+  }
+
+  return (
+    getTenantProviderConfigsByCode(normalizedCode).find(
+      (item) => resolveSchedulingProvider(item?.provider) === normalizedProvider,
+    ) || null
+  );
+}
+
+function getTenantIdentifierValueByCode(code, kind) {
+  const normalizedCode = normalizeTenantCode(code);
+  const normalizedKind = normalizeTenantIdentifierKind(kind);
+  if (!normalizedCode || !normalizedKind) {
+    return "";
+  }
+
+  const match = getTenantIdentifiersByCode(normalizedCode).find(
+    (item) => normalizeTenantIdentifierKind(item?.kind) === normalizedKind,
+  );
+  return toNonEmptyString(match?.value);
+}
+
+function readProviderConfigValue(config, candidates = []) {
+  const source = config && typeof config === "object" && !Array.isArray(config) ? config : {};
+
+  for (const candidate of candidates) {
+    const pathSegments = String(candidate || "")
+      .split(".")
+      .map((segment) => segment.trim())
+      .filter(Boolean);
+    if (!pathSegments.length) {
+      continue;
+    }
+
+    let current = source;
+    let found = true;
+    for (const segment of pathSegments) {
+      if (!current || typeof current !== "object" || Array.isArray(current) || !(segment in current)) {
+        found = false;
+        break;
+      }
+      current = current[segment];
+    }
+
+    const resolved = toNonEmptyString(current);
+    if (found && resolved) {
+      return resolved;
+    }
+  }
+
+  return "";
+}
+
+function resolveTrinksRuntimeConfig({ tenantCode = "", establishmentId = null } = {}) {
+  const context = resolveConversationTenantContext({
+    tenantCode,
+    establishmentId,
+  });
+  const resolvedTenantCode = normalizeTenantScopeCode(context.tenantCode || tenantCode);
+  const providerConfig = resolvedTenantCode
+    ? getTenantProviderConfigByCode(resolvedTenantCode, SCHEDULING_PROVIDER_TRINKS)
+    : null;
+  const config = providerConfig?.config && typeof providerConfig.config === "object" && !Array.isArray(providerConfig.config)
+    ? providerConfig.config
+    : {};
+
+  const baseUrl = firstNonEmpty([
+    readProviderConfigValue(config, [
+      "baseUrl",
+      "apiBaseUrl",
+      "api_base_url",
+      "trinksBaseUrl",
+      "trinksApiBaseUrl",
+      "credentials.baseUrl",
+    ]),
+    process.env.TRINKS_API_BASE_URL,
+  ]);
+  if (!baseUrl) {
+    throw new Error("Variavel obrigatoria ausente: TRINKS_API_BASE_URL.");
+  }
+
+  const apiKey = firstNonEmpty([
+    readProviderConfigValue(config, [
+      "apiKey",
+      "api_key",
+      "trinksApiKey",
+      "trinks_api_key",
+      "xApiKey",
+      "credentials.apiKey",
+      "credentials.api_key",
+    ]),
+    process.env.TRINKS_API_KEY,
+  ]);
+  if (!apiKey) {
+    throw new Error("Variavel obrigatoria ausente: TRINKS_API_KEY.");
+  }
+
+  return {
+    tenantCode: resolvedTenantCode,
+    baseUrl: String(baseUrl).replace(/\/$/, ""),
+    apiKey,
+    source: providerConfig ? "tenant" : "env",
+  };
+}
+
+function inferEvolutionInstanceFromPath(path = "") {
+  const normalizedPath = toNonEmptyString(path);
+  if (!normalizedPath) {
+    return "";
+  }
+
+  const queryMatch = normalizedPath.match(/[?&]instance=([^&]+)/i);
+  if (queryMatch?.[1]) {
+    try {
+      return decodeURIComponent(queryMatch[1]);
+    } catch {
+      return queryMatch[1];
+    }
+  }
+
+  const pathMatch = normalizedPath.match(
+    /\/(?:message\/sendText|webhook\/set|webhook\/find|instance\/(?:connect|qrcode|qr|logout|disconnect|close|create))\/([^/?]+)/i,
+  );
+  if (pathMatch?.[1]) {
+    try {
+      return decodeURIComponent(pathMatch[1]);
+    } catch {
+      return pathMatch[1];
+    }
+  }
+
+  return "";
+}
+
+function resolveEvolutionRuntimeConfig({ tenantCode = "", instanceName = "" } = {}) {
+  let resolvedTenantCode = normalizeTenantScopeCode(tenantCode);
+  if (!resolvedTenantCode && toNonEmptyString(instanceName)) {
+    const context = resolveConversationTenantContext({ instanceName });
+    resolvedTenantCode = normalizeTenantScopeCode(context.tenantCode);
+  }
+  const providerConfig = resolvedTenantCode
+    ? getTenantProviderConfigByCode(resolvedTenantCode, "evolution")
+    : null;
+  const config = providerConfig?.config && typeof providerConfig.config === "object" && !Array.isArray(providerConfig.config)
+    ? providerConfig.config
+    : {};
+
+  const baseUrl = firstNonEmpty([
+    readProviderConfigValue(config, [
+      "baseUrl",
+      "apiBaseUrl",
+      "api_base_url",
+      "url",
+      "evolutionBaseUrl",
+      "evolutionApiBaseUrl",
+      "credentials.baseUrl",
+    ]),
+    process.env.EVOLUTION_API_BASE_URL,
+    process.env.EVOLUTION_URL,
+    process.env._EVOLUTION_URL,
+  ]);
+  if (!baseUrl) {
+    throw new Error(
+      "Variavel obrigatoria ausente: EVOLUTION_API_BASE_URL (ou EVOLUTION_URL/_EVOLUTION_URL).",
+    );
+  }
+
+  const apiKey = firstNonEmpty([
+    readProviderConfigValue(config, [
+      "apiKey",
+      "api_key",
+      "apikey",
+      "evolutionApiKey",
+      "evolution_api_key",
+      "credentials.apiKey",
+      "credentials.api_key",
+      "credentials.apikey",
+    ]),
+    process.env.EVOLUTION_API_KEY,
+  ]);
+  if (!apiKey) {
+    throw new Error("Variavel obrigatoria ausente: EVOLUTION_API_KEY.");
+  }
+
+  const resolvedInstance = firstNonEmpty([
+    instanceName,
+    readProviderConfigValue(config, [
+      "instance",
+      "instanceName",
+      "evolutionInstance",
+      "credentials.instance",
+      "credentials.instanceName",
+    ]),
+    getTenantIdentifierValueByCode(resolvedTenantCode, "evolution_instance"),
+    process.env.EVOLUTION_INSTANCE,
+  ]);
+
+  return {
+    tenantCode: resolvedTenantCode,
+    baseUrl: String(baseUrl).replace(/\/$/, ""),
+    apiKey,
+    instance: resolvedInstance,
+    source: providerConfig ? "tenant" : "env",
+  };
 }
 
 function createTenant({
@@ -1446,6 +2072,1386 @@ function upsertTenantProviderConfigByCode(code, provider, { enabled = true, conf
   return getTenantProviderConfigsByCode(tenant.code);
 }
 
+function getDefaultCrmSettings() {
+  return {
+    crmReturnEnabled: false,
+    crmMode: "beta",
+    bookingMaxDaysAhead: BOOKING_MAX_DAYS_AHEAD,
+    messageSendingWindowStart: "09:00",
+    messageSendingWindowEnd: "19:00",
+    messageDailyLimit: 20,
+    stopFlowOnAnyFutureBooking: true,
+    maxSteps: 3,
+    humanHandoffEnabled: true,
+    humanHandoffClientNumber: "",
+    humanHandoffInternalNumber: "",
+    humanHandoffMessageTemplate:
+      "Se preferir, nosso atendimento humano segue com voce pelo numero {{human_number}}.",
+    humanHandoffSendInternalSummary: true,
+    humanHandoffPauseAi: true,
+    opportunityTrackingEnabled: true,
+    allowOnlyWhitelistedPhonesInBeta: false,
+    betaTestPhones: [],
+  };
+}
+
+function normalizeCrmMode(value) {
+  const normalized = toNonEmptyString(value).toLowerCase();
+  if (["beta", "manual", "automatic"].includes(normalized)) {
+    return normalized;
+  }
+  return "beta";
+}
+
+function normalizePriority(value, fallback = "medium") {
+  const normalized = toNonEmptyString(value).toLowerCase();
+  if (["low", "medium", "high"].includes(normalized)) {
+    return normalized;
+  }
+  return fallback;
+}
+
+function normalizeTimeWindowValue(value, fallback = "") {
+  const normalized = normalizeTimeValue(value);
+  return normalized || fallback;
+}
+
+function sanitizeCrmSettings(input = {}) {
+  const source = input && typeof input === "object" && !Array.isArray(input) ? input : {};
+  const defaults = getDefaultCrmSettings();
+  const bookingMaxDaysAhead = Number(source.bookingMaxDaysAhead);
+  const messageDailyLimit = Number(source.messageDailyLimit);
+  const maxSteps = Number(source.maxSteps);
+  const betaPhones = Array.isArray(source.betaTestPhones)
+    ? source.betaTestPhones.map((item) => normalizePhone(item)).filter(Boolean)
+    : parsePhoneList(source.betaTestPhones || "");
+
+  return {
+    ...defaults,
+    crmReturnEnabled: source.crmReturnEnabled == null
+      ? defaults.crmReturnEnabled
+      : Boolean(source.crmReturnEnabled),
+    crmMode: normalizeCrmMode(source.crmMode || defaults.crmMode),
+    bookingMaxDaysAhead: Number.isFinite(bookingMaxDaysAhead) && bookingMaxDaysAhead > 0
+      ? Math.min(365, Math.max(1, Math.trunc(bookingMaxDaysAhead)))
+      : defaults.bookingMaxDaysAhead,
+    messageSendingWindowStart: normalizeTimeWindowValue(
+      source.messageSendingWindowStart,
+      defaults.messageSendingWindowStart,
+    ),
+    messageSendingWindowEnd: normalizeTimeWindowValue(
+      source.messageSendingWindowEnd,
+      defaults.messageSendingWindowEnd,
+    ),
+    messageDailyLimit: Number.isFinite(messageDailyLimit) && messageDailyLimit > 0
+      ? Math.min(1000, Math.max(1, Math.trunc(messageDailyLimit)))
+      : defaults.messageDailyLimit,
+    stopFlowOnAnyFutureBooking: source.stopFlowOnAnyFutureBooking == null
+      ? defaults.stopFlowOnAnyFutureBooking
+      : Boolean(source.stopFlowOnAnyFutureBooking),
+    maxSteps: Number.isFinite(maxSteps) && maxSteps > 0
+      ? Math.min(3, Math.max(1, Math.trunc(maxSteps)))
+      : defaults.maxSteps,
+    humanHandoffEnabled: source.humanHandoffEnabled == null
+      ? defaults.humanHandoffEnabled
+      : Boolean(source.humanHandoffEnabled),
+    humanHandoffClientNumber: normalizePhone(source.humanHandoffClientNumber || source.humanNumber || ""),
+    humanHandoffInternalNumber: normalizePhone(source.humanHandoffInternalNumber || source.internalNumber || ""),
+    humanHandoffMessageTemplate: toNonEmptyString(source.humanHandoffMessageTemplate)
+      || defaults.humanHandoffMessageTemplate,
+    humanHandoffSendInternalSummary: source.humanHandoffSendInternalSummary == null
+      ? defaults.humanHandoffSendInternalSummary
+      : Boolean(source.humanHandoffSendInternalSummary),
+    humanHandoffPauseAi: source.humanHandoffPauseAi == null
+      ? defaults.humanHandoffPauseAi
+      : Boolean(source.humanHandoffPauseAi),
+    opportunityTrackingEnabled: source.opportunityTrackingEnabled == null
+      ? defaults.opportunityTrackingEnabled
+      : Boolean(source.opportunityTrackingEnabled),
+    allowOnlyWhitelistedPhonesInBeta: source.allowOnlyWhitelistedPhonesInBeta == null
+      ? defaults.allowOnlyWhitelistedPhonesInBeta
+      : Boolean(source.allowOnlyWhitelistedPhonesInBeta),
+    betaTestPhones: [...new Set(betaPhones)],
+  };
+}
+
+function getTenantCrmSettingsByCode(code) {
+  const tenant = getTenantByCode(code);
+  if (!tenant) {
+    return null;
+  }
+
+  const row = db.prepare(
+    `
+      SELECT id, config_json AS configJson, created_at AS createdAt, updated_at AS updatedAt
+      FROM tenant_crm_settings
+      WHERE tenant_id = ?
+      LIMIT 1
+    `,
+  ).get(tenant.id);
+
+  const config = sanitizeCrmSettings(parseJsonObjectLoose(row?.configJson, {}));
+  return {
+    id: Number(row?.id || 0) || null,
+    tenantId: tenant.id,
+    tenantCode: tenant.code,
+    config,
+    createdAt: toNonEmptyString(row?.createdAt),
+    updatedAt: toNonEmptyString(row?.updatedAt),
+  };
+}
+
+function upsertTenantCrmSettingsByCode(code, payload = {}) {
+  const tenant = getTenantByCode(code);
+  if (!tenant) {
+    const error = new Error("Tenant nao encontrado.");
+    error.status = 404;
+    throw error;
+  }
+
+  const current = getTenantCrmSettingsByCode(tenant.code);
+  const nextConfig = sanitizeCrmSettings({
+    ...(current?.config || getDefaultCrmSettings()),
+    ...(payload && typeof payload === "object" && !Array.isArray(payload) ? payload : {}),
+  });
+  const now = new Date().toISOString();
+
+  db.prepare(
+    `
+      INSERT INTO tenant_crm_settings (tenant_id, config_json, created_at, updated_at)
+      VALUES (?, ?, ?, ?)
+      ON CONFLICT(tenant_id) DO UPDATE SET
+        config_json = excluded.config_json,
+        updated_at = excluded.updated_at
+    `,
+  ).run(
+    tenant.id,
+    safeJsonStringify(nextConfig),
+    current?.createdAt || now,
+    now,
+  );
+
+  return getTenantCrmSettingsByCode(tenant.code);
+}
+
+function sanitizeServiceRuleInput(input = {}) {
+  const source = input && typeof input === "object" && !Array.isArray(input) ? input : {};
+  const serviceKey = firstNonEmpty([
+    toNonEmptyString(source.serviceKey),
+    toNonEmptyString(source.serviceId),
+    toNonEmptyString(source.id),
+  ]);
+  const serviceName = firstNonEmpty([
+    toNonEmptyString(source.serviceName),
+    toNonEmptyString(source.name),
+  ]);
+  const categoryKey = firstNonEmpty([
+    toNonEmptyString(source.categoryKey),
+    toNonEmptyString(source.categoryId),
+    toNonEmptyString(source.categoryName),
+  ]);
+  const categoryName = firstNonEmpty([
+    toNonEmptyString(source.categoryName),
+    toNonEmptyString(source.category),
+  ]);
+  const returnDays = Number(source.returnDays);
+  const step1DelayDays = Number(source.step1DelayDays);
+  const step2DelayDays = Number(source.step2DelayDays);
+  const step3DelayDays = Number(source.step3DelayDays);
+
+  return {
+    serviceKey,
+    serviceName,
+    categoryKey,
+    categoryName,
+    active: Boolean(source.active),
+    returnDays: Number.isFinite(returnDays) && returnDays > 0 ? Math.min(365, Math.trunc(returnDays)) : null,
+    useDefaultFlow: source.useDefaultFlow == null ? true : Boolean(source.useDefaultFlow),
+    step1DelayDays: Number.isFinite(step1DelayDays) && step1DelayDays >= 0 ? Math.min(365, Math.trunc(step1DelayDays)) : null,
+    step1MessageTemplate: toNonEmptyString(source.step1MessageTemplate),
+    step2DelayDays: Number.isFinite(step2DelayDays) && step2DelayDays >= 0 ? Math.min(365, Math.trunc(step2DelayDays)) : null,
+    step2MessageTemplate: toNonEmptyString(source.step2MessageTemplate),
+    step3DelayDays: Number.isFinite(step3DelayDays) && step3DelayDays >= 0 ? Math.min(365, Math.trunc(step3DelayDays)) : null,
+    step3MessageTemplate: toNonEmptyString(source.step3MessageTemplate),
+    priority: normalizePriority(source.priority, "medium"),
+    notes: toNonEmptyString(source.notes),
+  };
+}
+
+function listTenantServiceReturnRulesByCode(code) {
+  const tenant = getTenantByCode(code);
+  if (!tenant) {
+    return [];
+  }
+
+  return db.prepare(
+    `
+      SELECT id, service_key AS serviceKey, service_name AS serviceName,
+             category_key AS categoryKey, category_name AS categoryName,
+             active, return_days AS returnDays, use_default_flow AS useDefaultFlow,
+             step1_delay_days AS step1DelayDays, step1_message_template AS step1MessageTemplate,
+             step2_delay_days AS step2DelayDays, step2_message_template AS step2MessageTemplate,
+             step3_delay_days AS step3DelayDays, step3_message_template AS step3MessageTemplate,
+             priority, notes, created_at AS createdAt, updated_at AS updatedAt
+      FROM tenant_service_return_rules
+      WHERE tenant_id = ?
+      ORDER BY category_name COLLATE NOCASE ASC, service_name COLLATE NOCASE ASC, id ASC
+    `,
+  ).all(tenant.id).map((row) => ({
+    id: Number(row.id),
+    serviceKey: toNonEmptyString(row.serviceKey),
+    serviceName: toNonEmptyString(row.serviceName),
+    categoryKey: toNonEmptyString(row.categoryKey),
+    categoryName: toNonEmptyString(row.categoryName),
+    active: Number(row.active) !== 0,
+    returnDays: Number.isFinite(Number(row.returnDays)) ? Number(row.returnDays) : null,
+    useDefaultFlow: Number(row.useDefaultFlow) !== 0,
+    step1DelayDays: Number.isFinite(Number(row.step1DelayDays)) ? Number(row.step1DelayDays) : null,
+    step1MessageTemplate: toNonEmptyString(row.step1MessageTemplate),
+    step2DelayDays: Number.isFinite(Number(row.step2DelayDays)) ? Number(row.step2DelayDays) : null,
+    step2MessageTemplate: toNonEmptyString(row.step2MessageTemplate),
+    step3DelayDays: Number.isFinite(Number(row.step3DelayDays)) ? Number(row.step3DelayDays) : null,
+    step3MessageTemplate: toNonEmptyString(row.step3MessageTemplate),
+    priority: normalizePriority(row.priority, "medium"),
+    notes: toNonEmptyString(row.notes),
+    createdAt: toNonEmptyString(row.createdAt),
+    updatedAt: toNonEmptyString(row.updatedAt),
+  }));
+}
+
+function upsertTenantServiceReturnRulesByCode(code, rules = []) {
+  const tenant = getTenantByCode(code);
+  if (!tenant) {
+    const error = new Error("Tenant nao encontrado.");
+    error.status = 404;
+    throw error;
+  }
+
+  const list = Array.isArray(rules) ? rules : [];
+  const now = new Date().toISOString();
+  const stmt = db.prepare(
+    `
+      INSERT INTO tenant_service_return_rules (
+        tenant_id, service_key, service_name, category_key, category_name,
+        active, return_days, use_default_flow,
+        step1_delay_days, step1_message_template,
+        step2_delay_days, step2_message_template,
+        step3_delay_days, step3_message_template,
+        priority, notes, created_at, updated_at
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(tenant_id, service_key) DO UPDATE SET
+        service_name = excluded.service_name,
+        category_key = excluded.category_key,
+        category_name = excluded.category_name,
+        active = excluded.active,
+        return_days = excluded.return_days,
+        use_default_flow = excluded.use_default_flow,
+        step1_delay_days = excluded.step1_delay_days,
+        step1_message_template = excluded.step1_message_template,
+        step2_delay_days = excluded.step2_delay_days,
+        step2_message_template = excluded.step2_message_template,
+        step3_delay_days = excluded.step3_delay_days,
+        step3_message_template = excluded.step3_message_template,
+        priority = excluded.priority,
+        notes = excluded.notes,
+        updated_at = excluded.updated_at
+    `,
+  );
+
+  const transaction = db.transaction((items) => {
+    for (const item of items) {
+      const sanitized = sanitizeServiceRuleInput(item);
+      if (!sanitized.serviceKey || !sanitized.serviceName) {
+        continue;
+      }
+      stmt.run(
+        tenant.id,
+        sanitized.serviceKey,
+        sanitized.serviceName,
+        sanitized.categoryKey,
+        sanitized.categoryName,
+        sanitized.active ? 1 : 0,
+        sanitized.returnDays,
+        sanitized.useDefaultFlow ? 1 : 0,
+        sanitized.step1DelayDays,
+        sanitized.step1MessageTemplate,
+        sanitized.step2DelayDays,
+        sanitized.step2MessageTemplate,
+        sanitized.step3DelayDays,
+        sanitized.step3MessageTemplate,
+        sanitized.priority,
+        sanitized.notes,
+        now,
+        now,
+      );
+    }
+  });
+
+  transaction(list);
+  return listTenantServiceReturnRulesByCode(tenant.code);
+}
+
+function sanitizeCategoryOpportunityRuleInput(input = {}) {
+  const source = input && typeof input === "object" && !Array.isArray(input) ? input : {};
+  const categoryKey = firstNonEmpty([
+    toNonEmptyString(source.categoryKey),
+    toNonEmptyString(source.categoryId),
+    toNonEmptyString(source.categoryName),
+  ]);
+  const categoryName = firstNonEmpty([
+    toNonEmptyString(source.categoryName),
+    toNonEmptyString(source.name),
+  ]);
+  const opportunityDaysWithoutReturn = Number(source.opportunityDaysWithoutReturn);
+  return {
+    categoryKey,
+    categoryName,
+    opportunityTrackingEnabled: source.opportunityTrackingEnabled == null
+      ? true
+      : Boolean(source.opportunityTrackingEnabled),
+    opportunityDaysWithoutReturn:
+      Number.isFinite(opportunityDaysWithoutReturn) && opportunityDaysWithoutReturn > 0
+        ? Math.min(365, Math.trunc(opportunityDaysWithoutReturn))
+        : null,
+    opportunityPriority: normalizePriority(source.opportunityPriority, "medium"),
+    allowManualCampaign: source.allowManualCampaign == null ? true : Boolean(source.allowManualCampaign),
+    suggestedMessageTemplate: toNonEmptyString(source.suggestedMessageTemplate),
+    notes: toNonEmptyString(source.notes),
+  };
+}
+
+function listTenantCategoryOpportunityRulesByCode(code) {
+  const tenant = getTenantByCode(code);
+  if (!tenant) {
+    return [];
+  }
+
+  return db.prepare(
+    `
+      SELECT id, category_key AS categoryKey, category_name AS categoryName,
+             opportunity_tracking_enabled AS opportunityTrackingEnabled,
+             opportunity_days_without_return AS opportunityDaysWithoutReturn,
+             opportunity_priority AS opportunityPriority,
+             allow_manual_campaign AS allowManualCampaign,
+             suggested_message_template AS suggestedMessageTemplate,
+             notes, created_at AS createdAt, updated_at AS updatedAt
+      FROM tenant_category_opportunity_rules
+      WHERE tenant_id = ?
+      ORDER BY category_name COLLATE NOCASE ASC, id ASC
+    `,
+  ).all(tenant.id).map((row) => ({
+    id: Number(row.id),
+    categoryKey: toNonEmptyString(row.categoryKey),
+    categoryName: toNonEmptyString(row.categoryName),
+    opportunityTrackingEnabled: Number(row.opportunityTrackingEnabled) !== 0,
+    opportunityDaysWithoutReturn: Number.isFinite(Number(row.opportunityDaysWithoutReturn))
+      ? Number(row.opportunityDaysWithoutReturn)
+      : null,
+    opportunityPriority: normalizePriority(row.opportunityPriority, "medium"),
+    allowManualCampaign: Number(row.allowManualCampaign) !== 0,
+    suggestedMessageTemplate: toNonEmptyString(row.suggestedMessageTemplate),
+    notes: toNonEmptyString(row.notes),
+    createdAt: toNonEmptyString(row.createdAt),
+    updatedAt: toNonEmptyString(row.updatedAt),
+  }));
+}
+
+function upsertTenantCategoryOpportunityRulesByCode(code, rules = []) {
+  const tenant = getTenantByCode(code);
+  if (!tenant) {
+    const error = new Error("Tenant nao encontrado.");
+    error.status = 404;
+    throw error;
+  }
+
+  const list = Array.isArray(rules) ? rules : [];
+  const now = new Date().toISOString();
+  const stmt = db.prepare(
+    `
+      INSERT INTO tenant_category_opportunity_rules (
+        tenant_id, category_key, category_name,
+        opportunity_tracking_enabled, opportunity_days_without_return,
+        opportunity_priority, allow_manual_campaign,
+        suggested_message_template, notes, created_at, updated_at
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(tenant_id, category_key) DO UPDATE SET
+        category_name = excluded.category_name,
+        opportunity_tracking_enabled = excluded.opportunity_tracking_enabled,
+        opportunity_days_without_return = excluded.opportunity_days_without_return,
+        opportunity_priority = excluded.opportunity_priority,
+        allow_manual_campaign = excluded.allow_manual_campaign,
+        suggested_message_template = excluded.suggested_message_template,
+        notes = excluded.notes,
+        updated_at = excluded.updated_at
+    `,
+  );
+
+  const transaction = db.transaction((items) => {
+    for (const item of items) {
+      const sanitized = sanitizeCategoryOpportunityRuleInput(item);
+      if (!sanitized.categoryKey || !sanitized.categoryName) {
+        continue;
+      }
+      stmt.run(
+        tenant.id,
+        sanitized.categoryKey,
+        sanitized.categoryName,
+        sanitized.opportunityTrackingEnabled ? 1 : 0,
+        sanitized.opportunityDaysWithoutReturn,
+        sanitized.opportunityPriority,
+        sanitized.allowManualCampaign ? 1 : 0,
+        sanitized.suggestedMessageTemplate,
+        sanitized.notes,
+        now,
+        now,
+      );
+    }
+  });
+
+  transaction(list);
+  return listTenantCategoryOpportunityRulesByCode(tenant.code);
+}
+
+function listCrmClientBlocksByCode(code, { phone = "" } = {}) {
+  const tenant = getTenantByCode(code);
+  if (!tenant) {
+    return [];
+  }
+
+  let query = `
+    SELECT id, client_id AS clientId, client_name AS clientName, phone,
+           is_blocked AS isBlocked, block_reason AS blockReason, block_notes AS blockNotes,
+           blocked_at AS blockedAt, blocked_by AS blockedBy,
+           created_at AS createdAt, updated_at AS updatedAt
+    FROM crm_client_blocks
+    WHERE tenant_id = ?
+  `;
+  const params = [tenant.id];
+  const normalizedPhone = normalizePhone(phone);
+  if (normalizedPhone) {
+    query += " AND phone = ?";
+    params.push(normalizedPhone);
+  }
+  query += " ORDER BY is_blocked DESC, datetime(updated_at) DESC, id DESC";
+
+  return db.prepare(query).all(...params).map((row) => ({
+    id: Number(row.id),
+    clientId: Number.isFinite(Number(row.clientId)) ? Number(row.clientId) : null,
+    clientName: toNonEmptyString(row.clientName),
+    phone: toNonEmptyString(row.phone),
+    isBlocked: Number(row.isBlocked) !== 0,
+    blockReason: toNonEmptyString(row.blockReason),
+    blockNotes: toNonEmptyString(row.blockNotes),
+    blockedAt: toNonEmptyString(row.blockedAt),
+    blockedBy: toNonEmptyString(row.blockedBy),
+    createdAt: toNonEmptyString(row.createdAt),
+    updatedAt: toNonEmptyString(row.updatedAt),
+  }));
+}
+
+function upsertCrmClientBlockByCode(code, payload = {}) {
+  const tenant = getTenantByCode(code);
+  if (!tenant) {
+    const error = new Error("Tenant nao encontrado.");
+    error.status = 404;
+    throw error;
+  }
+
+  const phone = normalizePhone(payload.phone || payload.clientPhone || "");
+  if (!phone) {
+    const error = new Error("Campo obrigatorio: phone");
+    error.status = 400;
+    throw error;
+  }
+
+  const now = new Date().toISOString();
+  const isBlocked = payload.isBlocked == null ? true : Boolean(payload.isBlocked);
+  db.prepare(
+    `
+      INSERT INTO crm_client_blocks (
+        tenant_id, client_id, client_name, phone, is_blocked,
+        block_reason, block_notes, blocked_at, blocked_by, created_at, updated_at
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(tenant_id, phone) DO UPDATE SET
+        client_id = excluded.client_id,
+        client_name = excluded.client_name,
+        is_blocked = excluded.is_blocked,
+        block_reason = excluded.block_reason,
+        block_notes = excluded.block_notes,
+        blocked_at = excluded.blocked_at,
+        blocked_by = excluded.blocked_by,
+        updated_at = excluded.updated_at
+    `,
+  ).run(
+    tenant.id,
+    Number.isFinite(Number(payload.clientId)) ? Number(payload.clientId) : null,
+    toNonEmptyString(payload.clientName),
+    phone,
+    isBlocked ? 1 : 0,
+    toNonEmptyString(payload.blockReason),
+    toNonEmptyString(payload.blockNotes || payload.notes),
+    isBlocked ? (toNonEmptyString(payload.blockedAt) || now) : null,
+    toNonEmptyString(payload.blockedBy),
+    now,
+    now,
+  );
+
+  return listCrmClientBlocksByCode(tenant.code, { phone })[0] || null;
+}
+
+function listCrmReturnFlowsByCode(code, { phone = "", status = "", limit = 200 } = {}) {
+  const tenant = getTenantByCode(code);
+  if (!tenant) {
+    return [];
+  }
+
+  let query = `
+    SELECT id, client_id AS clientId, client_name AS clientName, phone,
+           origin_service_key AS originServiceKey, origin_service_name AS originServiceName,
+           origin_category_key AS originCategoryKey, origin_category_name AS originCategoryName,
+           last_visit_at AS lastVisitAt, last_professional_id AS lastProfessionalId,
+           last_professional_name AS lastProfessionalName, last_professional_active AS lastProfessionalActive,
+           flow_status AS flowStatus, current_step AS currentStep,
+           entered_flow_at AS enteredFlowAt, last_message_sent_at AS lastMessageSentAt,
+           next_scheduled_send_at AS nextScheduledSendAt, stop_reason AS stopReason,
+           converted_appointment_id AS convertedAppointmentId, converted_at AS convertedAt,
+           created_at AS createdAt, updated_at AS updatedAt
+    FROM crm_return_flows
+    WHERE tenant_id = ?
+  `;
+  const params = [tenant.id];
+  const normalizedPhone = normalizePhone(phone);
+  const normalizedStatus = toNonEmptyString(status);
+  if (normalizedPhone) {
+    query += " AND phone = ?";
+    params.push(normalizedPhone);
+  }
+  if (normalizedStatus) {
+    query += " AND flow_status = ?";
+    params.push(normalizedStatus);
+  }
+  query += " ORDER BY datetime(updated_at) DESC, id DESC LIMIT ?";
+  params.push(Math.min(Math.max(Number(limit || 200), 1), 1000));
+
+  return db.prepare(query).all(...params).map((row) => ({
+    id: Number(row.id),
+    clientId: Number.isFinite(Number(row.clientId)) ? Number(row.clientId) : null,
+    clientName: toNonEmptyString(row.clientName),
+    phone: toNonEmptyString(row.phone),
+    originServiceKey: toNonEmptyString(row.originServiceKey),
+    originServiceName: toNonEmptyString(row.originServiceName),
+    originCategoryKey: toNonEmptyString(row.originCategoryKey),
+    originCategoryName: toNonEmptyString(row.originCategoryName),
+    lastVisitAt: toNonEmptyString(row.lastVisitAt),
+    lastProfessionalId: Number.isFinite(Number(row.lastProfessionalId)) ? Number(row.lastProfessionalId) : null,
+    lastProfessionalName: toNonEmptyString(row.lastProfessionalName),
+    lastProfessionalActive: row.lastProfessionalActive == null
+      ? null
+      : Number(row.lastProfessionalActive) !== 0,
+    flowStatus: toNonEmptyString(row.flowStatus),
+    currentStep: Number.isFinite(Number(row.currentStep)) ? Number(row.currentStep) : 0,
+    enteredFlowAt: toNonEmptyString(row.enteredFlowAt),
+    lastMessageSentAt: toNonEmptyString(row.lastMessageSentAt),
+    nextScheduledSendAt: toNonEmptyString(row.nextScheduledSendAt),
+    stopReason: toNonEmptyString(row.stopReason),
+    convertedAppointmentId: Number.isFinite(Number(row.convertedAppointmentId)) ? Number(row.convertedAppointmentId) : null,
+    convertedAt: toNonEmptyString(row.convertedAt),
+    createdAt: toNonEmptyString(row.createdAt),
+    updatedAt: toNonEmptyString(row.updatedAt),
+  }));
+}
+
+function listCrmCategoryOpportunitiesByCode(code, { status = "", limit = 200 } = {}) {
+  const tenant = getTenantByCode(code);
+  if (!tenant) {
+    return [];
+  }
+
+  let query = `
+    SELECT id, client_id AS clientId, client_name AS clientName, phone,
+           category_key AS categoryKey, category_name AS categoryName,
+           source_service_key AS sourceServiceKey, source_service_name AS sourceServiceName,
+           last_relevant_visit_at AS lastRelevantVisitAt, days_without_return AS daysWithoutReturn,
+           last_professional_id AS lastProfessionalId, last_professional_name AS lastProfessionalName,
+           last_professional_active AS lastProfessionalActive,
+           opportunity_status AS opportunityStatus, priority, owner, notes,
+           created_at AS createdAt, updated_at AS updatedAt
+    FROM crm_category_opportunities
+    WHERE tenant_id = ?
+  `;
+  const params = [tenant.id];
+  const normalizedStatus = toNonEmptyString(status);
+  if (normalizedStatus) {
+    query += " AND opportunity_status = ?";
+    params.push(normalizedStatus);
+  }
+  query += " ORDER BY datetime(updated_at) DESC, id DESC LIMIT ?";
+  params.push(Math.min(Math.max(Number(limit || 200), 1), 1000));
+
+  return db.prepare(query).all(...params).map((row) => ({
+    id: Number(row.id),
+    clientId: Number.isFinite(Number(row.clientId)) ? Number(row.clientId) : null,
+    clientName: toNonEmptyString(row.clientName),
+    phone: toNonEmptyString(row.phone),
+    categoryKey: toNonEmptyString(row.categoryKey),
+    categoryName: toNonEmptyString(row.categoryName),
+    sourceServiceKey: toNonEmptyString(row.sourceServiceKey),
+    sourceServiceName: toNonEmptyString(row.sourceServiceName),
+    lastRelevantVisitAt: toNonEmptyString(row.lastRelevantVisitAt),
+    daysWithoutReturn: Number.isFinite(Number(row.daysWithoutReturn)) ? Number(row.daysWithoutReturn) : null,
+    lastProfessionalId: Number.isFinite(Number(row.lastProfessionalId)) ? Number(row.lastProfessionalId) : null,
+    lastProfessionalName: toNonEmptyString(row.lastProfessionalName),
+    lastProfessionalActive: row.lastProfessionalActive == null
+      ? null
+      : Number(row.lastProfessionalActive) !== 0,
+    opportunityStatus: toNonEmptyString(row.opportunityStatus),
+    priority: normalizePriority(row.priority, "medium"),
+    owner: toNonEmptyString(row.owner),
+    notes: toNonEmptyString(row.notes),
+    createdAt: toNonEmptyString(row.createdAt),
+    updatedAt: toNonEmptyString(row.updatedAt),
+  }));
+}
+
+function resolveServiceKeyFromCatalogItem(item) {
+  const idCandidate = firstNonEmpty([
+    toNonEmptyString(item?.id),
+    toNonEmptyString(item?.servicoId),
+    toNonEmptyString(item?.serviceId),
+    toNonEmptyString(item?.codigo),
+    toNonEmptyString(item?.code),
+  ]);
+  if (idCandidate) {
+    return idCandidate;
+  }
+  const nameCandidate = toNonEmptyString(item?.nome || item?.name || item?.servicoNome);
+  return normalizeTenantCode(nameCandidate).replace(/-/g, "_");
+}
+
+function resolveCategoryKeyFromCatalogItem(item) {
+  return firstNonEmpty([
+    toNonEmptyString(item?.categoriaId),
+    toNonEmptyString(item?.categoria?.id),
+    toNonEmptyString(item?.categoryId),
+    toNonEmptyString(item?.category?.id),
+    normalizeTenantCode(item?.categoriaNome || item?.categoria || item?.category || item?.categoryName).replace(/-/g, "_"),
+  ]);
+}
+
+function resolveCategoryNameFromCatalogItem(item) {
+  return firstNonEmpty([
+    toNonEmptyString(item?.categoriaNome),
+    toNonEmptyString(item?.categoria?.nome),
+    toNonEmptyString(item?.categoria),
+    toNonEmptyString(item?.categoryName),
+    toNonEmptyString(item?.category?.name),
+    toNonEmptyString(item?.category),
+  ]);
+}
+
+function mapTrinksCatalogServiceItem(item) {
+  const serviceKey = resolveServiceKeyFromCatalogItem(item);
+  const serviceName = toNonEmptyString(item?.nome || item?.name || item?.servicoNome);
+  if (!serviceKey || !serviceName) {
+    return null;
+  }
+
+  const duration = Number(item?.duracaoEmMinutos || item?.duracao || item?.duracaoMinutos);
+  const price = Number(item?.valor || item?.preco);
+  const categoryKey = resolveCategoryKeyFromCatalogItem(item);
+  const categoryName = resolveCategoryNameFromCatalogItem(item);
+
+  return {
+    serviceKey,
+    serviceName,
+    categoryKey,
+    categoryName,
+    serviceId: Number.isFinite(Number(item?.id || item?.servicoId || item?.serviceId))
+      ? Number(item?.id || item?.servicoId || item?.serviceId)
+      : null,
+    durationMinutes: Number.isFinite(duration) && duration > 0 ? duration : null,
+    price: Number.isFinite(price) ? price : null,
+    active: item?.ativo == null ? true : Boolean(item.ativo),
+    visibleToClient: item?.visivelCliente == null ? null : Boolean(item.visivelCliente),
+    raw: item,
+  };
+}
+
+async function listTenantServiceCatalogByCode(code) {
+  const tenant = getTenantByCode(code);
+  if (!tenant) {
+    const error = new Error("Tenant nao encontrado.");
+    error.status = 404;
+    throw error;
+  }
+  if (!tenant.establishmentId) {
+    const error = new Error("Tenant sem establishmentId configurado.");
+    error.status = 400;
+    throw error;
+  }
+
+  const collected = [];
+  const seen = new Set();
+  for (let page = 1; page <= 10; page += 1) {
+    const payload = await trinksRequest("/servicos", {
+      method: "GET",
+      estabelecimentoId: tenant.establishmentId,
+      tenantCode: tenant.code,
+      query: {
+        page,
+        pageSize: 100,
+      },
+    });
+    const items = extractItems(payload);
+    for (const item of items) {
+      const mapped = mapTrinksCatalogServiceItem(item);
+      if (!mapped) {
+        continue;
+      }
+      if (seen.has(mapped.serviceKey)) {
+        continue;
+      }
+      seen.add(mapped.serviceKey);
+      collected.push(mapped);
+    }
+    if (items.length < 100) {
+      break;
+    }
+  }
+
+  return collected.sort((a, b) =>
+    `${a.categoryName} ${a.serviceName}`.localeCompare(`${b.categoryName} ${b.serviceName}`, "pt-BR", {
+      sensitivity: "base",
+    }),
+  );
+}
+
+async function buildTenantCrmServiceCatalogWithRules(code) {
+  const [catalog, rules] = await Promise.all([
+    listTenantServiceCatalogByCode(code),
+    Promise.resolve(listTenantServiceReturnRulesByCode(code)),
+  ]);
+  const ruleMap = new Map(rules.map((item) => [String(item.serviceKey), item]));
+
+  return catalog.map((item) => ({
+    ...item,
+    rule: ruleMap.get(String(item.serviceKey)) || null,
+  }));
+}
+
+function buildTenantCrmDashboard(code) {
+  const tenant = getTenantByCode(code);
+  if (!tenant) {
+    const error = new Error("Tenant nao encontrado.");
+    error.status = 404;
+    throw error;
+  }
+
+  const serviceRules = listTenantServiceReturnRulesByCode(tenant.code);
+  const categoryRules = listTenantCategoryOpportunityRulesByCode(tenant.code);
+  const blocks = listCrmClientBlocksByCode(tenant.code);
+  const flows = listCrmReturnFlowsByCode(tenant.code, { limit: 1000 });
+  const opportunities = listCrmCategoryOpportunitiesByCode(tenant.code, { limit: 1000 });
+  const settings = getTenantCrmSettingsByCode(tenant.code);
+
+  const auditSummary = db.prepare(
+    `
+      SELECT
+        COUNT(1) AS total,
+        SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END) AS successCount,
+        SUM(CASE WHEN event_type = 'create' THEN 1 ELSE 0 END) AS createCount
+      FROM appointment_audit
+      WHERE tenant_code = ?
+    `,
+  ).get(tenant.code);
+
+  const webhookSummary = db.prepare(
+    `
+      SELECT
+        COUNT(1) AS total,
+        SUM(CASE WHEN reason = 'handoffActivated' THEN 1 ELSE 0 END) AS handoffActivatedCount,
+        SUM(CASE WHEN reason = 'handoffResumed' THEN 1 ELSE 0 END) AS handoffResumedCount
+      FROM webhook_events
+      WHERE tenant_code = ?
+    `,
+  ).get(tenant.code);
+
+  const flowsByStatus = {};
+  for (const item of flows) {
+    const key = toNonEmptyString(item.flowStatus) || "unknown";
+    flowsByStatus[key] = Number(flowsByStatus[key] || 0) + 1;
+  }
+
+  const opportunitiesByStatus = {};
+  for (const item of opportunities) {
+    const key = toNonEmptyString(item.opportunityStatus) || "unknown";
+    opportunitiesByStatus[key] = Number(opportunitiesByStatus[key] || 0) + 1;
+  }
+
+  const activeRules = serviceRules.filter((item) => item.active && Number(item.returnDays) > 0);
+  return {
+    settings: settings?.config || getDefaultCrmSettings(),
+    totals: {
+      configuredServices: serviceRules.length,
+      activeServiceRules: activeRules.length,
+      configuredCategories: categoryRules.length,
+      blockedClients: blocks.filter((item) => item.isBlocked).length,
+      flowsTotal: flows.length,
+      opportunitiesTotal: opportunities.length,
+      auditAppointmentsTotal: Number(auditSummary?.total || 0),
+      auditAppointmentsSuccess: Number(auditSummary?.successCount || 0),
+      auditAppointmentsCreated: Number(auditSummary?.createCount || 0),
+      webhookEventsTotal: Number(webhookSummary?.total || 0),
+      handoffActivatedCount: Number(webhookSummary?.handoffActivatedCount || 0),
+      handoffResumedCount: Number(webhookSummary?.handoffResumedCount || 0),
+    },
+    flowsByStatus,
+    opportunitiesByStatus,
+    topServices: activeRules
+      .slice()
+      .sort((a, b) => (Number(a.returnDays || 0) - Number(b.returnDays || 0)))
+      .slice(0, 8),
+    topCategories: categoryRules
+      .slice()
+      .sort((a, b) => (Number(a.opportunityDaysWithoutReturn || 0) - Number(b.opportunityDaysWithoutReturn || 0)))
+      .slice(0, 8),
+    recentBlocks: blocks.slice(0, 8),
+    recentFlows: flows.slice(0, 8),
+    recentOpportunities: opportunities.slice(0, 8),
+  };
+}
+
+function daysBetweenIsoDates(fromIsoDate = "", toIsoDate = "") {
+  const start = Date.parse(`${String(fromIsoDate || "").trim()}T00:00:00Z`);
+  const end = Date.parse(`${String(toIsoDate || "").trim()}T00:00:00Z`);
+  if (!Number.isFinite(start) || !Number.isFinite(end)) {
+    return null;
+  }
+  return Math.floor((end - start) / (24 * 60 * 60 * 1000));
+}
+
+function findMatchingServiceRuleForName(serviceName = "", rules = []) {
+  const target = toNonEmptyString(serviceName);
+  if (!target || !Array.isArray(rules) || !rules.length) {
+    return null;
+  }
+
+  const candidates = rules.map((rule) => ({
+    nome: rule.serviceName,
+    rule,
+  }));
+  const matched = findBestServiceMatch(target, candidates);
+  return matched?.rule || null;
+}
+
+function queryRecentTenantAppointmentAudit(tenantCode, { limit = 2000 } = {}) {
+  return db.prepare(
+    `
+      SELECT id, tenant_code AS tenantCode, event_type AS eventType, status,
+             establishment_id AS establishmentId, appointment_id AS appointmentId,
+             confirmation_code AS confirmationCode, client_phone AS clientPhone,
+             client_name AS clientName, service_name AS serviceName,
+             professional_name AS professionalName, appointment_date AS appointmentDate,
+             appointment_time AS appointmentTime, request_payload AS requestPayload,
+             response_payload AS responsePayload, created_at AS createdAt
+      FROM appointment_audit
+      WHERE tenant_code = ?
+        AND status = 'success'
+        AND event_type IN ('create', 'reschedule')
+        AND COALESCE(client_phone, '') <> ''
+        AND COALESCE(service_name, '') <> ''
+      ORDER BY appointment_date DESC, appointment_time DESC, id DESC
+      LIMIT ?
+    `,
+  ).all(normalizeTenantScopeCode(tenantCode), Math.min(Math.max(Number(limit || 2000), 1), 5000)).map((row) => ({
+    ...row,
+    requestPayload: row.requestPayload ? safeJsonParse(row.requestPayload) : null,
+    responsePayload: row.responsePayload ? safeJsonParse(row.responsePayload) : null,
+  }));
+}
+
+async function detectFutureBookingForPhone(tenant, phone, cache, todayIso) {
+  const normalizedPhone = normalizePhone(phone);
+  if (!tenant?.establishmentId || !normalizedPhone) {
+    return {
+      phone: normalizedPhone,
+      hasFutureBooking: false,
+      clientId: null,
+      clientName: "",
+      firstFutureBooking: null,
+      lookupStatus: "missing_phone",
+    };
+  }
+
+  if (cache.has(normalizedPhone)) {
+    return cache.get(normalizedPhone);
+  }
+
+  let result = {
+    phone: normalizedPhone,
+    hasFutureBooking: false,
+    clientId: null,
+    clientName: "",
+    firstFutureBooking: null,
+    lookupStatus: "not_found",
+  };
+
+  try {
+    const client = await findExistingClientByPhone(tenant.establishmentId, normalizedPhone);
+    const clientId = Number(clientIdFrom(client));
+    if (Number.isFinite(clientId) && clientId > 0) {
+      const futureItems = await listAppointmentsByClientId(
+        tenant.establishmentId,
+        clientId,
+        { dateFrom: todayIso, dateTo: addDaysToIsoDate(todayIso, 120) },
+      );
+      const normalizedAppointments = futureItems
+        .map(normalizeAppointmentItem)
+        .filter(Boolean)
+        .filter((item) => !appointmentLooksCanceled(item.raw))
+        .filter((item) => toNonEmptyString(item.date) >= todayIso)
+        .sort((left, right) => appointmentSortDateTime(left).localeCompare(appointmentSortDateTime(right)));
+
+      result = {
+        phone: normalizedPhone,
+        hasFutureBooking: normalizedAppointments.length > 0,
+        clientId,
+        clientName: clientDisplayNameFrom(client),
+        firstFutureBooking: normalizedAppointments[0] || null,
+        lookupStatus: "ok",
+      };
+    }
+  } catch (error) {
+    result = {
+      ...result,
+      lookupStatus: "error",
+      errorMessage: error?.message || "Erro ao consultar agendamentos futuros da cliente.",
+    };
+  }
+
+  cache.set(normalizedPhone, result);
+  return result;
+}
+
+function findOpenCrmReturnFlowRow(tenantId, phone, originServiceKey) {
+  return db.prepare(
+    `
+      SELECT id
+      FROM crm_return_flows
+      WHERE tenant_id = ?
+        AND phone = ?
+        AND origin_service_key = ?
+        AND flow_status NOT IN ('converted', 'stopped', 'expired')
+      ORDER BY datetime(updated_at) DESC, id DESC
+      LIMIT 1
+    `,
+  ).get(tenantId, normalizePhone(phone), toNonEmptyString(originServiceKey));
+}
+
+function findOpenCrmCategoryOpportunityRow(tenantId, phone, categoryKey) {
+  return db.prepare(
+    `
+      SELECT id
+      FROM crm_category_opportunities
+      WHERE tenant_id = ?
+        AND phone = ?
+        AND category_key = ?
+        AND opportunity_status NOT IN ('converted', 'dismissed')
+      ORDER BY datetime(updated_at) DESC, id DESC
+      LIMIT 1
+    `,
+  ).get(tenantId, normalizePhone(phone), toNonEmptyString(categoryKey));
+}
+
+function recordCrmFlowEvent({ flowId = null, tenantId, eventType, step = null, metadata = {}, messagePreview = "" }) {
+  if (!tenantId || !eventType) {
+    return;
+  }
+  db.prepare(
+    `
+      INSERT INTO crm_flow_events (
+        flow_id, tenant_id, event_type, step, message_preview, metadata_json, created_at
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `,
+  ).run(
+    flowId,
+    tenantId,
+    toNonEmptyString(eventType),
+    Number.isFinite(Number(step)) ? Number(step) : null,
+    toNonEmptyString(messagePreview),
+    safeJsonStringify(metadata || {}),
+    new Date().toISOString(),
+  );
+}
+
+function materializeCrmFlowCandidate(tenant, candidate, crmMode = "beta") {
+  const phone = normalizePhone(candidate.phone);
+  const now = new Date().toISOString();
+  const existing = findOpenCrmReturnFlowRow(tenant.id, phone, candidate.originServiceKey);
+  const nextStatus = crmMode === "automatic" ? "scheduled_step_1" : "pending_approval";
+
+  if (existing?.id) {
+    db.prepare(
+      `
+        UPDATE crm_return_flows
+        SET client_id = ?,
+            client_name = ?,
+            origin_service_name = ?,
+            origin_category_key = ?,
+            origin_category_name = ?,
+            last_visit_at = ?,
+            last_professional_name = ?,
+            last_professional_active = ?,
+            flow_status = ?,
+            current_step = 0,
+            stop_reason = '',
+            updated_at = ?
+        WHERE id = ?
+      `,
+    ).run(
+      Number.isFinite(Number(candidate.clientId)) ? Number(candidate.clientId) : null,
+      toNonEmptyString(candidate.clientName),
+      toNonEmptyString(candidate.originServiceName),
+      toNonEmptyString(candidate.originCategoryKey),
+      toNonEmptyString(candidate.originCategoryName),
+      toNonEmptyString(candidate.lastVisitAt),
+      toNonEmptyString(candidate.lastProfessionalName),
+      candidate.lastProfessionalActive == null ? null : (candidate.lastProfessionalActive ? 1 : 0),
+      nextStatus,
+      now,
+      existing.id,
+    );
+    recordCrmFlowEvent({
+      flowId: existing.id,
+      tenantId: tenant.id,
+      eventType: "reentered_flow",
+      metadata: candidate,
+    });
+    return { id: existing.id, action: "updated" };
+  }
+
+  const result = db.prepare(
+    `
+      INSERT INTO crm_return_flows (
+        tenant_id, client_id, client_name, phone,
+        origin_service_key, origin_service_name, origin_category_key, origin_category_name,
+        last_visit_at, last_professional_name, last_professional_active,
+        flow_status, current_step, entered_flow_at, created_at, updated_at
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)
+    `,
+  ).run(
+    tenant.id,
+    Number.isFinite(Number(candidate.clientId)) ? Number(candidate.clientId) : null,
+    toNonEmptyString(candidate.clientName),
+    phone,
+    toNonEmptyString(candidate.originServiceKey),
+    toNonEmptyString(candidate.originServiceName),
+    toNonEmptyString(candidate.originCategoryKey),
+    toNonEmptyString(candidate.originCategoryName),
+    toNonEmptyString(candidate.lastVisitAt),
+    toNonEmptyString(candidate.lastProfessionalName),
+    candidate.lastProfessionalActive == null ? null : (candidate.lastProfessionalActive ? 1 : 0),
+    nextStatus,
+    now,
+    now,
+    now,
+  );
+  recordCrmFlowEvent({
+    flowId: Number(result.lastInsertRowid),
+    tenantId: tenant.id,
+    eventType: "entered_flow",
+    metadata: candidate,
+  });
+  return { id: Number(result.lastInsertRowid), action: "created" };
+}
+
+function materializeCrmOpportunityCandidate(tenant, candidate) {
+  const phone = normalizePhone(candidate.phone);
+  const now = new Date().toISOString();
+  const existing = findOpenCrmCategoryOpportunityRow(tenant.id, phone, candidate.categoryKey);
+
+  if (existing?.id) {
+    db.prepare(
+      `
+        UPDATE crm_category_opportunities
+        SET client_id = ?,
+            client_name = ?,
+            source_service_key = ?,
+            source_service_name = ?,
+            last_relevant_visit_at = ?,
+            days_without_return = ?,
+            last_professional_name = ?,
+            last_professional_active = ?,
+            opportunity_status = ?,
+            priority = ?,
+            notes = ?,
+            updated_at = ?
+        WHERE id = ?
+      `,
+    ).run(
+      Number.isFinite(Number(candidate.clientId)) ? Number(candidate.clientId) : null,
+      toNonEmptyString(candidate.clientName),
+      toNonEmptyString(candidate.sourceServiceKey),
+      toNonEmptyString(candidate.sourceServiceName),
+      toNonEmptyString(candidate.lastRelevantVisitAt),
+      Number.isFinite(Number(candidate.daysWithoutReturn)) ? Number(candidate.daysWithoutReturn) : null,
+      toNonEmptyString(candidate.lastProfessionalName),
+      candidate.lastProfessionalActive == null ? null : (candidate.lastProfessionalActive ? 1 : 0),
+      "open",
+      normalizePriority(candidate.priority, "medium"),
+      toNonEmptyString(candidate.notes),
+      now,
+      existing.id,
+    );
+    return { id: existing.id, action: "updated" };
+  }
+
+  const result = db.prepare(
+    `
+      INSERT INTO crm_category_opportunities (
+        tenant_id, client_id, client_name, phone,
+        category_key, category_name, source_service_key, source_service_name,
+        last_relevant_visit_at, days_without_return,
+        last_professional_name, last_professional_active,
+        opportunity_status, priority, notes, created_at, updated_at
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?)
+    `,
+  ).run(
+    tenant.id,
+    Number.isFinite(Number(candidate.clientId)) ? Number(candidate.clientId) : null,
+    toNonEmptyString(candidate.clientName),
+    phone,
+    toNonEmptyString(candidate.categoryKey),
+    toNonEmptyString(candidate.categoryName),
+    toNonEmptyString(candidate.sourceServiceKey),
+    toNonEmptyString(candidate.sourceServiceName),
+    toNonEmptyString(candidate.lastRelevantVisitAt),
+    Number.isFinite(Number(candidate.daysWithoutReturn)) ? Number(candidate.daysWithoutReturn) : null,
+    toNonEmptyString(candidate.lastProfessionalName),
+    candidate.lastProfessionalActive == null ? null : (candidate.lastProfessionalActive ? 1 : 0),
+    normalizePriority(candidate.priority, "medium"),
+    toNonEmptyString(candidate.notes),
+    now,
+    now,
+  );
+  return { id: Number(result.lastInsertRowid), action: "created" };
+}
+
+async function runTenantCrmPreview(code, { lookbackDays = 365, materialize = false, limit = 250 } = {}) {
+  const tenant = getTenantByCode(code);
+  if (!tenant) {
+    const error = new Error("Tenant nao encontrado.");
+    error.status = 404;
+    throw error;
+  }
+
+  const settings = getTenantCrmSettingsByCode(tenant.code)?.config || getDefaultCrmSettings();
+  const serviceRules = listTenantServiceReturnRulesByCode(tenant.code).filter(
+    (item) => item.active && Number(item.returnDays) > 0,
+  );
+  const categoryRules = listTenantCategoryOpportunityRulesByCode(tenant.code).filter(
+    (item) => item.opportunityTrackingEnabled && Number(item.opportunityDaysWithoutReturn) > 0,
+  );
+  const todayIso = getSaoPauloDateContext().isoToday;
+  const cutoffIso = addDaysToIsoDate(todayIso, -Math.abs(Number(lookbackDays || 365)));
+  const auditRows = queryRecentTenantAppointmentAudit(tenant.code, { limit: 4000 })
+    .filter((row) => toNonEmptyString(row.appointmentDate) && row.appointmentDate <= todayIso)
+    .filter((row) => !cutoffIso || row.appointmentDate >= cutoffIso);
+
+  const latestByPhoneService = new Map();
+  const latestByPhoneCategory = new Map();
+  const latestByPhoneOverall = new Map();
+  for (const row of auditRows) {
+    const phone = normalizePhone(row.clientPhone);
+    if (!phone) continue;
+    const serviceRule = findMatchingServiceRuleForName(row.serviceName, serviceRules);
+    const overallKey = phone;
+    if (!latestByPhoneOverall.has(overallKey)) {
+      latestByPhoneOverall.set(overallKey, row);
+    }
+    if (serviceRule) {
+      const serviceKey = `${phone}:${serviceRule.serviceKey}`;
+      if (!latestByPhoneService.has(serviceKey)) {
+        latestByPhoneService.set(serviceKey, { row, rule: serviceRule });
+      }
+    }
+  }
+
+  for (const row of auditRows) {
+    const phone = normalizePhone(row.clientPhone);
+    if (!phone) continue;
+    const serviceRule = findMatchingServiceRuleForName(row.serviceName, serviceRules);
+    const categoryKey = toNonEmptyString(serviceRule?.categoryKey);
+    const categoryName = toNonEmptyString(serviceRule?.categoryName);
+    if (!categoryKey || !categoryName) continue;
+    const categoryRule = categoryRules.find((item) => item.categoryKey === categoryKey);
+    if (!categoryRule) continue;
+    const key = `${phone}:${categoryKey}`;
+    if (!latestByPhoneCategory.has(key)) {
+      latestByPhoneCategory.set(key, { row, serviceRule, categoryRule });
+    }
+  }
+
+  const blockedPhones = new Set(
+    listCrmClientBlocksByCode(tenant.code)
+      .filter((item) => item.isBlocked)
+      .map((item) => normalizePhone(item.phone)),
+  );
+  const futureBookingCache = new Map();
+  const flowCandidates = [];
+  const opportunityCandidates = [];
+  const skipped = [];
+
+  for (const { row, rule } of latestByPhoneService.values()) {
+    if (flowCandidates.length >= limit) {
+      break;
+    }
+    const phone = normalizePhone(row.clientPhone);
+    const daysSinceLastVisit = daysBetweenIsoDates(row.appointmentDate, todayIso);
+    if (!phone || daysSinceLastVisit == null) {
+      continue;
+    }
+    if (daysSinceLastVisit < Number(rule.returnDays || 0)) {
+      continue;
+    }
+    if (blockedPhones.has(phone)) {
+      skipped.push({
+        type: "flow",
+        phone,
+        clientName: row.clientName,
+        reason: "client_blocked",
+        serviceName: rule.serviceName,
+      });
+      continue;
+    }
+
+    const futureBooking = await detectFutureBookingForPhone(tenant, phone, futureBookingCache, todayIso);
+    if (futureBooking.hasFutureBooking) {
+      skipped.push({
+        type: "flow",
+        phone,
+        clientName: row.clientName,
+        reason: "future_booking",
+        serviceName: rule.serviceName,
+        firstFutureBooking: futureBooking.firstFutureBooking,
+      });
+      continue;
+    }
+
+    const existingFlow = findOpenCrmReturnFlowRow(tenant.id, phone, rule.serviceKey);
+    if (existingFlow?.id) {
+      skipped.push({
+        type: "flow",
+        phone,
+        clientName: row.clientName,
+        reason: "already_open",
+        serviceName: rule.serviceName,
+      });
+      continue;
+    }
+
+    const candidate = {
+      phone,
+      clientId: futureBooking.clientId,
+      clientName: futureBooking.clientName || row.clientName,
+      originServiceKey: rule.serviceKey,
+      originServiceName: rule.serviceName,
+      originCategoryKey: rule.categoryKey,
+      originCategoryName: rule.categoryName,
+      lastVisitAt: row.appointmentDate,
+      lastProfessionalName: row.professionalName,
+      lastProfessionalActive: null,
+      daysSinceLastVisit,
+      returnDays: rule.returnDays,
+      stepMessages: {
+        step1: rule.step1MessageTemplate || "",
+        step2: rule.step2MessageTemplate || "",
+        step3: rule.step3MessageTemplate || "",
+      },
+      statusIfCreated: settings.crmMode === "automatic" ? "scheduled_step_1" : "pending_approval",
+    };
+    flowCandidates.push(candidate);
+  }
+
+  for (const { row, serviceRule, categoryRule } of latestByPhoneCategory.values()) {
+    if (opportunityCandidates.length >= limit) {
+      break;
+    }
+    const phone = normalizePhone(row.clientPhone);
+    const latestOverall = latestByPhoneOverall.get(phone);
+    if (!phone || !latestOverall || toNonEmptyString(latestOverall.appointmentDate) <= toNonEmptyString(row.appointmentDate)) {
+      continue;
+    }
+    const daysWithoutReturn = daysBetweenIsoDates(row.appointmentDate, todayIso);
+    if (daysWithoutReturn == null || daysWithoutReturn < Number(categoryRule.opportunityDaysWithoutReturn || 0)) {
+      continue;
+    }
+
+    const existingOpportunity = findOpenCrmCategoryOpportunityRow(tenant.id, phone, categoryRule.categoryKey);
+    if (existingOpportunity?.id) {
+      continue;
+    }
+
+    opportunityCandidates.push({
+      phone,
+      clientId: null,
+      clientName: row.clientName,
+      categoryKey: categoryRule.categoryKey,
+      categoryName: categoryRule.categoryName,
+      sourceServiceKey: serviceRule.serviceKey,
+      sourceServiceName: serviceRule.serviceName,
+      lastRelevantVisitAt: row.appointmentDate,
+      daysWithoutReturn,
+      lastProfessionalName: row.professionalName,
+      lastProfessionalActive: null,
+      priority: categoryRule.opportunityPriority,
+      notes: "Cliente voltou por outro atendimento, mas esta categoria segue sem retorno no ciclo esperado.",
+    });
+  }
+
+  const materialized = {
+    flowsCreated: 0,
+    flowsUpdated: 0,
+    opportunitiesCreated: 0,
+    opportunitiesUpdated: 0,
+  };
+
+  if (materialize) {
+    for (const candidate of flowCandidates) {
+      const result = materializeCrmFlowCandidate(tenant, candidate, settings.crmMode);
+      if (result.action === "created") materialized.flowsCreated += 1;
+      if (result.action === "updated") materialized.flowsUpdated += 1;
+    }
+    for (const candidate of opportunityCandidates) {
+      const result = materializeCrmOpportunityCandidate(tenant, candidate);
+      if (result.action === "created") materialized.opportunitiesCreated += 1;
+      if (result.action === "updated") materialized.opportunitiesUpdated += 1;
+    }
+  }
+
+  return {
+    generatedAt: new Date().toISOString(),
+    materialize,
+    crmMode: settings.crmMode || "beta",
+    summary: {
+      auditedRows: auditRows.length,
+      flowCandidates: flowCandidates.length,
+      opportunityCandidates: opportunityCandidates.length,
+      skipped: skipped.length,
+      ...materialized,
+    },
+    flowCandidates,
+    opportunityCandidates,
+    skipped: skipped.slice(0, 200),
+  };
+}
+
 function normalizeSchedulingProvider(value) {
   const normalized = toNonEmptyString(value)
     .toLowerCase()
@@ -1527,11 +3533,12 @@ function resolveSchedulingRequestContext({ tenantCode = "", tenantAlias = "", es
   const tenant = normalizedTenantCode ? getTenantByCode(normalizedTenantCode) : null;
 
   const parsedEstablishmentId = Number(establishmentId);
-  const resolvedEstablishmentId = Number.isFinite(parsedEstablishmentId) && parsedEstablishmentId > 0
-    ? parsedEstablishmentId
-    : (Number.isFinite(Number(tenant?.establishmentId)) && Number(tenant.establishmentId) > 0
-      ? Number(tenant.establishmentId)
-      : null);
+  const tenantEstablishmentId = Number(tenant?.establishmentId);
+  const hasTenantEstablishmentId = Number.isFinite(tenantEstablishmentId) && tenantEstablishmentId > 0;
+  const hasParsedEstablishmentId = Number.isFinite(parsedEstablishmentId) && parsedEstablishmentId > 0;
+  const resolvedEstablishmentId = hasTenantEstablishmentId
+    ? tenantEstablishmentId
+    : (hasParsedEstablishmentId ? parsedEstablishmentId : null);
 
   return {
     tenantCode: normalizedTenantCode || "",
@@ -1640,6 +3647,7 @@ function getSchedulingAdapter(preferredProviderOrOptions = "") {
       },
       async createAppointment({
         establishmentId,
+        tenantCode = "",
         service,
         date,
         time,
@@ -1649,6 +3657,7 @@ function getSchedulingAdapter(preferredProviderOrOptions = "") {
       }) {
         return createAppointment({
           establishmentId,
+          tenantCode: tenantCode ? String(tenantCode) : "",
           service,
           date,
           time,
@@ -1681,9 +3690,10 @@ function getSchedulingAdapter(preferredProviderOrOptions = "") {
             })),
         };
       },
-      async rescheduleAppointment({ establishmentId, confirmationCode, appointmentId, date, time }) {
+      async rescheduleAppointment({ establishmentId, tenantCode = "", confirmationCode, appointmentId, date, time }) {
         return rescheduleAppointment({
           establishmentId: Number(establishmentId),
+          tenantCode: tenantCode ? String(tenantCode) : "",
           confirmationCode: confirmationCode ? String(confirmationCode) : "",
           appointmentId: appointmentId ? String(appointmentId) : "",
           date: String(date),
@@ -1692,6 +3702,7 @@ function getSchedulingAdapter(preferredProviderOrOptions = "") {
       },
       async cancelAppointment({
         establishmentId,
+        tenantCode = "",
         confirmationCode,
         appointmentId,
         reason,
@@ -1704,6 +3715,7 @@ function getSchedulingAdapter(preferredProviderOrOptions = "") {
       }) {
         return cancelAppointment({
           establishmentId: Number(establishmentId),
+          tenantCode: tenantCode ? String(tenantCode) : "",
           confirmationCode: confirmationCode ? String(confirmationCode) : "",
           appointmentId: appointmentId ? String(appointmentId) : "",
           reason: reason ? String(reason) : "",
@@ -1763,17 +3775,56 @@ function normalizeWhatsappMessage(item) {
   };
 }
 
-function persistWhatsappMessage({ phone, role, content, at, senderName = "", source = "runtime" }) {
+function normalizeTenantScopeCode(value = "") {
+  return normalizeTenantCode(value);
+}
+
+function buildWhatsappConversationCacheKey(phone, tenantCode = "") {
+  const normalizedPhone = normalizePhone(phone || "");
+  const normalizedTenantCode = normalizeTenantScopeCode(tenantCode);
+  if (!normalizedPhone) {
+    return "";
+  }
+  return normalizedTenantCode ? `${normalizedTenantCode}:${normalizedPhone}` : normalizedPhone;
+}
+
+function parseWhatsappConversationCacheKey(key = "") {
+  const raw = toNonEmptyString(key);
+  if (!raw) {
+    return { tenantCode: "", phone: "" };
+  }
+
+  const separator = raw.indexOf(":");
+  if (separator <= 0) {
+    return { tenantCode: "", phone: normalizePhone(raw) };
+  }
+
+  return {
+    tenantCode: normalizeTenantScopeCode(raw.slice(0, separator)),
+    phone: normalizePhone(raw.slice(separator + 1)),
+  };
+}
+
+function persistWhatsappMessage({
+  phone,
+  role,
+  content,
+  at,
+  senderName = "",
+  source = "runtime",
+  tenantCode = "",
+}) {
   if (!phone || !role || !content) {
     return;
   }
 
   db.prepare(
     `
-      INSERT INTO whatsapp_messages (phone, role, content, sender_name, at, source)
-      VALUES (?, ?, ?, ?, ?, ?)
+      INSERT INTO whatsapp_messages (tenant_code, phone, role, content, sender_name, at, source)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
     `,
   ).run(
+    normalizeTenantScopeCode(tenantCode),
     String(phone),
     String(role),
     String(content),
@@ -1783,20 +3834,32 @@ function persistWhatsappMessage({ phone, role, content, at, senderName = "", sou
   );
 }
 
-function loadWhatsappMessagesFromDb(phone, limit = MAX_WHATSAPP_HISTORY_MESSAGES) {
+function loadWhatsappMessagesFromDb(phone, limit = MAX_WHATSAPP_HISTORY_MESSAGES, options = {}) {
   if (!phone) {
     return [];
   }
 
-  const rows = db.prepare(
-    `
-      SELECT role, content, at, sender_name AS senderName
-      FROM whatsapp_messages
-      WHERE phone = ?
-      ORDER BY datetime(at) DESC, id DESC
-      LIMIT ?
-    `,
-  ).all(String(phone), Number(limit));
+  const normalizedTenantCode = normalizeTenantScopeCode(options?.tenantCode || "");
+  const rows = normalizedTenantCode
+    ? db.prepare(
+      `
+        SELECT role, content, at, sender_name AS senderName
+        FROM whatsapp_messages
+        WHERE phone = ?
+          AND tenant_code = ?
+        ORDER BY datetime(at) DESC, id DESC
+        LIMIT ?
+      `,
+    ).all(String(phone), normalizedTenantCode, Number(limit))
+    : db.prepare(
+      `
+        SELECT role, content, at, sender_name AS senderName
+        FROM whatsapp_messages
+        WHERE phone = ?
+        ORDER BY datetime(at) DESC, id DESC
+        LIMIT ?
+      `,
+    ).all(String(phone), Number(limit));
 
   return rows
     .reverse()
@@ -1804,13 +3867,14 @@ function loadWhatsappMessagesFromDb(phone, limit = MAX_WHATSAPP_HISTORY_MESSAGES
     .filter(Boolean);
 }
 
-function getWhatsappHistory(phone) {
+function getWhatsappHistory(phone, options = {}) {
   if (!phone) {
     return [];
   }
 
-  const current = Array.isArray(whatsappConversations.get(phone))
-    ? whatsappConversations.get(phone)
+  const cacheKey = buildWhatsappConversationCacheKey(phone, options?.tenantCode || "");
+  const current = Array.isArray(whatsappConversations.get(cacheKey))
+    ? whatsappConversations.get(cacheKey)
     : [];
 
   const normalized = current.map(normalizeWhatsappMessage).filter(Boolean);
@@ -1818,19 +3882,21 @@ function getWhatsappHistory(phone) {
     return normalized;
   }
 
-  const fromDb = loadWhatsappMessagesFromDb(phone, MAX_WHATSAPP_HISTORY_MESSAGES);
+  const fromDb = loadWhatsappMessagesFromDb(phone, MAX_WHATSAPP_HISTORY_MESSAGES, options);
   if (fromDb.length) {
-    whatsappConversations.set(phone, fromDb);
+    whatsappConversations.set(cacheKey, fromDb);
   }
   return fromDb;
 }
 
-function pushWhatsappHistory(phone, role, content, senderName = "") {
+function pushWhatsappHistory(phone, role, content, senderName = "", options = {}) {
   if (!phone || !role || !content) {
     return;
   }
 
-  const current = getWhatsappHistory(phone);
+  const normalizedTenantCode = normalizeTenantScopeCode(options?.tenantCode || "");
+  const cacheKey = buildWhatsappConversationCacheKey(phone, normalizedTenantCode);
+  const current = getWhatsappHistory(phone, { tenantCode: normalizedTenantCode });
   const entry = {
     role,
     content: String(content),
@@ -1838,7 +3904,7 @@ function pushWhatsappHistory(phone, role, content, senderName = "") {
     senderName: senderName ? String(senderName) : "",
   };
   const updated = [...current, entry].slice(-MAX_WHATSAPP_HISTORY_MESSAGES);
-  whatsappConversations.set(phone, updated);
+  whatsappConversations.set(cacheKey, updated);
   persistWhatsappMessage({
     phone,
     role,
@@ -1846,6 +3912,7 @@ function pushWhatsappHistory(phone, role, content, senderName = "") {
     at: entry.at,
     senderName: entry.senderName,
     source: "runtime",
+    tenantCode: normalizedTenantCode,
   });
 }
 
@@ -1857,15 +3924,18 @@ function cleanupWebhookDedupeCache(now = Date.now()) {
   }
 }
 
-function isDuplicateIncomingWhatsapp(incoming) {
+function isDuplicateIncomingWhatsapp(incoming, options = {}) {
   const now = Date.now();
   cleanupWebhookDedupeCache(now);
 
   const sender = normalizePhone(incoming?.senderNumber || "");
   const messageId = toNonEmptyString(incoming?.messageId);
   const text = toNonEmptyString(incoming?.messageText).toLowerCase();
-  const withMessageId = sender && messageId ? `id:${sender}:${messageId}` : "";
-  const withoutMessageId = sender && text ? `txt:${sender}:${text}` : "";
+  const tenantScope = normalizeTenantScopeCode(options?.tenantCode || "");
+  const instanceScope = toNonEmptyString(options?.instanceName || incoming?.instanceName).toLowerCase();
+  const scope = tenantScope || (instanceScope ? `instance:${instanceScope}` : "global");
+  const withMessageId = sender && messageId ? `id:${scope}:${sender}:${messageId}` : "";
+  const withoutMessageId = sender && text ? `txt:${scope}:${sender}:${text}` : "";
 
   if (withMessageId) {
     if (recentWebhookMessages.has(withMessageId)) {
@@ -1885,37 +3955,74 @@ function isDuplicateIncomingWhatsapp(incoming) {
   return false;
 }
 
-function summarizeWhatsappConversations() {
-  const rows = db.prepare(
-    `
-      SELECT m.phone,
-             m.content AS lastMessage,
-             m.role AS lastRole,
-             m.at AS updatedAt,
-             m.sender_name AS senderName,
-             (
-               SELECT sender_name
-               FROM whatsapp_messages u
-               WHERE u.phone = m.phone
-                 AND u.role = 'user'
-                 AND COALESCE(u.sender_name, '') <> ''
-               ORDER BY datetime(u.at) DESC, u.id DESC
-               LIMIT 1
-             ) AS userSenderName,
-             (
-               SELECT COUNT(*)
-               FROM whatsapp_messages c
-               WHERE c.phone = m.phone
-             ) AS count
-      FROM whatsapp_messages m
-      JOIN (
-        SELECT phone, MAX(id) AS max_id
-        FROM whatsapp_messages
-        GROUP BY phone
-      ) latest ON latest.max_id = m.id
-      ORDER BY datetime(m.at) DESC, m.id DESC
-    `,
-  ).all();
+function summarizeWhatsappConversations(options = {}) {
+  const normalizedTenantCode = normalizeTenantScopeCode(options?.tenantCode || "");
+  const rows = normalizedTenantCode
+    ? db.prepare(
+      `
+        SELECT m.phone,
+               m.content AS lastMessage,
+               m.role AS lastRole,
+               m.at AS updatedAt,
+               m.sender_name AS senderName,
+               (
+                 SELECT sender_name
+                 FROM whatsapp_messages u
+                 WHERE u.phone = m.phone
+                   AND u.tenant_code = m.tenant_code
+                   AND u.role = 'user'
+                   AND COALESCE(u.sender_name, '') <> ''
+                 ORDER BY datetime(u.at) DESC, u.id DESC
+                 LIMIT 1
+               ) AS userSenderName,
+               (
+                 SELECT COUNT(*)
+                 FROM whatsapp_messages c
+                 WHERE c.phone = m.phone
+                   AND c.tenant_code = m.tenant_code
+               ) AS count
+        FROM whatsapp_messages m
+        JOIN (
+          SELECT tenant_code, phone, MAX(id) AS max_id
+          FROM whatsapp_messages
+          WHERE tenant_code = ?
+          GROUP BY tenant_code, phone
+        ) latest ON latest.max_id = m.id
+        ORDER BY datetime(m.at) DESC, m.id DESC
+      `,
+    ).all(normalizedTenantCode)
+    : db.prepare(
+      `
+        SELECT m.phone,
+               m.content AS lastMessage,
+               m.role AS lastRole,
+               m.at AS updatedAt,
+               m.sender_name AS senderName,
+               (
+                 SELECT sender_name
+                 FROM whatsapp_messages u
+                 WHERE u.phone = m.phone
+                   AND u.tenant_code = m.tenant_code
+                   AND u.role = 'user'
+                   AND COALESCE(u.sender_name, '') <> ''
+                 ORDER BY datetime(u.at) DESC, u.id DESC
+                 LIMIT 1
+               ) AS userSenderName,
+               (
+                 SELECT COUNT(*)
+                 FROM whatsapp_messages c
+                 WHERE c.phone = m.phone
+                   AND c.tenant_code = m.tenant_code
+               ) AS count
+        FROM whatsapp_messages m
+        JOIN (
+          SELECT tenant_code, phone, MAX(id) AS max_id
+          FROM whatsapp_messages
+          GROUP BY tenant_code, phone
+        ) latest ON latest.max_id = m.id
+        ORDER BY datetime(m.at) DESC, m.id DESC
+      `,
+    ).all();
 
   if (rows.length) {
     return rows.map((row) => ({
@@ -1930,7 +4037,20 @@ function summarizeWhatsappConversations() {
 
   const summaries = [];
 
-  for (const [phone, messages] of whatsappConversations.entries()) {
+  for (const [cacheKey, messages] of whatsappConversations.entries()) {
+    const parsed = parseWhatsappConversationCacheKey(cacheKey);
+    const phone = parsed.phone;
+    const tenantCode = parsed.tenantCode;
+    if (!phone) {
+      continue;
+    }
+    if (normalizedTenantCode && normalizedTenantCode !== tenantCode) {
+      continue;
+    }
+    if (!normalizedTenantCode && tenantCode) {
+      continue;
+    }
+
     const normalized = Array.isArray(messages) ? messages.map(normalizeWhatsappMessage).filter(Boolean) : [];
     if (!normalized.length) {
       continue;
@@ -2015,22 +4135,49 @@ function isHumanHandoffEnabled() {
   return !["0", "false", "off", "no", "nao"].includes(raw);
 }
 
+function buildHumanHandoffSessionKey(phone, tenantCode = "") {
+  const normalizedPhone = normalizePhone(phone);
+  if (!normalizedPhone) {
+    return "";
+  }
+
+  const normalizedTenantCode = normalizeTenantScopeCode(tenantCode);
+  return normalizedTenantCode ? `${normalizedTenantCode}:${normalizedPhone}` : `global:${normalizedPhone}`;
+}
+
 function cleanupHumanHandoffSessions(now = Date.now()) {
-  for (const [phone, value] of humanHandoffSessions.entries()) {
+  for (const [key, value] of humanHandoffSessions.entries()) {
     if (!value || now > Number(value.expiresAt || 0)) {
-      humanHandoffSessions.delete(phone);
+      humanHandoffSessions.delete(key);
     }
   }
 }
 
-function getHumanHandoffSession(phone) {
+function getHumanHandoffSession(phone, tenantCode = "") {
   const normalizedPhone = normalizePhone(phone);
   if (!normalizedPhone) {
     return null;
   }
 
   cleanupHumanHandoffSessions();
-  return humanHandoffSessions.get(normalizedPhone) || null;
+  const scopedKey = buildHumanHandoffSessionKey(normalizedPhone, tenantCode);
+  if (tenantCode) {
+    return humanHandoffSessions.get(scopedKey) || null;
+  }
+
+  const matches = [];
+  for (const value of humanHandoffSessions.values()) {
+    if (normalizePhone(value?.phone || "") === normalizedPhone) {
+      matches.push(value);
+    }
+  }
+
+  if (!matches.length) {
+    return humanHandoffSessions.get(scopedKey) || null;
+  }
+
+  matches.sort((left, right) => Number(right?.updatedAt || 0) - Number(left?.updatedAt || 0));
+  return matches[0] || null;
 }
 
 function setHumanHandoffSession(phone, payload = {}) {
@@ -2039,27 +4186,204 @@ function setHumanHandoffSession(phone, payload = {}) {
     return null;
   }
 
+  const normalizedTenantCode = normalizeTenantScopeCode(payload?.tenantCode || "");
+  const sessionKey = buildHumanHandoffSessionKey(normalizedPhone, normalizedTenantCode);
   const now = Date.now();
   const value = {
     active: true,
     phone: normalizedPhone,
+    tenantCode: normalizedTenantCode,
     createdAt: now,
     updatedAt: now,
     expiresAt: now + HUMAN_HANDOFF_TTL_MS,
     ...payload,
   };
 
-  humanHandoffSessions.set(normalizedPhone, value);
+  humanHandoffSessions.set(sessionKey, value);
   return value;
 }
 
-function clearHumanHandoffSession(phone) {
+function clearHumanHandoffSession(phone, tenantCode = "") {
   const normalizedPhone = normalizePhone(phone);
   if (!normalizedPhone) {
     return false;
   }
 
-  return humanHandoffSessions.delete(normalizedPhone);
+  if (tenantCode) {
+    return humanHandoffSessions.delete(buildHumanHandoffSessionKey(normalizedPhone, tenantCode));
+  }
+
+  let deleted = false;
+  for (const key of [...humanHandoffSessions.keys()]) {
+    if (key.endsWith(`:${normalizedPhone}`)) {
+      humanHandoffSessions.delete(key);
+      deleted = true;
+    }
+  }
+  return deleted;
+}
+
+function buildBotSessionKey(phone, tenantCode = "") {
+  const normalizedPhone = normalizePhone(phone);
+  if (!normalizedPhone) {
+    return "";
+  }
+  const normalizedTenantCode = normalizeTenantScopeCode(tenantCode);
+  return normalizedTenantCode ? `${normalizedTenantCode}:${normalizedPhone}` : normalizedPhone;
+}
+
+function cleanupBotAutoClosedSessions(now = Date.now()) {
+  for (const [key, value] of botAutoClosedSessions.entries()) {
+    if (!value || now > Number(value.expiresAt || 0)) {
+      botAutoClosedSessions.delete(key);
+    }
+  }
+}
+
+function getBotAutoClosedSession(phone, tenantCode = "") {
+  const key = buildBotSessionKey(phone, tenantCode);
+  if (!key) {
+    return null;
+  }
+  cleanupBotAutoClosedSessions();
+  return botAutoClosedSessions.get(key) || null;
+}
+
+function setBotAutoClosedSession(phone, tenantCode = "", payload = {}) {
+  const key = buildBotSessionKey(phone, tenantCode);
+  if (!key) {
+    return null;
+  }
+
+  const now = Date.now();
+  const value = {
+    active: true,
+    phone: normalizePhone(phone),
+    tenantCode: normalizeTenantScopeCode(tenantCode),
+    createdAt: now,
+    updatedAt: now,
+    expiresAt: now + BOT_AUTOCLOSE_TTL_MS,
+    ...payload,
+  };
+  botAutoClosedSessions.set(key, value);
+  return value;
+}
+
+function clearBotAutoClosedSession(phone, tenantCode = "") {
+  const key = buildBotSessionKey(phone, tenantCode);
+  if (!key) {
+    return false;
+  }
+  return botAutoClosedSessions.delete(key);
+}
+
+function detectInboundAutomationSignal(text = "") {
+  const normalized = normalizeForMatch(text).replace(/\s+/g, " ").trim();
+  if (!normalized) {
+    return { score: 0, reasons: [] };
+  }
+
+  const reasons = [];
+  let score = 0;
+  const mark = (pattern, reason, weight = 1) => {
+    if (pattern.test(normalized)) {
+      reasons.push(reason);
+      score += weight;
+    }
+  };
+
+  mark(/\bj&t express\b/, "jt_express", 2);
+  mark(/\btransportadora\b/, "transportadora", 2);
+  mark(/\b(remessa|encomenda|logistica)\b/, "logistica", 1);
+  mark(/\bpesquisa oficial\b/, "pesquisa_oficial", 2);
+  mark(/\bexperiencia dos nossos clientes\b/, "pesquisa_experiencia", 1);
+  mark(/\b(escreva|responda)\s+(sim|nao)\b/, "resposta_binaria", 2);
+  mark(/\bclique nos botoes acima\b/, "botoes_acima", 2);
+  mark(/\bagradecemos (o seu interesse|por compartilhar|sua colaboracao)\b/, "agradecimento_template", 1);
+  mark(/\bparceira da empresa\b/, "template_parceira", 1);
+  mark(/\bencaminhar o seu feedback\b/, "feedback_template", 1);
+
+  return {
+    score,
+    reasons: [...new Set(reasons)],
+  };
+}
+
+function countRecentAutomationHits(history = []) {
+  if (!Array.isArray(history) || !history.length) {
+    return 0;
+  }
+  return history
+    .slice(-12)
+    .filter((item) => String(item?.role || "").toLowerCase() === "user")
+    .map((item) => detectInboundAutomationSignal(item?.content || item?.text || ""))
+    .filter((signal) => Number(signal.score || 0) >= 2)
+    .length;
+}
+
+function countRepeatedUserMessage(history = [], message = "") {
+  const normalizedMessage = normalizeForMatch(message).replace(/\s+/g, " ").trim();
+  if (!normalizedMessage || !Array.isArray(history)) {
+    return 0;
+  }
+
+  return history
+    .slice(-12)
+    .filter((item) => String(item?.role || "").toLowerCase() === "user")
+    .map((item) => normalizeForMatch(item?.content || item?.text || "").replace(/\s+/g, " ").trim())
+    .filter((content) => content && content === normalizedMessage)
+    .length;
+}
+
+function isExplicitHumanReopenMessage(text = "") {
+  const normalized = normalizeForMatch(text);
+  if (!normalized) {
+    return false;
+  }
+  return (
+    /\b(quero agendar|quero marcar|gostaria de agendar|sou cliente|sou uma cliente)\b/.test(normalized) ||
+    /\b(escova|manicure|pedicure|depilacao|cabelo|corte|unha|sobrancelha)\b/.test(normalized) ||
+    /\b(falar com atendente|falar com humano)\b/.test(normalized)
+  );
+}
+
+function shouldAutoCloseBotConversation({
+  message = "",
+  history = [],
+  knownClientName = "",
+} = {}) {
+  const signal = detectInboundAutomationSignal(message);
+  const recentHits = countRecentAutomationHits(history);
+  const repeatedCount = countRepeatedUserMessage(history, message);
+  const hasKnownClient = Boolean(toNonEmptyString(knownClientName));
+
+  const shouldClose = !hasKnownClient && (
+    signal.score >= 3 ||
+    (signal.score >= 2 && recentHits >= 1) ||
+    recentHits >= 2 ||
+    repeatedCount >= 1
+  );
+
+  return {
+    shouldClose,
+    signal,
+    recentHits,
+    repeatedCount,
+    hasKnownClient,
+  };
+}
+
+function buildBotAutoCloseMessage({ tenantName = "" } = {}) {
+  const channelLabel = toNonEmptyString(tenantName)
+    ? `do ${tenantName}`
+    : "desta unidade";
+  return [
+    "Encerrando este atendimento automaticamente para evitar loop entre mensagens de robo.",
+    "",
+    `Motivo: identifiquei que este numero esta enviando mensagens automaticas de outro sistema (ex.: pesquisa/logistica), e este canal ${channelLabel} e exclusivo para atendimento de clientes.`,
+    "",
+    "Se voce for uma pessoa e quiser retomar, envie: QUERO AGENDAR.",
+  ].join("\n");
 }
 
 function listHumanAlertPhones() {
@@ -2183,6 +4507,304 @@ function detectConfirmationIntent(message) {
   return "none";
 }
 
+function historyHasRecentBookingConfirmationPrompt(history = []) {
+  if (!Array.isArray(history) || !history.length) {
+    return false;
+  }
+
+  const recent = history.slice(-8);
+  for (let index = recent.length - 1; index >= 0; index -= 1) {
+    const item = recent[index];
+    const role = toNonEmptyString(item?.role).toLowerCase();
+    if (role !== "assistant") {
+      continue;
+    }
+
+    const content = normalizeForMatch(item?.content || item?.text || "");
+    if (!content) {
+      continue;
+    }
+
+    if (
+      /\b(confirma|confirmar|podemos confirmar|posso confirmar|responda sim|responda "sim"|se estiver certo responda)\b/.test(
+        content,
+      ) &&
+      /\b(agendamento|agendar|servico|horario|data)\b/.test(content)
+    ) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+function textLooksLikeBookingConfirmationRequest(text = "") {
+  const normalized = normalizeForMatch(text);
+  if (!normalized) {
+    return false;
+  }
+  return (
+    /\b(podemos confirmar|posso confirmar|confirma estes|confirma este|se estiver certo responda|responda sim)\b/.test(
+      normalized,
+    ) &&
+    /\b(agendamento|agendar|servic|horario|data)\b/.test(normalized)
+  );
+}
+
+function extractIsoDateFromText(text, fallbackIsoDate = "") {
+  const raw = toNonEmptyString(text);
+  if (!raw) {
+    return "";
+  }
+
+  const isoMatch = raw.match(/\b(20\d{2})-(\d{2})-(\d{2})\b/);
+  if (isoMatch) {
+    return `${isoMatch[1]}-${isoMatch[2]}-${isoMatch[3]}`;
+  }
+
+  const brMatch = raw.match(/\b(\d{1,2})[\/\-](\d{1,2})(?:[\/\-](\d{2,4}))?\b/);
+  if (!brMatch) {
+    return "";
+  }
+
+  const day = Number(brMatch[1]);
+  const month = Number(brMatch[2]);
+  let year = Number(brMatch[3] || "");
+
+  if (!Number.isFinite(year) || !year) {
+    const fallbackYear = Number(toNonEmptyString(fallbackIsoDate).slice(0, 4));
+    year = Number.isFinite(fallbackYear) && fallbackYear > 0
+      ? fallbackYear
+      : Number(getSaoPauloDateContext().isoToday.slice(0, 4));
+  } else if (year < 100) {
+    year += 2000;
+  }
+
+  if (!Number.isFinite(day) || !Number.isFinite(month) || day < 1 || day > 31 || month < 1 || month > 12) {
+    return "";
+  }
+
+  return `${String(year).padStart(4, "0")}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+}
+
+function normalizeRecoveredProfessionalName(value) {
+  return professionalDisplayName(
+    toNonEmptyString(value)
+      .replace(/^[\-\u2022\*]+/, "")
+      .replace(/\s+/g, " ")
+      .trim(),
+  );
+}
+
+function normalizeRecoveredServiceName(value) {
+  return toNonEmptyString(value)
+    .replace(/^[\-\u2022\*]+/, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function parseIsoDateFromFlexibleToken(token = "", fallbackIsoDate = "") {
+  const raw = toNonEmptyString(token);
+  if (!raw) {
+    return "";
+  }
+
+  const directIso = extractIsoDateFromText(raw, fallbackIsoDate);
+  if (directIso) {
+    return directIso;
+  }
+
+  const normalized = normalizeForMatch(raw);
+  const dayOnlyMatch = normalized.match(/\bdia\s*(\d{1,2})\b/);
+  if (!dayOnlyMatch) {
+    return "";
+  }
+
+  const day = Number(dayOnlyMatch[1]);
+  if (!Number.isFinite(day) || day < 1 || day > 31) {
+    return "";
+  }
+
+  const baseIso = /^\d{4}-\d{2}-\d{2}$/.test(toNonEmptyString(fallbackIsoDate))
+    ? toNonEmptyString(fallbackIsoDate)
+    : getSaoPauloDateContext().isoToday;
+  const baseYear = Number(baseIso.slice(0, 4));
+  const baseMonth = Number(baseIso.slice(5, 7));
+  if (!Number.isFinite(baseYear) || !Number.isFinite(baseMonth) || baseMonth < 1 || baseMonth > 12) {
+    return "";
+  }
+
+  return `${String(baseYear).padStart(4, "0")}-${String(baseMonth).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+}
+
+function extractRecoveredServiceAndDate(serviceLabel = "", fallbackIsoDate = "") {
+  const rawService = normalizeRecoveredServiceName(serviceLabel);
+  if (!rawService) {
+    return {
+      service: "",
+      date: toNonEmptyString(fallbackIsoDate),
+    };
+  }
+
+  let service = rawService.replace(/^servi[cç]o\b[:\-\s]*/i, "").trim();
+  let resolvedDate = "";
+
+  const datePattern = /\b(?:dia\s*)?\d{1,2}(?:[\/\-]\d{1,2}(?:[\/\-]\d{2,4})?)?\b/i;
+  const dateMatch = service.match(datePattern);
+  if (dateMatch?.[0]) {
+    resolvedDate = parseIsoDateFromFlexibleToken(dateMatch[0], fallbackIsoDate);
+    service = service.replace(dateMatch[0], " ");
+  }
+
+  service = service
+    .replace(/\b(?:dia|data|horario|hora)\b/gi, " ")
+    .replace(/[,:;]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  if (!service) {
+    service = rawService;
+  }
+
+  return {
+    service,
+    date: resolvedDate || toNonEmptyString(fallbackIsoDate),
+  };
+}
+
+function looksLikeBookingServiceLabel(value = "") {
+  const normalized = normalizeForMatch(value);
+  if (!normalized) {
+    return false;
+  }
+  return /\b(escova|corte|colora|tonaliz|reflex|manicure|pedicure|depil|hidrat|reconstr|maqui|penteado|sobrancel|unha|mao|pe)\b/.test(
+    normalized,
+  );
+}
+
+function recoverBookingDraftFromHistory(history = [], fallbackIsoDate = "") {
+  if (!Array.isArray(history) || !history.length) {
+    return { items: [], source: "" };
+  }
+
+  const recent = history.slice(-12);
+  for (let index = recent.length - 1; index >= 0; index -= 1) {
+    const item = recent[index];
+    const content = toNonEmptyString(item?.content || item?.text || "");
+    if (!content) {
+      continue;
+    }
+
+    const lines = content
+      .replace(/\r/g, "")
+      .split("\n")
+      .map((line) => line.trim())
+      .filter(Boolean);
+    if (!lines.length) {
+      continue;
+    }
+
+    const resolvedDate = extractIsoDateFromText(content, fallbackIsoDate) || toNonEmptyString(fallbackIsoDate);
+    if (!resolvedDate) {
+      continue;
+    }
+
+    const recovered = [];
+    for (const line of lines) {
+      const normalizedLine = normalizeForMatch(line).replace(/\*/g, " ").replace(/\s+/g, " ").trim();
+      if (!normalizedLine.includes(" com ") || !/(?:\bas|\ba|\?s)\s+\d{1,2}(?::\d{2}|h\d{0,2})?\b/.test(normalizedLine)) {
+        continue;
+      }
+
+      const serviceMatch = normalizedLine.match(
+        /^(.+?)\s+com\s+(?:a|o)?\s*([a-z][a-z\s.'-]{1,50})(?:\s+em\s+\d{1,2}[\/\-]\d{1,2}(?:[\/\-]\d{2,4})?)?\s+(?:\bas|\ba|\?s)\s*(\d{1,2})(?::|h)?(\d{2})?/i,
+      );
+      if (!serviceMatch) {
+        continue;
+      }
+
+      const recoveredService = extractRecoveredServiceAndDate(serviceMatch[1], resolvedDate);
+      const rawService = normalizeRecoveredServiceName(recoveredService.service);
+      const itemDate = toNonEmptyString(recoveredService.date) || resolvedDate;
+      const rawProfessional = normalizeRecoveredProfessionalName(serviceMatch[2]);
+      const hour = Number(serviceMatch[3]);
+      const minute = Number(serviceMatch[4] || "0");
+      const parsedTime = normalizeTimeValue(
+        `${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}`,
+      );
+
+      if (!rawService || !looksLikeBookingServiceLabel(rawService) || !rawProfessional || !parsedTime || !itemDate) {
+        continue;
+      }
+
+      recovered.push({
+        service: rawService,
+        date: itemDate,
+        time: parsedTime,
+        professionalName: rawProfessional,
+      });
+    }
+
+    if (!recovered.length) {
+      const merged = normalizeForMatch(content)
+        .replace(/\*/g, " ")
+        .replace(/\s+/g, " ")
+        .trim();
+      const globalPattern = /([a-z][a-z0-9\s\/-]{2,40}?)\s+com\s+(?:a|o)?\s*([a-z][a-z\s.'-]{1,50})\s+(?:\bas|\ba|\?s)\s*(\d{1,2})(?::|h)?(\d{2})?/gi;
+      for (const match of merged.matchAll(globalPattern)) {
+        const recoveredService = extractRecoveredServiceAndDate(match[1], resolvedDate);
+        const rawService = normalizeRecoveredServiceName(recoveredService.service);
+        const itemDate = toNonEmptyString(recoveredService.date) || resolvedDate;
+        const rawProfessional = normalizeRecoveredProfessionalName(match[2]);
+        const hour = Number(match[3]);
+        const minute = Number(match[4] || "0");
+        const parsedTime = normalizeTimeValue(
+          `${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}`,
+        );
+        if (!rawService || !looksLikeBookingServiceLabel(rawService) || !rawProfessional || !parsedTime || !itemDate) {
+          continue;
+        }
+        recovered.push({
+          service: rawService,
+          date: itemDate,
+          time: parsedTime,
+          professionalName: rawProfessional,
+        });
+      }
+    }
+
+    if (recovered.length) {
+      const unique = new Map();
+      for (const entry of recovered) {
+        unique.set(
+          `${normalizeForMatch(entry.service)}|${normalizeForMatch(entry.professionalName)}|${entry.date}|${entry.time}`,
+          entry,
+        );
+      }
+      return { items: [...unique.values()], source: content };
+    }
+  }
+
+  return { items: [], source: "" };
+}
+
+function isBookingStatusInquiry(message) {
+  const normalized = normalizeForMatch(message);
+  if (!normalized) {
+    return false;
+  }
+
+  return [
+    "conseguiu",
+    "deu certo",
+    "confirmou",
+    "ja confirmou",
+    "ja agendou",
+    "status",
+    "e ai",
+  ].some((token) => normalized.includes(token));
+}
+
 function formatBookingItemSummary(item) {
   const date = toNonEmptyString(item?.date);
   const brDate = isoToBrDate(date) || date;
@@ -2217,6 +4839,98 @@ function normalizeBookingDate(value, fallbackDate = "") {
   return toNonEmptyString(fallbackDate);
 }
 
+function shouldEnforceMaxDaysAheadBookingLimit({ tenantCode = "", establishmentId = null } = {}) {
+  const normalizedTenant = normalizeTenantCode(tenantCode);
+  if (normalizedTenant) {
+    const crmSettings = getTenantCrmSettingsByCode(normalizedTenant);
+    const configured = Number(crmSettings?.config?.bookingMaxDaysAhead);
+    if (Number.isFinite(configured) && configured > 0) {
+      return true;
+    }
+  }
+  if (normalizedTenant && BOOKING_MAX_DAYS_AHEAD_TENANTS.has(normalizedTenant)) {
+    return true;
+  }
+
+  const parsedEstablishmentId = Number(establishmentId);
+  if (Number.isFinite(parsedEstablishmentId) && parsedEstablishmentId > 0) {
+    if (BOOKING_MAX_DAYS_AHEAD_ESTABLISHMENTS.has(parsedEstablishmentId)) {
+      return true;
+    }
+    const tenant = getActiveTenantByEstablishmentId(parsedEstablishmentId);
+    const configured = Number(getTenantCrmSettingsByCode(tenant?.code || "")?.config?.bookingMaxDaysAhead);
+    if (Number.isFinite(configured) && configured > 0) {
+      return true;
+    }
+    if (BOOKING_MAX_DAYS_AHEAD_TENANTS.has(normalizeTenantCode(tenant?.code || ""))) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+function resolveBookingMaxDaysAhead({ tenantCode = "", establishmentId = null } = {}) {
+  const normalizedTenant = normalizeTenantCode(tenantCode);
+  if (normalizedTenant) {
+    const crmSettings = getTenantCrmSettingsByCode(normalizedTenant);
+    const configured = Number(crmSettings?.config?.bookingMaxDaysAhead);
+    if (Number.isFinite(configured) && configured > 0) {
+      return Math.min(365, Math.max(1, Math.trunc(configured)));
+    }
+  }
+
+  const parsedEstablishmentId = Number(establishmentId);
+  if (Number.isFinite(parsedEstablishmentId) && parsedEstablishmentId > 0) {
+    const tenant = getActiveTenantByEstablishmentId(parsedEstablishmentId);
+    if (tenant?.code) {
+      return resolveBookingMaxDaysAhead({ tenantCode: tenant.code });
+    }
+  }
+
+  return BOOKING_MAX_DAYS_AHEAD;
+}
+
+function assertBookingWithinMaxDaysAhead({
+  date,
+  tenantCode = "",
+  establishmentId = null,
+  maxDaysAhead = null,
+} = {}) {
+  const normalizedDate = normalizeBookingDate(date);
+  if (!normalizedDate) {
+    return;
+  }
+  if (!shouldEnforceMaxDaysAheadBookingLimit({ tenantCode, establishmentId })) {
+    return;
+  }
+
+  const todayIso = getSaoPauloDateContext().isoToday;
+  const effectiveMaxDaysAhead = Number.isFinite(Number(maxDaysAhead)) && Number(maxDaysAhead) > 0
+    ? Number(maxDaysAhead)
+    : resolveBookingMaxDaysAhead({ tenantCode, establishmentId });
+  const maxAllowedIso = addDaysToIsoDate(todayIso, effectiveMaxDaysAhead);
+  if (!maxAllowedIso) {
+    return;
+  }
+
+  if (normalizedDate > maxAllowedIso) {
+    const maxAllowedBr = isoToBrDate(maxAllowedIso) || maxAllowedIso;
+    const error = new Error(
+      `Para este atendimento, consigo agendar somente ate ${maxAllowedBr} (${maxDaysAhead} dias a partir de hoje).`,
+    );
+    error.status = 422;
+    error.details = {
+      code: "booking_window_exceeded",
+      maxDaysAhead,
+      requestedDate: normalizedDate,
+      todayIso,
+      maxAllowedDate: maxAllowedIso,
+    };
+    throw error;
+  }
+}
+
 function generateRequestReference() {
   const now = new Date();
   const compact = now.toISOString().replace(/\D/g, "").slice(2, 14);
@@ -2238,6 +4952,7 @@ function buildAppointmentObservation({ requestReference = "", confirmationCode =
 }
 
 function recordAppointmentAudit({
+  tenantCode = "",
   eventType,
   status = "success",
   establishmentId = null,
@@ -2257,14 +4972,15 @@ function recordAppointmentAudit({
     db.prepare(
       `
         INSERT INTO appointment_audit (
-          event_type, status, establishment_id, appointment_id, confirmation_code,
+          tenant_code, event_type, status, establishment_id, appointment_id, confirmation_code,
           client_phone, client_name, service_name, professional_name,
           appointment_date, appointment_time, request_payload, response_payload,
           error_message, created_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `,
     ).run(
+      normalizeTenantScopeCode(tenantCode),
       String(eventType || "unknown"),
       String(status || "success"),
       establishmentId !== undefined && establishmentId !== null ? Number(establishmentId) : null,
@@ -2650,6 +5366,131 @@ function uniqueProfessionalDisplayNames(names) {
   return result;
 }
 
+function joinHumanNames(names = []) {
+  const cleaned = Array.isArray(names)
+    ? names.map((name) => toNonEmptyString(name)).filter(Boolean)
+    : [];
+  if (!cleaned.length) {
+    return "";
+  }
+  if (cleaned.length === 1) {
+    return cleaned[0];
+  }
+  if (cleaned.length === 2) {
+    return `${cleaned[0]} e ${cleaned[1]}`;
+  }
+  return `${cleaned.slice(0, -1).join(", ")} e ${cleaned[cleaned.length - 1]}`;
+}
+
+function resolveTenantDisplayName(knowledge, tenantCode = "") {
+  const tenant = getTenantByCode(tenantCode);
+  const fromTenant = toNonEmptyString(tenant?.name);
+  if (fromTenant) {
+    return fromTenant;
+  }
+  return firstNonEmpty([
+    knowledge?.identity?.brandName,
+    knowledge?.business?.name,
+    knowledge?.identity?.name,
+  ]);
+}
+
+function buildRestrictedProfessionalMessage({ allowedProfessionalNames = [] } = {}) {
+  const displayNames = uniqueProfessionalDisplayNames(allowedProfessionalNames);
+  if (!displayNames.length) {
+    return "No momento, consigo ajudar apenas com agenda dos profissionais habilitados desta unidade. Sobre outros profissionais, nao tenho informacao para confirmar por este canal.";
+  }
+  return `No momento, consigo ajudar apenas com agenda de ${joinHumanNames(displayNames)}. Sobre outros profissionais, nao tenho informacao para confirmar por este canal.`;
+}
+
+function buildBookingSingleMessageRetryHint({ allowedProfessionalNames = [] } = {}) {
+  const displayNames = uniqueProfessionalDisplayNames(allowedProfessionalNames);
+  const sampleDate = getSaoPauloDateContext().brTomorrow || "14/04/2026";
+
+  if (displayNames.length >= 2) {
+    return `Perfeito. Para evitar erro no fechamento, preciso que voce reenvie em uma unica mensagem: servico, data, horario e profissional. Exemplo: Escova com ${displayNames[0]} em ${sampleDate} as 13:00 e Manicure com ${displayNames[1]} as 13:00.`;
+  }
+  if (displayNames.length === 1) {
+    return `Perfeito. Para evitar erro no fechamento, preciso que voce reenvie em uma unica mensagem: servico, data, horario e profissional. Exemplo: Escova com ${displayNames[0]} em ${sampleDate} as 13:00.`;
+  }
+  return "Perfeito. Para evitar erro no fechamento, preciso que voce reenvie em uma unica mensagem: servico, data, horario e profissional. Exemplo: Escova com [Profissional] em 14/04 as 13:00.";
+}
+
+function normalizeProfessionalConstraintName(value) {
+  return normalizeForMatch(toNonEmptyString(value));
+}
+
+function extractAllowedProfessionalNames(knowledge) {
+  if (!knowledge || typeof knowledge !== "object" || Array.isArray(knowledge)) {
+    return [];
+  }
+
+  const candidateArrays = [
+    knowledge?.allowedProfessionals,
+    knowledge?.operations?.allowedProfessionals,
+    knowledge?.business?.allowedProfessionals,
+    knowledge?.rules?.allowedProfessionals,
+  ];
+
+  const flat = candidateArrays
+    .flatMap((value) => (Array.isArray(value) ? value : []))
+    .map((item) => toNonEmptyString(item))
+    .filter(Boolean);
+
+  return [...new Set(flat)];
+}
+
+function professionalMatchesAllowedList(name, allowedNames = []) {
+  if (!Array.isArray(allowedNames) || !allowedNames.length) {
+    return true;
+  }
+
+  const normalizedCandidate = normalizeProfessionalConstraintName(name);
+  const candidateFirstName = clientFirstName(name);
+  const normalizedCandidateFirstName = normalizeProfessionalConstraintName(candidateFirstName);
+  if (!normalizedCandidate && !normalizedCandidateFirstName) {
+    return false;
+  }
+
+  return allowedNames.some((allowed) => {
+    const normalizedAllowed = normalizeProfessionalConstraintName(allowed);
+    const allowedFirstName = clientFirstName(allowed);
+    const normalizedAllowedFirstName = normalizeProfessionalConstraintName(allowedFirstName);
+
+    if (!normalizedAllowed && !normalizedAllowedFirstName) {
+      return false;
+    }
+
+    return (
+      (normalizedAllowed && normalizedCandidate.includes(normalizedAllowed)) ||
+      (normalizedAllowed && normalizedAllowed.includes(normalizedCandidate)) ||
+      (normalizedAllowedFirstName && normalizedCandidateFirstName === normalizedAllowedFirstName) ||
+      (normalizedAllowedFirstName && normalizedCandidate === normalizedAllowedFirstName)
+    );
+  });
+}
+
+function filterProfessionalsByAllowedList(professionals = [], allowedNames = []) {
+  if (!Array.isArray(professionals)) {
+    return [];
+  }
+  if (!Array.isArray(allowedNames) || !allowedNames.length) {
+    return professionals;
+  }
+  return professionals.filter((item) =>
+    professionalMatchesAllowedList(item?.name || professionalNameFrom(item), allowedNames));
+}
+
+function filterProfessionalNamesByAllowedList(names = [], allowedNames = []) {
+  if (!Array.isArray(names)) {
+    return [];
+  }
+  if (!Array.isArray(allowedNames) || !allowedNames.length) {
+    return names;
+  }
+  return names.filter((name) => professionalMatchesAllowedList(name, allowedNames));
+}
+
 function loadSalonKnowledge() {
   try {
     const raw = readFileSync(KNOWLEDGE_FILE_PATH, "utf-8");
@@ -2863,10 +5704,21 @@ function applyMarketingActionBeforeClosing({
     };
   }
 
+  const actionSignature = [
+    toNonEmptyString(action.id),
+    toNonEmptyString(action.message),
+    toNonEmptyString(action.mediaUrl),
+    toNonEmptyString(action.mediaCaption),
+    toNonEmptyString(action.endDate),
+  ].join("|");
+
   if (sessionKey) {
     cleanupMarketingActionSessions();
     const sentState = marketingActionSessions.get(sessionKey);
-    if (sentState?.actionId === action.id) {
+    if (
+      sentState?.actionId === action.id
+      && toNonEmptyString(sentState?.actionSignature || "") === actionSignature
+    ) {
       return {
         text: replyText,
         marketingMedia: null,
@@ -2875,6 +5727,7 @@ function applyMarketingActionBeforeClosing({
 
     marketingActionSessions.set(sessionKey, {
       actionId: action.id,
+      actionSignature,
       sentAt: Date.now(),
     });
   }
@@ -2898,13 +5751,14 @@ function applyMarketingActionBeforeClosing({
   };
 }
 
-function formatKnowledgeForPrompt(knowledge) {
+function formatKnowledgeForPrompt(knowledge, tenantCode = "") {
   const identity = knowledge?.identity || {};
   const policies = knowledge?.policies || {};
   const business = knowledge?.business || {};
   const services = Array.isArray(knowledge?.services) ? knowledge.services : [];
   const faq = Array.isArray(knowledge?.faq) ? knowledge.faq : [];
   const marketing = normalizeMarketingConfig(knowledge);
+  const toneGuide = extractKnowledgeToneGuide(knowledge);
 
   const servicesText = services.length
     ? services
@@ -2935,6 +5789,8 @@ function formatKnowledgeForPrompt(knowledge) {
   return [
     "Base de conhecimento do salao (fonte oficial):",
     `- Nome comercial: ${identity?.brandName || "Nao informado"}`,
+    `- Nome da concierge digital: ${resolveConciergeDisplayName(knowledge, tenantCode)}`,
+    `- Tom das conversas: ${toneGuide}`,
     `- Endereco: ${business?.address || "Nao informado"}`,
     `- Horario de funcionamento: ${business?.openingHours || "Nao informado"}`,
     `- Telefone: ${business?.phone || "Nao informado"}`,
@@ -2957,11 +5813,66 @@ function formatKnowledgeForPrompt(knowledge) {
   ].join("\n");
 }
 
+function resolveConciergeDisplayName(knowledge, tenantCode = "") {
+  const explicitName = toNonEmptyString(knowledge?.identity?.assistantName);
+  if (explicitName) {
+    return explicitName;
+  }
+
+  const normalizedTenant = normalizeTenantCode(tenantCode);
+  if (normalizedTenant === "essencia") {
+    return "Rebeka";
+  }
+
+  return "Concierge digital";
+}
+
+function splitKnowledgeToneValues(value) {
+  if (Array.isArray(value)) {
+    return value
+      .map((item) => toNonEmptyString(item))
+      .filter(Boolean);
+  }
+  const text = toNonEmptyString(value);
+  if (!text) {
+    return [];
+  }
+  return text
+    .split(",")
+    .map((item) => toNonEmptyString(item))
+    .filter(Boolean);
+}
+
+function extractKnowledgeToneGuide(knowledge) {
+  const identity = knowledge?.identity && typeof knowledge.identity === "object" && !Array.isArray(knowledge.identity)
+    ? knowledge.identity
+    : {};
+
+  const rawValues = [
+    ...splitKnowledgeToneValues(identity?.toneOptions),
+    ...splitKnowledgeToneValues(identity?.toneCustom),
+    ...splitKnowledgeToneValues(identity?.toneGuide),
+  ];
+
+  const seen = new Set();
+  const uniqueValues = [];
+  rawValues.forEach((item) => {
+    const key = toNonEmptyString(item).normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase();
+    if (!key || seen.has(key)) {
+      return;
+    }
+    seen.add(key);
+    uniqueValues.push(item);
+  });
+
+  return uniqueValues.length ? uniqueValues.join(", ") : "Nao informado";
+}
+
 const SYSTEM_INSTRUCTION = `Voce e a IA.AGENDAMENTO, uma concierge digital premium para atendimento e agendamento.
-Seu nome e Jacques.
+Use o nome da concierge digital definido na Base de conhecimento; se nao houver, use "Concierge digital".
 
 Diretrizes:
-- Tom sofisticado, acolhedor e objetivo.
+- Siga o tom definido na Base de conhecimento; se nao houver definicao, use tom sofisticado, acolhedor e objetivo.
 - Frases curtas, sem paragrafos longos.
 - Foco em concluir agendamentos com precisao.
 - Ao mencionar profissionais para a cliente, use apenas o primeiro nome.
@@ -3459,7 +6370,7 @@ function messageContainsProfessionalPreferenceHint(message) {
   }
 
   return (
-    /\bcom\s+(a|o)\s+[a-z]{3,}\b/.test(normalized) ||
+    /\bcom\s+(?:a|o)?\s*[a-z]{3,}\b/.test(normalized) ||
     /\bsim[, ]+\s*[a-z]{3,}\b/.test(normalized) ||
     /\b(prefiro|quero|gosto)\s+(da|do|de)?\s*[a-z]{3,}\b/.test(normalized)
   );
@@ -3490,7 +6401,7 @@ function historyHasProfessionalContext(history) {
   });
 }
 
-function buildConversationPrompt(history, message, knowledge, customerContext = null) {
+function buildConversationPrompt(history, message, knowledge, customerContext = null, tenantCode = "") {
   const dateContext = getSaoPauloDateContext();
   const relativeDate = detectRelativeDateReference(message, dateContext);
   const knownClientName = clientFirstName(customerContext?.name);
@@ -3506,7 +6417,8 @@ function buildConversationPrompt(history, message, knowledge, customerContext = 
     "Historico da conversa:",
     transcript || "Sem historico anterior.",
     "",
-    formatKnowledgeForPrompt(knowledge),
+    formatKnowledgeForPrompt(knowledge, tenantCode),
+    `- Tenant em atendimento: ${toNonEmptyString(tenantCode) || "nao informado"}`,
     "",
     "Contexto temporal oficial (usar como verdade):",
     `- Fuso horario: ${dateContext.timeZone}`,
@@ -3538,9 +6450,13 @@ function buildConversationPrompt(history, message, knowledge, customerContext = 
   ].join("\n");
 }
 
-async function trinksRequest(path, { method = "GET", estabelecimentoId, body, query } = {}) {
-  const baseUrl = ensureEnv("TRINKS_API_BASE_URL").replace(/\/$/, "");
-  const apiKey = ensureEnv("TRINKS_API_KEY");
+async function trinksRequest(path, { method = "GET", estabelecimentoId, body, query, tenantCode = "" } = {}) {
+  const runtime = resolveTrinksRuntimeConfig({
+    tenantCode,
+    establishmentId: estabelecimentoId,
+  });
+  const baseUrl = runtime.baseUrl;
+  const apiKey = runtime.apiKey;
 
   const url = new URL(`${baseUrl}${path}`);
   if (query && typeof query === "object") {
@@ -3630,33 +6546,26 @@ async function trinksRequest(path, { method = "GET", estabelecimentoId, body, qu
   throw exhausted;
 }
 
-function resolveEvolutionBaseUrl() {
-  const baseUrl = firstNonEmpty([
-    process.env.EVOLUTION_API_BASE_URL,
-    process.env.EVOLUTION_URL,
-    process.env._EVOLUTION_URL,
-  ]);
-
-  if (!baseUrl) {
-    throw new Error(
-      "Variavel obrigatoria ausente: EVOLUTION_API_BASE_URL (ou EVOLUTION_URL/_EVOLUTION_URL).",
-    );
-  }
-
-  return String(baseUrl).replace(/\/$/, "");
+function resolveEvolutionBaseUrl(options = {}) {
+  return resolveEvolutionRuntimeConfig(options).baseUrl;
 }
 
 function resolveEvolutionTimeoutMs() {
-  const raw = Number(process.env.EVOLUTION_TIMEOUT_MS || 8000);
+  const raw = Number(process.env.EVOLUTION_TIMEOUT_MS || 20000);
   if (!Number.isFinite(raw) || raw < 1000) {
-    return 8000;
+    return 20000;
   }
   return Math.floor(raw);
 }
 
-async function evolutionRequest(path, { method = "POST", body } = {}) {
-  const baseUrl = resolveEvolutionBaseUrl();
-  const apiKey = ensureEnv("EVOLUTION_API_KEY");
+async function evolutionRequest(path, { method = "POST", body, tenantCode = "", instanceName = "" } = {}) {
+  const inferredInstanceName = firstNonEmpty([instanceName, inferEvolutionInstanceFromPath(path)]);
+  const runtime = resolveEvolutionRuntimeConfig({
+    tenantCode,
+    instanceName: inferredInstanceName,
+  });
+  const baseUrl = runtime.baseUrl;
+  const apiKey = runtime.apiKey;
   const timeoutMs = resolveEvolutionTimeoutMs();
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
@@ -3704,7 +6613,7 @@ async function evolutionRequest(path, { method = "POST", body } = {}) {
   return json;
 }
 
-async function evolutionRequestWithFallback(attempts) {
+async function evolutionRequestWithFallback(attempts, context = {}) {
   const errors = [];
 
   for (const attempt of attempts) {
@@ -3712,6 +6621,8 @@ async function evolutionRequestWithFallback(attempts) {
       const payload = await evolutionRequest(attempt.path, {
         method: attempt.method || "POST",
         body: attempt.body,
+        tenantCode: attempt.tenantCode ?? context.tenantCode ?? "",
+        instanceName: attempt.instanceName ?? context.instanceName ?? "",
       });
       return { payload, attempt };
     } catch (error) {
@@ -3770,10 +6681,31 @@ function toQrDataUrl(rawQr) {
   return "";
 }
 
-function resolveEvolutionInstance(preferred) {
+function resolveEvolutionInstance(preferred, options = {}) {
   const fromArg = toNonEmptyString(preferred);
   if (fromArg) {
     return fromArg;
+  }
+
+  const normalizedTenantCode = normalizeTenantScopeCode(options?.tenantCode || "");
+  if (normalizedTenantCode) {
+    const providerConfig = getTenantProviderConfigByCode(normalizedTenantCode, "evolution");
+    const config = providerConfig?.config && typeof providerConfig.config === "object" && !Array.isArray(providerConfig.config)
+      ? providerConfig.config
+      : {};
+    const tenantInstance = firstNonEmpty([
+      readProviderConfigValue(config, [
+        "instance",
+        "instanceName",
+        "evolutionInstance",
+        "credentials.instance",
+        "credentials.instanceName",
+      ]),
+      getTenantIdentifierValueByCode(normalizedTenantCode, "evolution_instance"),
+    ]);
+    if (tenantInstance) {
+      return tenantInstance;
+    }
   }
 
   return toNonEmptyString(process.env.EVOLUTION_INSTANCE);
@@ -3874,7 +6806,7 @@ async function setEvolutionWebhook(instanceName, webhookPayload) {
       method: "POST",
       body: payload,
     },
-  ]);
+  ], { instanceName: instance });
 
   return { payload: response, attempt, request: payload };
 }
@@ -3890,7 +6822,7 @@ async function findEvolutionWebhook(instanceName) {
   const { payload, attempt } = await evolutionRequestWithFallback([
     { path: `/webhook/find/${instance}`, method: "GET" },
     { path: `/webhook/find?instance=${encodeURIComponent(instance)}`, method: "GET" },
-  ]);
+  ], { instanceName: instance });
 
   return { payload, attempt };
 }
@@ -3931,7 +6863,7 @@ async function createEvolutionInstance(instanceName) {
           integration: "WHATSAPP-BAILEYS",
         },
       },
-    ]);
+    ], { instanceName: name });
 
     return { created: true, payload, attempt };
   } catch (error) {
@@ -3979,7 +6911,7 @@ async function fetchEvolutionQr(instanceName) {
     { path: `/instance/qrcode/${instance}`, method: "GET" },
     { path: `/instance/qr/${instance}`, method: "GET" },
     { path: `/instance/connect/${instance}`, method: "POST" },
-  ]);
+  ], { instanceName: instance });
 
   const qrRaw = extractQrValue(payload);
   const qrDataUrl = toQrDataUrl(qrRaw);
@@ -3992,6 +6924,98 @@ async function fetchEvolutionQr(instanceName) {
     qrDataUrl,
     pairingCode,
   };
+}
+
+function normalizeEvolutionConnectionStatus(value) {
+  return toNonEmptyString(value).toLowerCase();
+}
+
+function isEvolutionInstanceConnected(instancePayload) {
+  if (!instancePayload || typeof instancePayload !== "object") {
+    return false;
+  }
+
+  const status = normalizeEvolutionConnectionStatus(
+    firstNonEmpty([
+      instancePayload.connectionStatus,
+      instancePayload.status,
+      instancePayload.state,
+    ]),
+  );
+
+  if (status === "open" || status === "connected" || status === "online") {
+    return true;
+  }
+
+  if (status === "close" || status === "closed" || status === "disconnected") {
+    return false;
+  }
+
+  return false;
+}
+
+async function disconnectEvolutionInstance(instanceName) {
+  const instance = toNonEmptyString(instanceName);
+  if (!instance) {
+    const error = new Error("Nome da instancia nao informado.");
+    error.status = 400;
+    throw error;
+  }
+
+  const attempts = [
+    { path: `/instance/logout/${instance}`, method: "DELETE" },
+    { path: `/instance/logout/${instance}`, method: "POST" },
+    { path: `/instance/disconnect/${instance}`, method: "DELETE" },
+    { path: `/instance/disconnect/${instance}`, method: "POST" },
+    { path: `/instance/close/${instance}`, method: "POST" },
+  ];
+
+  const errors = [];
+  for (const attempt of attempts) {
+    try {
+      const payload = await evolutionRequest(attempt.path, {
+        method: attempt.method,
+        instanceName: instance,
+      });
+      return {
+        payload,
+        attempt,
+      };
+    } catch (error) {
+      const extractTexts = (value) => {
+        if (value == null) return [];
+        if (typeof value === "string") return [value.toLowerCase()];
+        if (Array.isArray(value)) return value.flatMap((item) => extractTexts(item));
+        if (typeof value === "object") return Object.values(value).flatMap((item) => extractTexts(item));
+        return [String(value).toLowerCase()];
+      };
+      const texts = [String(error?.message || "").toLowerCase(), ...extractTexts(error?.details)];
+      const alreadyDisconnected = texts.some((text) => text.includes("not connected") || text.includes("nao conect"));
+      if (alreadyDisconnected) {
+        return {
+          payload: {
+            status: "SUCCESS",
+            alreadyDisconnected: true,
+            message: "Instancia ja estava desconectada.",
+          },
+          attempt,
+        };
+      }
+
+      errors.push({
+        path: attempt.path,
+        method: attempt.method,
+        message: error.message || "Erro ao desconectar instancia.",
+        status: error.status || null,
+        details: error.details || null,
+      });
+    }
+  }
+
+  const finalError = new Error("Nenhum endpoint de desconexao respondeu com sucesso.");
+  finalError.status = 502;
+  finalError.details = errors;
+  throw finalError;
 }
 
 function detectWhatsappMessageType(...candidates) {
@@ -4308,72 +7332,308 @@ function findBestServiceMatch(serviceName, services) {
   return best.service;
 }
 
-async function findServiceByName(estabelecimentoId, serviceName) {
-  const normalizedInput = toNonEmptyString(serviceName);
-  if (!normalizedInput) {
+function isEssenciaTenantScope({ tenantCode = "", establishmentId = null } = {}) {
+  const normalizedTenant = normalizeTenantCode(tenantCode);
+  if (normalizedTenant === "essencia") {
+    return true;
+  }
+
+  const parsedEstablishmentId = Number(establishmentId);
+  if (Number.isFinite(parsedEstablishmentId) && parsedEstablishmentId > 0) {
+    if (parsedEstablishmentId === 62217) {
+      return true;
+    }
+    const tenant = getActiveTenantByEstablishmentId(parsedEstablishmentId);
+    if (normalizeTenantCode(tenant?.code || "") === "essencia") {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+function resolveEssenciaServiceCanonicalName(serviceName = "") {
+  const raw = toNonEmptyString(serviceName);
+  if (!raw) {
+    return "";
+  }
+
+  const normalized = normalizeForMatch(raw)
+    .replace(/[^a-z0-9\s]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!normalized) {
+    return raw;
+  }
+
+  if (/\bmanicure\b/.test(normalized) && !/\bmao\b/.test(normalized)) {
+    return "mao tradicional";
+  }
+  if (/\bpedicure\b/.test(normalized) && !/\bpe\b/.test(normalized)) {
+    return "pe tradicional";
+  }
+
+  return raw;
+}
+
+function resolveServiceLookupCandidates({
+  serviceName = "",
+  tenantCode = "",
+  establishmentId = null,
+} = {}) {
+  const raw = toNonEmptyString(serviceName);
+  if (!raw) {
+    return [];
+  }
+
+  const candidates = [];
+  const seen = new Set();
+  const pushCandidate = (value) => {
+    const cleaned = toNonEmptyString(value);
+    if (!cleaned) {
+      return;
+    }
+    const key = normalizeForMatch(cleaned).replace(/\s+/g, " ").trim();
+    if (!key || seen.has(key)) {
+      return;
+    }
+    seen.add(key);
+    candidates.push(cleaned);
+  };
+
+  if (isEssenciaTenantScope({ tenantCode, establishmentId })) {
+    pushCandidate(resolveEssenciaServiceCanonicalName(raw));
+  }
+  pushCandidate(raw);
+
+  return candidates;
+}
+
+function classifyEssenciaServiceType(item = {}) {
+  const combined = [
+    toNonEmptyString(item?.serviceResolvedName),
+    toNonEmptyString(item?.service),
+    toNonEmptyString(item?.serviceCategory),
+  ]
+    .map((value) => normalizeForMatch(value))
+    .join(" ")
+    .replace(/[^a-z0-9\s]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  if (!combined) {
+    return "other";
+  }
+
+  if (/\bdepil/.test(combined) || /\bcera\b/.test(combined)) {
+    return "depilation";
+  }
+
+  if (
+    /\bmanicure\b/.test(combined) ||
+    /\bpedicure\b/.test(combined) ||
+    /\bmao\b/.test(combined) ||
+    /\bunha\b/.test(combined) ||
+    /\bpe\b/.test(combined)
+  ) {
+    return "manicure";
+  }
+
+  if (
+    /\bescova\b/.test(combined) ||
+    /\bcabelo\b/.test(combined) ||
+    /\bcorte\b/.test(combined) ||
+    /\bcolora/.test(combined) ||
+    /\bmecha/.test(combined) ||
+    /\breflex/.test(combined) ||
+    /\bpentead/.test(combined) ||
+    /\bhidrat/.test(combined) ||
+    /\breconstr/.test(combined)
+  ) {
+    return "hair";
+  }
+
+  return "other";
+}
+
+function validateTenantSimultaneousBookingRules(items = [], { tenantCode = "", establishmentId = null } = {}) {
+  if (!Array.isArray(items) || items.length < 2) {
     return null;
   }
 
-  const directPayload = await trinksRequest("/servicos", {
-    method: "GET",
-    estabelecimentoId,
-    query: {
-      nome: normalizedInput,
-      page: 1,
-      pageSize: 100,
-    },
-  });
-
-  const directItems = extractItems(directPayload);
-  const directMatch = findBestServiceMatch(normalizedInput, directItems);
-  if (directMatch) {
-    return directMatch;
+  if (!isEssenciaTenantScope({ tenantCode, establishmentId })) {
+    return null;
   }
 
-  // Segunda tentativa: busca por termos importantes da frase (ex.: "pedicure").
-  const tokenQueries = [...new Set(tokenizeMeaningfulText(normalizedInput).filter((token) => token.length >= 4))].slice(
-    0,
-    6,
-  );
+  const groupedBySlot = new Map();
+  for (const item of items) {
+    const date = toNonEmptyString(item?.date);
+    const time = normalizeTimeValue(item?.time) || toNonEmptyString(item?.time);
+    if (!date || !time) {
+      continue;
+    }
+    const key = `${date}|${time}`;
+    if (!groupedBySlot.has(key)) {
+      groupedBySlot.set(key, []);
+    }
+    groupedBySlot.get(key).push(item);
+  }
 
-  for (const token of tokenQueries) {
-    const tokenPayload = await trinksRequest("/servicos", {
+  for (const [slotKey, group] of groupedBySlot.entries()) {
+    if (group.length < 2) {
+      continue;
+    }
+
+    const classified = group.map((item) => ({
+      item,
+      kind: classifyEssenciaServiceType(item),
+    }));
+    const hasDepilation = classified.some((entry) => entry.kind === "depilation");
+    const hasHair = classified.some((entry) => entry.kind === "hair");
+    const hasManicure = classified.some((entry) => entry.kind === "manicure");
+
+    if (hasDepilation && (hasHair || hasManicure)) {
+      const [date, time] = slotKey.split("|");
+      return {
+        status: "invalid_simultaneous_combination",
+        message:
+          "No Essencia, no mesmo horario permitimos cabelo junto com manicure. Combinacoes com depilacao devem ser em outro horario.",
+        details: {
+          date,
+          time,
+          services: group.map((item) => ({
+            service: toNonEmptyString(item?.serviceResolvedName || item?.service),
+            professionalName: professionalDisplayName(item?.professionalName || ""),
+          })),
+        },
+      };
+    }
+  }
+
+  return null;
+}
+
+function buildServiceFallbackAliases(serviceName = "") {
+  const normalized = normalizeForMatch(serviceName)
+    .replace(/[^a-z0-9\s]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!normalized) {
+    return [];
+  }
+
+  const aliases = [];
+
+  if (/\bmanicure\b/.test(normalized) || /\besmalt/.test(normalized)) {
+    aliases.push("mao tradicional", "mao");
+  }
+
+  if (/\bpedicure\b/.test(normalized)) {
+    aliases.push("pe tradicional", "pe");
+  }
+
+  if (/\bdepilacao\b/.test(normalized) && /\bintima\b/.test(normalized)) {
+    aliases.push("depilacao virilha");
+  }
+
+  const seen = new Set();
+  const output = [];
+  for (const alias of aliases) {
+    const cleaned = toNonEmptyString(alias);
+    if (!cleaned) {
+      continue;
+    }
+    const key = normalizeForMatch(cleaned);
+    if (!key || seen.has(key) || key === normalized) {
+      continue;
+    }
+    seen.add(key);
+    output.push(cleaned);
+  }
+  return output;
+}
+
+async function findServiceByName(estabelecimentoId, serviceName) {
+  const normalizedInput = toNonEmptyString(serviceName);
+  const lookupCandidates = resolveServiceLookupCandidates({
+    serviceName: normalizedInput,
+    establishmentId: estabelecimentoId,
+  });
+  if (!lookupCandidates.length) {
+    return null;
+  }
+
+  const tryLookup = async (targetInput) => {
+    const directPayload = await trinksRequest("/servicos", {
       method: "GET",
       estabelecimentoId,
       query: {
-        nome: token,
+        nome: targetInput,
         page: 1,
         pageSize: 100,
       },
     });
 
-    const tokenItems = extractItems(tokenPayload);
-    const tokenMatch = findBestServiceMatch(normalizedInput, tokenItems);
-    if (tokenMatch) {
-      return tokenMatch;
+    const directItems = extractItems(directPayload);
+    const directMatch = findBestServiceMatch(targetInput, directItems);
+    if (directMatch) {
+      return directMatch;
+    }
+
+    // Segunda tentativa: busca por termos importantes da frase (ex.: "pedicure").
+    const tokenQueries = [...new Set(tokenizeMeaningfulText(targetInput).filter((token) => token.length >= 4))].slice(
+      0,
+      6,
+    );
+
+    for (const token of tokenQueries) {
+      const tokenPayload = await trinksRequest("/servicos", {
+        method: "GET",
+        estabelecimentoId,
+        query: {
+          nome: token,
+          page: 1,
+          pageSize: 100,
+        },
+      });
+
+      const tokenItems = extractItems(tokenPayload);
+      const tokenMatch = findBestServiceMatch(targetInput, tokenItems);
+      if (tokenMatch) {
+        return tokenMatch;
+      }
+    }
+
+    // Fallback: varre algumas paginas para cobrir nomes com acento/variacoes.
+    const fallbackItems = [];
+    const maxPages = 6;
+    for (let page = 1; page <= maxPages; page += 1) {
+      const payload = await trinksRequest("/servicos", {
+        method: "GET",
+        estabelecimentoId,
+        query: {
+          page,
+          pageSize: 100,
+        },
+      });
+      const items = extractItems(payload);
+      fallbackItems.push(...items);
+      if (items.length < 100) {
+        break;
+      }
+    }
+
+    return findBestServiceMatch(targetInput, fallbackItems);
+  };
+
+  for (const candidate of lookupCandidates) {
+    const match = await tryLookup(candidate);
+    if (match) {
+      return match;
     }
   }
 
-  // Fallback: varre algumas paginas para cobrir nomes com acento/variacoes.
-  const fallbackItems = [];
-  const maxPages = 6;
-  for (let page = 1; page <= maxPages; page += 1) {
-    const payload = await trinksRequest("/servicos", {
-      method: "GET",
-      estabelecimentoId,
-      query: {
-        page,
-        pageSize: 100,
-      },
-    });
-    const items = extractItems(payload);
-    fallbackItems.push(...items);
-    if (items.length < 100) {
-      break;
-    }
-  }
-
-  return findBestServiceMatch(normalizedInput, fallbackItems);
+  return null;
 }
 
 function collectProfessionalsFromPayload(payload) {
@@ -4558,7 +7818,7 @@ function extractPreferredTimeFromMessage(message) {
   }
 
   const patterns = [
-    /(?:as|a|Ã s)\s*(\d{1,2})(?::(\d{2}))?/i,
+    /(?:\bas|\bÃ s)\s*(\d{1,2})(?::(\d{2}))?(?!\/)/i,
     /\b(\d{1,2})h(?:\s*(\d{2}))?\b/i,
     /\b(\d{1,2}):(\d{2})\b/,
   ];
@@ -4942,9 +8202,14 @@ async function getAvailability(
   establishmentId,
   service,
   date,
-  { professionalName = "", preferredTime = "", strictProfessional = false } = {},
+  {
+    professionalName = "",
+    preferredTime = "",
+    strictProfessional = false,
+    allowedProfessionalNames = [],
+  } = {},
 ) {
-  const foundService = await findServiceByName(establishmentId, service);
+  let foundService = await findServiceByName(establishmentId, service);
   if (!foundService) {
     return {
       availableTimes: [],
@@ -4954,21 +8219,68 @@ async function getAvailability(
     };
   }
 
-  const serviceId = Number(serviceIdFrom(foundService));
-  const resolvedServiceName = toNonEmptyString(
+  let serviceId = Number(serviceIdFrom(foundService));
+  let resolvedServiceName = toNonEmptyString(
     foundService?.nome || foundService?.name || foundService?.servicoNome || service,
   ) || toNonEmptyString(service);
-  const duration = Number(
+  let serviceCategory = toNonEmptyString(
+    foundService?.categoria || foundService?.categoriaNome || foundService?.category || "",
+  );
+  let duration = Number(
     foundService?.duracaoEmMinutos || foundService?.duracao || foundService?.duracaoMinutos || 60,
   );
-  const durationMinutes = Number.isFinite(duration) ? duration : 60;
-  const serviceAmount = Number(foundService?.valor || foundService?.preco || 0);
+  let durationMinutes = Number.isFinite(duration) ? duration : 60;
+  let serviceAmount = Number(foundService?.valor || foundService?.preco || 0);
+  let serviceAliasAppliedFrom = "";
 
-  const professionals = await getProfessionals({
+  let professionalsRaw = await getProfessionals({
     establishmentId,
     date,
     serviceId: Number.isFinite(serviceId) ? serviceId : undefined,
   });
+
+  if (!professionalsRaw.length) {
+    const fallbackAliases = buildServiceFallbackAliases(service);
+    for (const alias of fallbackAliases) {
+      const aliasService = await findServiceByName(establishmentId, alias);
+      if (!aliasService) {
+        continue;
+      }
+
+      const aliasServiceId = Number(serviceIdFrom(aliasService));
+      if (!Number.isFinite(aliasServiceId) || aliasServiceId <= 0) {
+        continue;
+      }
+
+      const aliasProfessionalsRaw = await getProfessionals({
+        establishmentId,
+        date,
+        serviceId: aliasServiceId,
+      });
+      if (!aliasProfessionalsRaw.length) {
+        continue;
+      }
+
+      serviceAliasAppliedFrom = resolvedServiceName;
+      foundService = aliasService;
+      serviceId = aliasServiceId;
+      resolvedServiceName = toNonEmptyString(
+        aliasService?.nome || aliasService?.name || aliasService?.servicoNome || alias,
+      ) || alias;
+      serviceCategory = toNonEmptyString(
+        aliasService?.categoria || aliasService?.categoriaNome || aliasService?.category || serviceCategory,
+      );
+      duration = Number(
+        aliasService?.duracaoEmMinutos || aliasService?.duracao || aliasService?.duracaoMinutos || durationMinutes,
+      );
+      durationMinutes = Number.isFinite(duration) ? duration : durationMinutes;
+      serviceAmount = Number(aliasService?.valor || aliasService?.preco || serviceAmount || 0);
+      professionalsRaw = aliasProfessionalsRaw;
+      break;
+    }
+  }
+
+  const professionals = filterProfessionalsByAllowedList(professionalsRaw, allowedProfessionalNames);
 
   const requestedProfessional = toNonEmptyString(professionalName);
   const normalizedPreferredTime = normalizeTimeValue(preferredTime);
@@ -4994,7 +8306,8 @@ async function getAvailability(
         establishmentId,
         date,
       });
-      byProfessionalAllDay = allDayProfessionalsRaw.map((professional) => {
+      const allDayProfessionals = filterProfessionalsByAllowedList(allDayProfessionalsRaw, allowedProfessionalNames);
+      byProfessionalAllDay = allDayProfessionals.map((professional) => {
         const compatibleTimes = uniqueSortedTimes(
           professional.availableTimes.filter((time) =>
             isSlotCompatibleWithIntervals(time, durationMinutes, professional.availableIntervals),
@@ -5161,6 +8474,8 @@ async function getAvailability(
   return {
     serviceId: Number.isFinite(serviceId) ? serviceId : null,
     serviceName: resolvedServiceName,
+    serviceCategory: serviceCategory || null,
+    serviceAliasAppliedFrom: serviceAliasAppliedFrom || null,
     durationMinutes,
     serviceAmount: Number.isFinite(serviceAmount) ? serviceAmount : 0,
     availableTimes: flattenedTimes,
@@ -5188,6 +8503,10 @@ async function getAvailability(
                   ? preferredProfessionalNearestTimes
                   : preferredProfessionalTimes).join(", ")
               }. Caso esses horarios nao sirvam para voce, quer saber a disponibilidade de outros profissionais?`
+            : preferredProfessionalGeneralTimes.length
+              ? `${requestedProfessionalDisplay} tem agenda geral no dia ${isoToBrDate(date) || date} em: ${
+                  preferredProfessionalGeneralTimes.join(", ")
+                }, mas nao encontrei disponibilidade vinculada ao servico ${resolvedServiceName}. Posso verificar o servico correto para ela?`
             : `${requestedProfessionalDisplay} nao tem disponibilidade para este servico no dia ${isoToBrDate(date) || date}. Quer que eu verifique a disponibilidade de outros profissionais?`
           : `Horarios com ${requestedProfessionalDisplay} em ${isoToBrDate(date) || date}.`
         : normalizedPreferredTime
@@ -5253,10 +8572,12 @@ async function upsertAppointmentConfirmationNote({
 
 async function resolveBookingPreviewItem({
   establishmentId,
+  tenantCode = "",
   service,
   date,
   time,
   professionalName,
+  allowedProfessionalNames = [],
 }) {
   const normalizedService = toNonEmptyString(service);
   const normalizedDate = normalizeBookingDate(date);
@@ -5268,6 +8589,11 @@ async function resolveBookingPreviewItem({
     error.status = 400;
     throw error;
   }
+  assertBookingWithinMaxDaysAhead({
+    date: normalizedDate,
+    tenantCode,
+    establishmentId,
+  });
 
   const availability = await getAvailability(
     establishmentId,
@@ -5277,6 +8603,7 @@ async function resolveBookingPreviewItem({
       professionalName: requestedProfessional,
       preferredTime: normalizedTime,
       strictProfessional: true,
+      allowedProfessionalNames,
     },
   );
 
@@ -5338,6 +8665,7 @@ async function resolveBookingPreviewItem({
   return {
     service: normalizedService,
     serviceResolvedName: toNonEmptyString(availability?.serviceName) || normalizedService,
+    serviceCategory: toNonEmptyString(availability?.serviceCategory) || "",
     serviceId: Number.isFinite(Number(availability?.serviceId)) ? Number(availability.serviceId) : null,
     durationMinutes: Number.isFinite(Number(availability?.durationMinutes))
       ? Number(availability.durationMinutes)
@@ -5352,7 +8680,23 @@ async function resolveBookingPreviewItem({
   };
 }
 
-async function executeConfirmedBookings({ establishmentId, clientName, clientPhone, items }) {
+async function executeConfirmedBookings({ establishmentId, tenantCode = "", clientName, clientPhone, items }) {
+  const simultaneousRuleViolation = validateTenantSimultaneousBookingRules(items, {
+    tenantCode,
+    establishmentId,
+  });
+  if (simultaneousRuleViolation) {
+    return {
+      successes: [],
+      failures: (Array.isArray(items) ? items : []).map((item) => ({
+        ...item,
+        message: simultaneousRuleViolation.message,
+        status: 422,
+        requestReference: "",
+      })),
+    };
+  }
+
   const successes = [];
   let failures = [];
   let resolvedClientId = null;
@@ -5374,6 +8718,7 @@ async function executeConfirmedBookings({ establishmentId, clientName, clientPho
     try {
       const created = await createAppointment({
         establishmentId,
+        tenantCode,
         service: item.service,
         serviceResolvedName: item.serviceResolvedName,
         serviceId: item.serviceId,
@@ -5419,6 +8764,7 @@ async function executeConfirmedBookings({ establishmentId, clientName, clientPho
       try {
         const created = await createAppointment({
           establishmentId,
+          tenantCode,
           service: item.service,
           serviceResolvedName: item.serviceResolvedName,
           serviceId: item.serviceId,
@@ -5464,6 +8810,7 @@ async function executeConfirmedBookings({ establishmentId, clientName, clientPho
 
 async function createAppointment({
   establishmentId,
+  tenantCode = "",
   service,
   serviceResolvedName = "",
   serviceId = null,
@@ -5497,6 +8844,11 @@ async function createAppointment({
       error.status = 400;
       throw error;
     }
+    assertBookingWithinMaxDaysAhead({
+      date,
+      tenantCode,
+      establishmentId,
+    });
 
     let selectedServiceId = Number.isFinite(resolvedServiceId) ? resolvedServiceId : null;
     let selectedDurationMinutes = Number.isFinite(resolvedDurationMinutes)
@@ -5669,6 +9021,7 @@ async function createAppointment({
     };
 
     recordAppointmentAudit({
+      tenantCode,
       eventType: "create",
       status: "success",
       establishmentId,
@@ -5702,6 +9055,7 @@ async function createAppointment({
     }
 
     recordAppointmentAudit({
+      tenantCode,
       eventType: "create",
       status: "error",
       establishmentId,
@@ -6223,7 +9577,7 @@ async function resolveAppointmentForCancellationWithoutCode({
   throw error;
 }
 
-async function cancelAppointmentById({ establishmentId, appointmentId, reason, requestPayload }) {
+async function cancelAppointmentById({ establishmentId, tenantCode = "", appointmentId, reason, requestPayload }) {
   const normalizedReason = toNonEmptyString(reason);
   const cancellationNote = normalizedReason
     ? `Cancelado via IA.AGENDAMENTO | Motivo: ${normalizedReason}`
@@ -6336,6 +9690,7 @@ async function cancelAppointmentById({ establishmentId, appointmentId, reason, r
       };
 
       recordAppointmentAudit({
+        tenantCode,
         eventType: "cancel",
         status: "success",
         establishmentId,
@@ -6367,6 +9722,7 @@ async function cancelAppointmentById({ establishmentId, appointmentId, reason, r
   }
 
   recordAppointmentAudit({
+    tenantCode,
     eventType: "cancel",
     status: "error",
     establishmentId,
@@ -6385,9 +9741,14 @@ async function cancelAppointmentById({ establishmentId, appointmentId, reason, r
   throw lastError || new Error("Nao foi possivel cancelar o agendamento.");
 }
 
-async function rescheduleAppointment({ establishmentId, confirmationCode, appointmentId, date, time }) {
+async function rescheduleAppointment({ establishmentId, tenantCode = "", confirmationCode, appointmentId, date, time }) {
   const parsedId = parseAppointmentId({ confirmationCode, appointmentId });
   const requestedTime = normalizeTimeValue(time) || String(time || "");
+  assertBookingWithinMaxDaysAhead({
+    date,
+    tenantCode,
+    establishmentId,
+  });
   const dataHoraInicio = toIsoDateTime(date, requestedTime);
   const snapshot = await getAppointmentSnapshot(establishmentId, parsedId);
   const payload = buildAppointmentUpdatePayload(snapshot, {
@@ -6418,6 +9779,7 @@ async function rescheduleAppointment({ establishmentId, confirmationCode, appoin
       };
 
       recordAppointmentAudit({
+        tenantCode,
         eventType: "reschedule",
         status: "success",
         establishmentId,
@@ -6446,6 +9808,7 @@ async function rescheduleAppointment({ establishmentId, confirmationCode, appoin
 
   const last = errors[errors.length - 1];
   recordAppointmentAudit({
+    tenantCode,
     eventType: "reschedule",
     status: "error",
     establishmentId,
@@ -6472,44 +9835,137 @@ function isLikelyHttpUrl(value) {
   return /^https?:\/\/.+/i.test(raw);
 }
 
+function inferImageMimeTypeFromName(nameOrPath = "") {
+  const ext = String(path.extname(toNonEmptyString(nameOrPath))).toLowerCase();
+  if (ext === ".png") {
+    return "image/png";
+  }
+  if (ext === ".webp") {
+    return "image/webp";
+  }
+  if (ext === ".gif") {
+    return "image/gif";
+  }
+  return "image/jpeg";
+}
+
+function resolveLocalUploadPathFromMediaValue(mediaValue = "") {
+  const raw = toNonEmptyString(mediaValue);
+  if (!raw) {
+    return "";
+  }
+
+  let uploadPath = "";
+  if (raw.startsWith("/uploads/")) {
+    uploadPath = raw;
+  } else if (isLikelyHttpUrl(raw)) {
+    try {
+      const parsed = new URL(raw);
+      if (toNonEmptyString(parsed.pathname).startsWith("/uploads/")) {
+        uploadPath = parsed.pathname;
+      }
+    } catch {
+      uploadPath = "";
+    }
+  }
+
+  if (!uploadPath.startsWith("/uploads/")) {
+    return "";
+  }
+
+  const relative = uploadPath.replace(/^\/uploads\//, "");
+  const safePath = path.resolve(PUBLIC_UPLOADS_DIR_PATH, relative);
+  const uploadsRoot = path.resolve(PUBLIC_UPLOADS_DIR_PATH);
+  if (!safePath.startsWith(`${uploadsRoot}${path.sep}`) && safePath !== uploadsRoot) {
+    return "";
+  }
+
+  return safePath;
+}
+
 async function sendEvolutionImageMessage({ instance, number, mediaUrl, caption = "" }) {
   const normalizedInstance = toNonEmptyString(instance);
   const normalizedNumber = normalizePhone(number);
-  const normalizedMediaUrl = toNonEmptyString(mediaUrl);
-  if (!normalizedInstance || !normalizedNumber || !normalizedMediaUrl) {
+  const mediaSource = toNonEmptyString(mediaUrl);
+  if (!normalizedInstance || !normalizedNumber || !mediaSource) {
     const error = new Error("Dados obrigatorios ausentes para envio de imagem.");
     error.status = 400;
     throw error;
   }
 
-  if (!isLikelyHttpUrl(normalizedMediaUrl)) {
-    const error = new Error("URL da imagem invalida. Use URL http(s) publica.");
-    error.status = 400;
-    throw error;
-  }
-
   const payloadCaption = toNonEmptyString(caption);
-  const attempts = [
-    {
+  const attempts = [];
+
+  if (isLikelyHttpUrl(mediaSource)) {
+    attempts.push({
       path: `/message/sendMedia/${normalizedInstance}`,
       method: "POST",
       body: {
         number: normalizedNumber,
         mediatype: "image",
-        media: normalizedMediaUrl,
+        mimetype: inferImageMimeTypeFromName(mediaSource),
+        media: mediaSource,
+        fileName: path.basename(mediaSource.split("?")[0] || "imagem.jpg"),
         caption: payloadCaption,
       },
-    },
-    {
+    });
+    attempts.push({
       path: `/message/sendImage/${normalizedInstance}`,
       method: "POST",
       body: {
         number: normalizedNumber,
-        image: normalizedMediaUrl,
+        image: mediaSource,
         caption: payloadCaption,
       },
-    },
-  ];
+    });
+  }
+
+  if (mediaSource.startsWith("data:image")) {
+    const parsedDataUrl = parseImageDataUrl(mediaSource);
+    if (parsedDataUrl?.base64) {
+      attempts.push({
+        path: `/message/sendMedia/${normalizedInstance}`,
+        method: "POST",
+        body: {
+          number: normalizedNumber,
+          mediatype: "image",
+          mimetype: toNonEmptyString(parsedDataUrl.mime) || "image/jpeg",
+          media: toNonEmptyString(parsedDataUrl.base64),
+          fileName: `mkt-${Date.now()}.${marketingUploadMimeToExtension(parsedDataUrl.mime) || "jpg"}`,
+          caption: payloadCaption,
+        },
+      });
+    }
+  } else {
+    const localUploadPath = resolveLocalUploadPathFromMediaValue(mediaSource);
+    if (localUploadPath) {
+      try {
+        const buffer = readFileSync(localUploadPath);
+        if (buffer?.length) {
+          attempts.push({
+            path: `/message/sendMedia/${normalizedInstance}`,
+            method: "POST",
+            body: {
+              number: normalizedNumber,
+              mediatype: "image",
+              mimetype: inferImageMimeTypeFromName(localUploadPath),
+              media: buffer.toString("base64"),
+              fileName: path.basename(localUploadPath) || "imagem.jpg",
+              caption: payloadCaption,
+            },
+          });
+        }
+      } catch {
+        // Keep URL attempts only when file cannot be read locally.
+      }
+    }
+  }
+
+  if (!attempts.length) {
+    const error = new Error("Imagem invalida. Use URL http(s), data URL ou arquivo em /uploads.");
+    error.status = 400;
+    throw error;
+  }
 
   const result = await evolutionRequestWithFallback(attempts);
   return {
@@ -6520,6 +9976,7 @@ async function sendEvolutionImageMessage({ instance, number, mediaUrl, caption =
 
 async function cancelAppointment({
   establishmentId,
+  tenantCode = "",
   confirmationCode,
   appointmentId,
   reason,
@@ -6535,6 +9992,7 @@ async function cancelAppointment({
   if (parsedId) {
     return cancelAppointmentById({
       establishmentId,
+      tenantCode,
       appointmentId: parsedId,
       reason,
       requestPayload: {
@@ -6556,6 +10014,7 @@ async function cancelAppointment({
 
   return cancelAppointmentById({
     establishmentId,
+    tenantCode,
     appointmentId: resolved.appointmentId,
     reason,
     requestPayload: {
@@ -6578,21 +10037,55 @@ async function sendChatMessage({
   const knowledge = scopedKnowledge && typeof scopedKnowledge === "object" && !Array.isArray(scopedKnowledge)
     ? scopedKnowledge
     : loadSalonKnowledge();
+  const allowedProfessionalNames = extractAllowedProfessionalNames(knowledge);
+  const shouldApplyProfessionalWhitelist = !isEssenciaTenantScope({ tenantCode, establishmentId });
+  const scopedAllowedProfessionalNames = shouldApplyProfessionalWhitelist ? allowedProfessionalNames : [];
+  const restrictedProfessionalMessage = buildRestrictedProfessionalMessage({
+    allowedProfessionalNames: scopedAllowedProfessionalNames,
+  });
+  const bookingSingleMessageRetryHint = buildBookingSingleMessageRetryHint({
+    allowedProfessionalNames: scopedAllowedProfessionalNames,
+  });
   const dateContext = getSaoPauloDateContext();
   const relativeDate = detectRelativeDateReference(message, dateContext);
   const knownClientName = clientFirstName(customerContext?.name);
   const normalizedMessageForGate = normalizeForMatch(message);
+  const bookingTestSignal = detectTestSignal({
+    message,
+    internalTester: Boolean(customerContext?.internalTester),
+    explicitTestMode: Boolean(customerContext?.testMode || customerContext?.isTest),
+  });
+  const testAuthorization = normalizeTestAuthorization(customerContext?.testAuthorization);
   const inferredPreferredTime = extractPreferredTimeFromMessage(message);
+  const explicitDateFromMessage = extractIsoDateFromText(message, relativeDate?.iso || dateContext.isoToday);
+  const hasDateOrTimeHint =
+    Boolean(relativeDate) ||
+    Boolean(explicitDateFromMessage) ||
+    Boolean(inferredPreferredTime) ||
+    /\b\d{1,2}[\/\-]\d{1,2}(?:[\/\-]\d{2,4})?\b/.test(normalizedMessageForGate) ||
+    /\b\d{1,2}:\d{2}\b/.test(normalizedMessageForGate) ||
+    /\b\d{1,2}\s*h(?:\s*\d{2})?\b/.test(normalizedMessageForGate);
+  const hasLikelyServiceTerm =
+    /\b(escova|corte|colora|tonaliz|reflex|manicure|pedicure|depil|hidrat|reconstr|maqui|penteado|sobrancel|unha|mao|pe)\b/.test(
+      normalizedMessageForGate,
+    );
   const hasBookingTimeIntent = messageSuggestsBookingTimeIntent(message, dateContext);
   const hasSchedulingIntent = messageSuggestsSchedulingIntent(message);
   const hasCancellationIntent = messageSuggestsCancellationIntent(message);
   const hasRescheduleIntent = messageSuggestsRescheduleIntent(message);
+  const confirmationIntent = detectConfirmationIntent(message);
   const hasChangeRequestIntent = hasCancellationIntent || hasRescheduleIntent;
   const asksProfessionals = /(profission|quem atende|cabeleireir)/.test(normalizedMessageForGate);
   const hasProfessionalHintInMessage = messageContainsProfessionalPreferenceHint(message);
   const hasProfessionalHintInHistory = historyHasProfessionalContext(history);
   const pendingSessionKey = resolvePendingSessionKey(establishmentId, customerContext, { tenantCode });
   const pendingConfirmation = getPendingBookingConfirmation(pendingSessionKey);
+  const recoveredDraft = recoverBookingDraftFromHistory(
+    history,
+    explicitDateFromMessage || relativeDate?.iso || dateContext.isoToday,
+  );
+  const sessionClientName = toNonEmptyString(customerContext?.name);
+  const sessionClientPhone = normalizePhone(customerContext?.phone);
   const finalizeChatResponse = (text) =>
     applyMarketingActionBeforeClosing({
       knowledge,
@@ -6600,13 +10093,70 @@ async function sendChatMessage({
       assistantReply: text,
       sessionKey: pendingSessionKey,
     });
+  const capturePendingConfirmationFromText = (candidateText) => {
+    if (pendingConfirmation) {
+      return { captured: false, items: [] };
+    }
+
+    const rawText = toNonEmptyString(candidateText);
+    if (!rawText) {
+      return { captured: false, items: [] };
+    }
+
+    const normalizedText = normalizeForMatch(rawText);
+    const likelyBookingDraft =
+      textLooksLikeBookingConfirmationRequest(rawText) ||
+      /\b(confirmando a disponibilidade final|estou processando o seu agendamento|finalizo a reserva|confirma estes agendamentos|confirma este agendamento)\b/.test(
+        normalizedText,
+      );
+    if (!likelyBookingDraft) {
+      return { captured: false, items: [] };
+    }
+
+    const draft = recoverBookingDraftFromHistory(
+      [{ role: "assistant", content: rawText }],
+      explicitDateFromMessage || relativeDate?.iso || dateContext.isoToday,
+    );
+    if (!draft.items.length) {
+      return { captured: false, items: [] };
+    }
+
+    const sessionKey = resolvePendingSessionKey(establishmentId, customerContext, {
+      tenantCode,
+      clientName: sessionClientName,
+      clientPhone: sessionClientPhone,
+    });
+    if (!sessionKey || !sessionClientName || !sessionClientPhone) {
+      return { captured: false, items: [] };
+    }
+
+    const normalizedItems = draft.items
+      .map((item) => ({
+        service: toNonEmptyString(item?.service),
+        date: normalizeBookingDate(item?.date, explicitDateFromMessage || relativeDate?.iso || dateContext.isoToday),
+        time: normalizeBookingTime(item?.time),
+        professionalName: professionalDisplayName(item?.professionalName || ""),
+      }))
+      .filter((item) => item.service && item.date && item.time && item.professionalName);
+    if (!normalizedItems.length) {
+      return { captured: false, items: [] };
+    }
+
+    setPendingBookingConfirmation(sessionKey, {
+      establishmentId,
+      clientName: sessionClientName,
+      clientPhone: sessionClientPhone,
+      items: normalizedItems,
+    });
+
+    return { captured: true, items: normalizedItems };
+  };
 
   if (pendingConfirmation) {
-    const confirmationIntent = detectConfirmationIntent(message);
-
     if (confirmationIntent === "confirm") {
       const execution = await executeConfirmedBookings({
         establishmentId,
+        tenantCode,
         clientName: pendingConfirmation.clientName,
         clientPhone: pendingConfirmation.clientPhone,
         items: pendingConfirmation.items,
@@ -6661,6 +10211,123 @@ async function sendChatMessage({
 
   }
 
+  if (!pendingConfirmation && isBookingStatusInquiry(message)) {
+    if (recoveredDraft.items.length) {
+      return finalizeChatResponse(
+        "Ainda nao tenho confirmacao final registrada deste agendamento. Se quiser que eu finalize agora, responda \"sim\".",
+      );
+    }
+
+    if (historyHasRecentBookingConfirmationPrompt(history)) {
+      return finalizeChatResponse(
+        "Ainda estou aguardando a confirmacao final para concluir. Se estiver tudo certo, responda \"sim\".",
+      );
+    }
+
+    return finalizeChatResponse(
+      "Ainda nao tenho um agendamento pendente para confirmar nesta conversa. Me envie servico, data, horario e profissional para eu seguir.",
+    );
+  }
+
+  if (
+    confirmationIntent === "confirm" &&
+    !pendingConfirmation
+  ) {
+    if (recoveredDraft.items.length) {
+      const resolvedClientName = toNonEmptyString(customerContext?.name);
+      const resolvedClientPhone = normalizePhone(customerContext?.phone);
+
+      if (!resolvedClientName || !resolvedClientPhone) {
+        return finalizeChatResponse(
+          "Perfeito. Consigo confirmar, mas antes preciso do seu nome e telefone para concluir o agendamento com seguranca.",
+        );
+      }
+
+      const execution = await executeConfirmedBookings({
+        establishmentId,
+        tenantCode,
+        clientName: resolvedClientName,
+        clientPhone: resolvedClientPhone,
+        items: recoveredDraft.items,
+      });
+
+      const successLines = execution.successes.map((item) => {
+        const codeSuffix = item.confirmationCode ? ` | codigo ${item.confirmationCode}` : "";
+        const reqSuffix = item.requestReference ? ` | req ${item.requestReference}` : "";
+        return `- ${formatBookingItemSummary(item)}${codeSuffix}${reqSuffix}`;
+      });
+      const failureLines = execution.failures.map((item) => {
+        const reqSuffix = item.requestReference ? ` | req ${item.requestReference}` : "";
+        return `- ${formatBookingItemSummary(item)}${reqSuffix} | erro: ${item.message}`;
+      });
+
+      if (execution.successes.length && !execution.failures.length) {
+        return finalizeChatResponse(
+          `Perfeito, confirmei o agendamento com sucesso:\n${successLines.join("\n")}`,
+        );
+      }
+
+      if (execution.successes.length && execution.failures.length) {
+        return finalizeChatResponse(
+          [
+            "Consegui confirmar parte dos agendamentos.",
+            "",
+            "Confirmados:",
+            successLines.join("\n"),
+            "",
+            "Nao confirmados:",
+            failureLines.join("\n"),
+          ].join("\n"),
+        );
+      }
+
+      return finalizeChatResponse(
+        `Nao consegui confirmar os agendamentos solicitados:\n${failureLines.join("\n")}`,
+      );
+    }
+
+    if (!historyHasRecentBookingConfirmationPrompt(history)) {
+      return finalizeChatResponse(
+        "Perfeito. Para eu confirmar com seguranca, me envie em uma unica mensagem: servico, data, horario e profissional.",
+      );
+    }
+
+    return finalizeChatResponse(
+      bookingSingleMessageRetryHint,
+    );
+  }
+
+  if (
+    !pendingConfirmation &&
+    hasDateOrTimeHint &&
+    !hasChangeRequestIntent &&
+    confirmationIntent === "none" &&
+    (!hasLikelyServiceTerm || !hasProfessionalHintInMessage)
+  ) {
+    const parts = [];
+    const resolvedDate = explicitDateFromMessage || relativeDate?.iso || "";
+    if (resolvedDate) {
+      parts.push(`data ${isoToBrDate(resolvedDate) || resolvedDate}`);
+    }
+    if (inferredPreferredTime) {
+      parts.push(`horario ${inferredPreferredTime}`);
+    }
+
+    const opener = parts.length
+      ? `Perfeito, anotei ${parts.join(" e ")}.`
+      : "Perfeito, consegui registrar o que voce enviou.";
+
+    if (!hasProfessionalHintInMessage) {
+      return finalizeChatResponse(
+        `${opener} Para eu concluir sem erro, me confirme agora: servico e profissional.`,
+      );
+    }
+
+    return finalizeChatResponse(
+      `${opener} Para eu concluir sem erro, me confirme agora o servico desejado.`,
+    );
+  }
+
   const shouldAskPreferenceFirst =
     hasBookingTimeIntent &&
     !hasProfessionalHintInMessage &&
@@ -6695,11 +10362,12 @@ async function sendChatMessage({
       }
     }
 
-    const professionals = await getProfessionals({
+    const professionalsRaw = await getProfessionals({
       establishmentId,
       date: targetDate,
       serviceId,
     });
+    const professionals = filterProfessionalsByAllowedList(professionalsRaw, scopedAllowedProfessionalNames);
 
     const names = uniqueProfessionalDisplayNames(
       professionals
@@ -6730,7 +10398,13 @@ async function sendChatMessage({
   });
 
   let response = await chat.sendMessage({
-    message: buildConversationPrompt(history, message, knowledge, customerContext || null),
+    message: buildConversationPrompt(
+      history,
+      message,
+      knowledge,
+      customerContext || null,
+      tenantCode,
+    ),
   });
 
   for (let attempt = 0; attempt < 3; attempt += 1) {
@@ -6749,6 +10423,11 @@ async function sendChatMessage({
         text = String(corrected.text || text);
       }
 
+      const captured = capturePendingConfirmationFromText(text);
+      if (captured.captured && !textLooksLikeBookingConfirmationRequest(text)) {
+        text = `${text}\n\n${buildBookingConfirmationMessage(captured.items)}`;
+      }
+
       return finalizeChatResponse(text);
     }
 
@@ -6758,6 +10437,21 @@ async function sendChatMessage({
         if (call.name === "checkAvailability") {
           const requestedDate = relativeDate?.iso || toNonEmptyString(call.args?.date);
           const requestedProfessional = toNonEmptyString(call.args?.professionalName);
+          if (
+            requestedProfessional &&
+            Array.isArray(scopedAllowedProfessionalNames) &&
+            scopedAllowedProfessionalNames.length &&
+            !professionalMatchesAllowedList(requestedProfessional, scopedAllowedProfessionalNames)
+          ) {
+            results.push({
+              name: call.name,
+              result: {
+                status: "restricted_professional",
+                message: restrictedProfessionalMessage,
+              },
+            });
+            continue;
+          }
           const requestedPreferredTime =
             normalizeTimeValue(call.args?.preferredTime) || inferredPreferredTime;
           const availability = await getAvailability(
@@ -6767,6 +10461,7 @@ async function sendChatMessage({
             {
               professionalName: requestedProfessional,
               preferredTime: requestedPreferredTime,
+              allowedProfessionalNames: scopedAllowedProfessionalNames,
             },
           );
           results.push({ name: call.name, result: availability });
@@ -6800,11 +10495,12 @@ async function sendChatMessage({
             }
           }
 
-          const professionals = await getProfessionals({
+          const professionalsRaw = await getProfessionals({
             establishmentId,
             date: requestedDate,
             serviceId,
           });
+          const professionals = filterProfessionalsByAllowedList(professionalsRaw, scopedAllowedProfessionalNames);
 
           const names = uniqueProfessionalDisplayNames(
             professionals
@@ -6825,6 +10521,16 @@ async function sendChatMessage({
         }
 
         if (call.name === "bookAppointment") {
+          if (STRICT_TEST_BOOKING_GUARD_ENABLED && bookingTestSignal.inferredTest) {
+            if (!hasValidTestAuthorization(testAuthorization)) {
+              results.push({
+                name: call.name,
+                result: buildTestAuthorizationBlock({ signal: bookingTestSignal }),
+              });
+              continue;
+            }
+          }
+
           if (hasChangeRequestIntent) {
             results.push({
               name: call.name,
@@ -6875,6 +10581,25 @@ async function sendChatMessage({
             professionalName: toNonEmptyString(item?.professionalName || call.args?.professionalName),
           }));
 
+          const restrictedItem = normalizedItems.find(
+            (item) =>
+              item.professionalName &&
+              Array.isArray(scopedAllowedProfessionalNames) &&
+              scopedAllowedProfessionalNames.length &&
+              !professionalMatchesAllowedList(item.professionalName, scopedAllowedProfessionalNames),
+          );
+          if (restrictedItem) {
+            results.push({
+              name: call.name,
+              result: {
+                status: "restricted_professional",
+                message: restrictedProfessionalMessage,
+                requestedProfessional: restrictedItem.professionalName,
+              },
+            });
+            continue;
+          }
+
           const invalidItem = normalizedItems.find(
             (item) => !item.service || !item.date || !item.time,
           );
@@ -6897,10 +10622,12 @@ async function sendChatMessage({
             try {
               const preview = await resolveBookingPreviewItem({
                 establishmentId,
+                tenantCode,
                 service: item.service,
                 date: item.date,
                 time: item.time,
                 professionalName: item.professionalName,
+                allowedProfessionalNames: scopedAllowedProfessionalNames,
               });
               previewItems.push(preview);
             } catch (error) {
@@ -6916,6 +10643,22 @@ async function sendChatMessage({
                 status: "error",
                 message: previewError?.message || "Nao foi possivel validar disponibilidade.",
                 details: previewError?.details || null,
+              },
+            });
+            continue;
+          }
+
+          const simultaneousRuleViolation = validateTenantSimultaneousBookingRules(previewItems, {
+            tenantCode,
+            establishmentId,
+          });
+          if (simultaneousRuleViolation) {
+            results.push({
+              name: call.name,
+              result: {
+                status: simultaneousRuleViolation.status,
+                message: simultaneousRuleViolation.message,
+                details: simultaneousRuleViolation.details || null,
               },
             });
             continue;
@@ -6964,6 +10707,7 @@ async function sendChatMessage({
           const requestedDate = relativeDate?.iso || toNonEmptyString(call.args?.date);
           const rescheduled = await rescheduleAppointment({
             establishmentId,
+            tenantCode,
             confirmationCode: String(call.args.confirmationCode || ""),
             appointmentId: String(call.args.appointmentId || ""),
             date: requestedDate,
@@ -6976,6 +10720,7 @@ async function sendChatMessage({
         if (call.name === "cancelAppointment") {
           const cancelled = await cancelAppointment({
             establishmentId,
+            tenantCode,
             confirmationCode: String(call.args?.confirmationCode || ""),
             appointmentId: String(call.args?.appointmentId || ""),
             reason: String(call.args?.reason || ""),
@@ -7010,13 +10755,23 @@ async function sendChatMessage({
       }
     }
 
+    const pendingConfirmationResult = results.find((item) =>
+      toNonEmptyString(item?.name) === "bookAppointment" &&
+      normalizeForMatch(item?.result?.status || "") === "pending_confirmation",
+    );
+    if (pendingConfirmationResult) {
+      const pendingMessage = toNonEmptyString(pendingConfirmationResult?.result?.message) ||
+        buildBookingConfirmationMessage(pendingConfirmationResult?.result?.items || []);
+      return finalizeChatResponse(pendingMessage);
+    }
+
     response = await chat.sendMessage({
       message: JSON.stringify(results),
     });
   }
 
   return finalizeChatResponse(
-    "Tive uma instabilidade momentanea aqui. Consegue repetir sua ultima mensagem para eu continuar seu atendimento?",
+    "Nao consegui concluir esta etapa automaticamente. Me envie novamente servico, data, horario e profissional para eu seguir com seu atendimento.",
   );
 }
 
@@ -7214,6 +10969,19 @@ app.get("/", (req, res) => {
       adminTenantUsersList: "GET /api/admin/tenants/:code/users",
       adminTenantUsersCreate: "POST /api/admin/tenants/:code/users",
       adminTenantUsersUpdate: "PUT /api/admin/tenants/:code/users/:userId",
+      adminTenantCrmSettingsGet: "GET /api/admin/tenants/:code/crm/settings",
+      adminTenantCrmSettingsPut: "PUT /api/admin/tenants/:code/crm/settings",
+      adminTenantCrmCatalog: "GET /api/admin/tenants/:code/crm/services/catalog",
+      adminTenantCrmServiceRulesGet: "GET /api/admin/tenants/:code/crm/services/rules",
+      adminTenantCrmServiceRulesPut: "PUT /api/admin/tenants/:code/crm/services/rules",
+      adminTenantCrmCategoryRulesGet: "GET /api/admin/tenants/:code/crm/categories/rules",
+      adminTenantCrmCategoryRulesPut: "PUT /api/admin/tenants/:code/crm/categories/rules",
+      adminTenantCrmBlocksGet: "GET /api/admin/tenants/:code/crm/blocks",
+      adminTenantCrmBlocksPost: "POST /api/admin/tenants/:code/crm/blocks",
+      adminTenantCrmFlows: "GET /api/admin/tenants/:code/crm/flows",
+      adminTenantCrmOpportunities: "GET /api/admin/tenants/:code/crm/opportunities",
+      adminTenantCrmDashboard: "GET /api/admin/tenants/:code/crm/dashboard",
+      adminTenantCrmPreviewRun: "POST /api/admin/tenants/:code/crm/preview-run",
       adminUploadMarketingImage: "POST /api/admin/uploads/marketing-image",
       trinksAvailability: "POST /api/trinks/availability",
       trinksAppointments: "POST /api/trinks/appointments",
@@ -7338,6 +11106,27 @@ app.post("/api/evolution/webhook/set", async (req, res) => {
   }
 });
 
+app.post("/api/evolution/instance/disconnect", async (req, res) => {
+  try {
+    const instance = resolveEvolutionInstance(
+      req.query.instance || req.query.instanceName || req.body?.instance || req.body?.instanceName,
+    );
+    if (!instance) {
+      return res.status(400).json({ message: "Informe instance/instanceName ou configure EVOLUTION_INSTANCE." });
+    }
+
+    const result = await disconnectEvolutionInstance(instance);
+    return res.json({ status: "ok", success: true, instance, result });
+  } catch (error) {
+    return res.status(error.status || 500).json({
+      status: "error",
+      success: false,
+      message: error.message || "Erro ao desconectar instancia.",
+      details: error.details || null,
+    });
+  }
+});
+
 app.get("/api/evolution/instance/status", async (req, res) => {
   try {
     const instance = resolveEvolutionInstance(req.query.instance || req.query.instanceName);
@@ -7345,14 +11134,24 @@ app.get("/api/evolution/instance/status", async (req, res) => {
       return res.status(400).json({ message: "Informe instance ou configure EVOLUTION_INSTANCE." });
     }
 
-    const payload = await evolutionRequest("/instance/fetchInstances", { method: "GET" });
+    const payload = await evolutionRequest("/instance/fetchInstances", {
+      method: "GET",
+      tenantCode: req.query.tenantCode || req.query.tenant || "",
+      instanceName: instance,
+    });
     const instances = Array.isArray(payload) ? payload : Array.isArray(payload?.instances) ? payload.instances : [];
     const found = instances.find(
       (item) =>
         toNonEmptyString(item?.name || item?.instanceName || item?.instance).toLowerCase() === instance.toLowerCase(),
     );
 
-    return res.json({ status: "ok", instance, connected: Boolean(found), data: found || null, raw: payload });
+    return res.json({
+      status: "ok",
+      instance,
+      connected: isEvolutionInstanceConnected(found),
+      data: found || null,
+      raw: payload,
+    });
   } catch (error) {
     return res.status(error.status || 500).json({
       status: "error",
@@ -8044,6 +11843,337 @@ app.put("/api/admin/tenants/:code/users/:userId", (req, res) => {
   }
 });
 
+app.get("/api/admin/tenants/:code/crm/settings", (req, res) => {
+  try {
+    const principal = requireAdminPrincipal(req, res);
+    if (!principal) {
+      return;
+    }
+    if (!principalCanAccessTenant(principal, req.params.code)) {
+      return res.status(403).json({ status: "error", message: "Sem permissao para este tenant." });
+    }
+
+    const tenant = getTenantByCode(req.params.code);
+    if (!tenant) {
+      return res.status(404).json({ status: "error", message: "Tenant nao encontrado." });
+    }
+
+    return res.json({
+      status: "ok",
+      tenant: { code: tenant.code, name: tenant.name },
+      settings: getTenantCrmSettingsByCode(tenant.code)?.config || getDefaultCrmSettings(),
+    });
+  } catch (error) {
+    return res.status(error.status || 500).json({
+      status: "error",
+      message: error.message || "Erro ao carregar configuracoes de CRM.",
+      details: error.details || null,
+    });
+  }
+});
+
+app.put("/api/admin/tenants/:code/crm/settings", (req, res) => {
+  try {
+    const principal = requireAdminPrincipal(req, res);
+    if (!principal) {
+      return;
+    }
+    if (!principalCanAccessTenant(principal, req.params.code)) {
+      return res.status(403).json({ status: "error", message: "Sem permissao para este tenant." });
+    }
+
+    const settings = upsertTenantCrmSettingsByCode(req.params.code, req.body?.settings || req.body || {});
+    return res.json({
+      status: "ok",
+      settings: settings?.config || getDefaultCrmSettings(),
+    });
+  } catch (error) {
+    return res.status(error.status || 500).json({
+      status: "error",
+      message: error.message || "Erro ao salvar configuracoes de CRM.",
+      details: error.details || null,
+    });
+  }
+});
+
+app.get("/api/admin/tenants/:code/crm/services/catalog", async (req, res) => {
+  try {
+    const principal = requireAdminPrincipal(req, res);
+    if (!principal) {
+      return;
+    }
+    if (!principalCanAccessTenant(principal, req.params.code)) {
+      return res.status(403).json({ status: "error", message: "Sem permissao para este tenant." });
+    }
+
+    const tenant = getTenantByCode(req.params.code);
+    if (!tenant) {
+      return res.status(404).json({ status: "error", message: "Tenant nao encontrado." });
+    }
+
+    const services = await buildTenantCrmServiceCatalogWithRules(tenant.code);
+    return res.json({
+      status: "ok",
+      tenant: { code: tenant.code, name: tenant.name, establishmentId: tenant.establishmentId },
+      data: services,
+    });
+  } catch (error) {
+    return res.status(error.status || 500).json({
+      status: "error",
+      message: error.message || "Erro ao listar servicos do CRM.",
+      details: error.details || null,
+    });
+  }
+});
+
+app.get("/api/admin/tenants/:code/crm/services/rules", (req, res) => {
+  try {
+    const principal = requireAdminPrincipal(req, res);
+    if (!principal) {
+      return;
+    }
+    if (!principalCanAccessTenant(principal, req.params.code)) {
+      return res.status(403).json({ status: "error", message: "Sem permissao para este tenant." });
+    }
+
+    return res.json({
+      status: "ok",
+      rules: listTenantServiceReturnRulesByCode(req.params.code),
+    });
+  } catch (error) {
+    return res.status(error.status || 500).json({
+      status: "error",
+      message: error.message || "Erro ao listar regras por servico do CRM.",
+      details: error.details || null,
+    });
+  }
+});
+
+app.put("/api/admin/tenants/:code/crm/services/rules", (req, res) => {
+  try {
+    const principal = requireAdminPrincipal(req, res);
+    if (!principal) {
+      return;
+    }
+    if (!principalCanAccessTenant(principal, req.params.code)) {
+      return res.status(403).json({ status: "error", message: "Sem permissao para este tenant." });
+    }
+
+    const rules = upsertTenantServiceReturnRulesByCode(req.params.code, req.body?.rules || []);
+    return res.json({
+      status: "ok",
+      rules,
+    });
+  } catch (error) {
+    return res.status(error.status || 500).json({
+      status: "error",
+      message: error.message || "Erro ao salvar regras por servico do CRM.",
+      details: error.details || null,
+    });
+  }
+});
+
+app.get("/api/admin/tenants/:code/crm/categories/rules", (req, res) => {
+  try {
+    const principal = requireAdminPrincipal(req, res);
+    if (!principal) {
+      return;
+    }
+    if (!principalCanAccessTenant(principal, req.params.code)) {
+      return res.status(403).json({ status: "error", message: "Sem permissao para este tenant." });
+    }
+
+    return res.json({
+      status: "ok",
+      rules: listTenantCategoryOpportunityRulesByCode(req.params.code),
+    });
+  } catch (error) {
+    return res.status(error.status || 500).json({
+      status: "error",
+      message: error.message || "Erro ao listar regras por categoria do CRM.",
+      details: error.details || null,
+    });
+  }
+});
+
+app.put("/api/admin/tenants/:code/crm/categories/rules", (req, res) => {
+  try {
+    const principal = requireAdminPrincipal(req, res);
+    if (!principal) {
+      return;
+    }
+    if (!principalCanAccessTenant(principal, req.params.code)) {
+      return res.status(403).json({ status: "error", message: "Sem permissao para este tenant." });
+    }
+
+    const rules = upsertTenantCategoryOpportunityRulesByCode(req.params.code, req.body?.rules || []);
+    return res.json({
+      status: "ok",
+      rules,
+    });
+  } catch (error) {
+    return res.status(error.status || 500).json({
+      status: "error",
+      message: error.message || "Erro ao salvar regras por categoria do CRM.",
+      details: error.details || null,
+    });
+  }
+});
+
+app.get("/api/admin/tenants/:code/crm/blocks", (req, res) => {
+  try {
+    const principal = requireAdminPrincipal(req, res);
+    if (!principal) {
+      return;
+    }
+    if (!principalCanAccessTenant(principal, req.params.code)) {
+      return res.status(403).json({ status: "error", message: "Sem permissao para este tenant." });
+    }
+
+    return res.json({
+      status: "ok",
+      blocks: listCrmClientBlocksByCode(req.params.code, { phone: req.query.phone || "" }),
+    });
+  } catch (error) {
+    return res.status(error.status || 500).json({
+      status: "error",
+      message: error.message || "Erro ao listar bloqueios do CRM.",
+      details: error.details || null,
+    });
+  }
+});
+
+app.post("/api/admin/tenants/:code/crm/blocks", (req, res) => {
+  try {
+    const principal = requireAdminPrincipal(req, res);
+    if (!principal) {
+      return;
+    }
+    if (!principalCanAccessTenant(principal, req.params.code)) {
+      return res.status(403).json({ status: "error", message: "Sem permissao para este tenant." });
+    }
+
+    const block = upsertCrmClientBlockByCode(req.params.code, req.body || {});
+    return res.json({
+      status: "ok",
+      block,
+      blocks: listCrmClientBlocksByCode(req.params.code),
+    });
+  } catch (error) {
+    return res.status(error.status || 500).json({
+      status: "error",
+      message: error.message || "Erro ao salvar bloqueio do CRM.",
+      details: error.details || null,
+    });
+  }
+});
+
+app.get("/api/admin/tenants/:code/crm/flows", (req, res) => {
+  try {
+    const principal = requireAdminPrincipal(req, res);
+    if (!principal) {
+      return;
+    }
+    if (!principalCanAccessTenant(principal, req.params.code)) {
+      return res.status(403).json({ status: "error", message: "Sem permissao para este tenant." });
+    }
+
+    return res.json({
+      status: "ok",
+      data: listCrmReturnFlowsByCode(req.params.code, {
+        phone: req.query.phone || "",
+        status: req.query.status || "",
+        limit: req.query.limit || 200,
+      }),
+    });
+  } catch (error) {
+    return res.status(error.status || 500).json({
+      status: "error",
+      message: error.message || "Erro ao listar fluxos do CRM.",
+      details: error.details || null,
+    });
+  }
+});
+
+app.get("/api/admin/tenants/:code/crm/opportunities", (req, res) => {
+  try {
+    const principal = requireAdminPrincipal(req, res);
+    if (!principal) {
+      return;
+    }
+    if (!principalCanAccessTenant(principal, req.params.code)) {
+      return res.status(403).json({ status: "error", message: "Sem permissao para este tenant." });
+    }
+
+    return res.json({
+      status: "ok",
+      data: listCrmCategoryOpportunitiesByCode(req.params.code, {
+        status: req.query.status || "",
+        limit: req.query.limit || 200,
+      }),
+    });
+  } catch (error) {
+    return res.status(error.status || 500).json({
+      status: "error",
+      message: error.message || "Erro ao listar oportunidades do CRM.",
+      details: error.details || null,
+    });
+  }
+});
+
+app.get("/api/admin/tenants/:code/crm/dashboard", (req, res) => {
+  try {
+    const principal = requireAdminPrincipal(req, res);
+    if (!principal) {
+      return;
+    }
+    if (!principalCanAccessTenant(principal, req.params.code)) {
+      return res.status(403).json({ status: "error", message: "Sem permissao para este tenant." });
+    }
+
+    return res.json({
+      status: "ok",
+      dashboard: buildTenantCrmDashboard(req.params.code),
+    });
+  } catch (error) {
+    return res.status(error.status || 500).json({
+      status: "error",
+      message: error.message || "Erro ao montar dashboard do CRM.",
+      details: error.details || null,
+    });
+  }
+});
+
+app.post("/api/admin/tenants/:code/crm/preview-run", async (req, res) => {
+  try {
+    const principal = requireAdminPrincipal(req, res);
+    if (!principal) {
+      return;
+    }
+    if (!principalCanAccessTenant(principal, req.params.code)) {
+      return res.status(403).json({ status: "error", message: "Sem permissao para este tenant." });
+    }
+
+    const preview = await runTenantCrmPreview(req.params.code, {
+      lookbackDays: req.body?.lookbackDays || req.body?.days || 365,
+      materialize: Boolean(req.body?.materialize),
+      limit: req.body?.limit || 250,
+    });
+
+    return res.json({
+      status: "ok",
+      preview,
+      dashboard: buildTenantCrmDashboard(req.params.code),
+    });
+  } catch (error) {
+    return res.status(error.status || 500).json({
+      status: "error",
+      message: error.message || "Erro ao rodar preview do CRM.",
+      details: error.details || null,
+    });
+  }
+});
+
 app.get("/api/scheduling/providers", (req, res) => {
   try {
     const tenantCode = toNonEmptyString(req.query.tenantCode || req.query.tenant || "");
@@ -8122,6 +12252,17 @@ app.post("/api/scheduling/appointments", async (req, res) => {
       tenantCode,
       tenant,
     } = req.body || {};
+    const directTestSignal = detectDirectBookingTestSignal(req.body || {});
+    const directTestAuthorization = resolveTrustedTestAuthorizationFromRequest(
+      req,
+      req.body?.testAuthorization || req.body?.testApproval,
+    );
+
+    if (STRICT_TEST_BOOKING_GUARD_ENABLED && directTestSignal.inferredTest) {
+      if (!hasValidTestAuthorization(directTestAuthorization)) {
+        return res.status(403).json(buildTestAuthorizationBlock({ signal: directTestSignal }));
+      }
+    }
 
     const context = resolveSchedulingRequestContext({
       tenantCode,
@@ -8141,6 +12282,7 @@ app.post("/api/scheduling/appointments", async (req, res) => {
     });
     const createdAppointment = await adapter.createAppointment({
       establishmentId: context.establishmentId,
+      tenantCode: context.tenantCode,
       service,
       date,
       time,
@@ -8254,6 +12396,7 @@ app.post("/api/scheduling/appointments/reschedule", async (req, res) => {
     });
     const result = await adapter.rescheduleAppointment({
       establishmentId: context.establishmentId,
+      tenantCode: context.tenantCode,
       confirmationCode,
       appointmentId,
       date,
@@ -8306,6 +12449,7 @@ app.post("/api/scheduling/appointments/cancel", async (req, res) => {
     });
     const result = await adapter.cancelAppointment({
       establishmentId: context.establishmentId,
+      tenantCode: context.tenantCode,
       confirmationCode,
       appointmentId,
       reason,
@@ -8358,6 +12502,17 @@ app.post("/api/trinks/appointments", async (req, res) => {
       clientName,
       clientPhone,
     } = req.body || {};
+    const directTestSignal = detectDirectBookingTestSignal(req.body || {});
+    const directTestAuthorization = resolveTrustedTestAuthorizationFromRequest(
+      req,
+      req.body?.testAuthorization || req.body?.testApproval,
+    );
+
+    if (STRICT_TEST_BOOKING_GUARD_ENABLED && directTestSignal.inferredTest) {
+      if (!hasValidTestAuthorization(directTestAuthorization)) {
+        return res.status(403).json(buildTestAuthorizationBlock({ signal: directTestSignal }));
+      }
+    }
 
     if (!establishmentId || !service || !date || !time || !clientName || !clientPhone) {
       return res.status(400).json({
@@ -8478,6 +12633,23 @@ app.post("/api/trinks/diagnostics/professionals-raw", async (req, res) => {
 app.post("/api/chat", async (req, res) => {
   try {
     const { establishmentId, message, history, customerContext, tenantCode, tenant, instance, instanceName } = req.body || {};
+    const baseCustomerContext =
+      customerContext && typeof customerContext === "object" && !Array.isArray(customerContext)
+        ? { ...customerContext }
+        : {};
+    if (req.body?.testMode !== undefined || req.body?.isTest !== undefined) {
+      baseCustomerContext.testMode = Boolean(req.body?.testMode || req.body?.isTest);
+    }
+    const testAuthorization = resolveTrustedTestAuthorizationFromRequest(
+      req,
+      req.body?.testAuthorization || req.body?.testApproval || baseCustomerContext?.testAuthorization,
+    );
+    if (testAuthorization) {
+      baseCustomerContext.testAuthorization = testAuthorization;
+    }
+    if (isInternalTestPhone(baseCustomerContext?.phone)) {
+      baseCustomerContext.internalTester = true;
+    }
 
     const context = resolveConversationTenantContext({
       tenantCode,
@@ -8486,9 +12658,15 @@ app.post("/api/chat", async (req, res) => {
       establishmentId,
     });
 
-    if (!context.establishmentId || !message) {
+    if (!message) {
       return res.status(400).json({
-        message: "Campos obrigatorios: establishmentId, message",
+        message: "Campo obrigatorio: message",
+      });
+    }
+
+    if (!context.establishmentId) {
+      return res.status(400).json({
+        message: "Informe establishmentId valido ou tenantCode com establishmentId cadastrado.",
       });
     }
 
@@ -8496,7 +12674,7 @@ app.post("/api/chat", async (req, res) => {
       establishmentId: Number(context.establishmentId),
       message: String(message),
       history: Array.isArray(history) ? history : [],
-      customerContext: customerContext && typeof customerContext === "object" ? customerContext : null,
+      customerContext: baseCustomerContext,
       knowledge: context.knowledge,
       tenantCode: context.tenantCode,
     });
@@ -8795,39 +12973,84 @@ app.post("/api/trinks/appointments/cancel", async (req, res) => {
 
 app.get("/api/db/conversations", (req, res) => {
   try {
-    const limit = Math.min(Math.max(Number(req.query.limit || 50), 1), 500);
-    const rows = db.prepare(
-      `
-        SELECT m.phone,
-               m.content AS lastMessage,
-               m.role AS lastRole,
-               m.at AS updatedAt,
-               (
-                 SELECT sender_name
-                 FROM whatsapp_messages u
-                 WHERE u.phone = m.phone
-                   AND u.role = 'user'
-                   AND COALESCE(u.sender_name, '') <> ''
-                 ORDER BY datetime(u.at) DESC, u.id DESC
-                 LIMIT 1
-               ) AS name,
-               (
-                 SELECT COUNT(*)
-                 FROM whatsapp_messages c
-                 WHERE c.phone = m.phone
-               ) AS count
-        FROM whatsapp_messages m
-        JOIN (
-          SELECT phone, MAX(id) AS max_id
-          FROM whatsapp_messages
-          GROUP BY phone
-        ) latest ON latest.max_id = m.id
-        ORDER BY datetime(m.at) DESC, m.id DESC
-        LIMIT ?
-      `,
-    ).all(limit);
+    const principal = requireAdminPrincipal(req, res);
+    if (!principal) {
+      return;
+    }
 
-    return res.json({ status: "ok", data: rows });
+    const requestedTenantCode = normalizeTenantCode(req.query.tenantCode || req.query.tenant || "");
+    const tenantCode = principal.role === "tenant"
+      ? normalizeTenantCode(principal.tenantCode)
+      : requestedTenantCode;
+    const limit = Math.min(Math.max(Number(req.query.limit || 50), 1), 500);
+    const rows = tenantCode
+      ? db.prepare(
+        `
+          SELECT m.phone,
+                 m.content AS lastMessage,
+                 m.role AS lastRole,
+                 m.at AS updatedAt,
+                 (
+                   SELECT sender_name
+                   FROM whatsapp_messages u
+                   WHERE u.phone = m.phone
+                     AND u.tenant_code = m.tenant_code
+                     AND u.role = 'user'
+                     AND COALESCE(u.sender_name, '') <> ''
+                   ORDER BY datetime(u.at) DESC, u.id DESC
+                   LIMIT 1
+                 ) AS name,
+                 (
+                   SELECT COUNT(*)
+                   FROM whatsapp_messages c
+                   WHERE c.phone = m.phone
+                     AND c.tenant_code = m.tenant_code
+                 ) AS count
+          FROM whatsapp_messages m
+          JOIN (
+            SELECT tenant_code, phone, MAX(id) AS max_id
+            FROM whatsapp_messages
+            WHERE tenant_code = ?
+            GROUP BY tenant_code, phone
+          ) latest ON latest.max_id = m.id
+          ORDER BY datetime(m.at) DESC, m.id DESC
+          LIMIT ?
+        `,
+      ).all(tenantCode, limit)
+      : db.prepare(
+        `
+          SELECT m.phone,
+                 m.content AS lastMessage,
+                 m.role AS lastRole,
+                 m.at AS updatedAt,
+                 (
+                   SELECT sender_name
+                   FROM whatsapp_messages u
+                   WHERE u.phone = m.phone
+                     AND u.tenant_code = m.tenant_code
+                     AND u.role = 'user'
+                     AND COALESCE(u.sender_name, '') <> ''
+                   ORDER BY datetime(u.at) DESC, u.id DESC
+                   LIMIT 1
+                 ) AS name,
+                 (
+                   SELECT COUNT(*)
+                   FROM whatsapp_messages c
+                   WHERE c.phone = m.phone
+                     AND c.tenant_code = m.tenant_code
+                 ) AS count
+          FROM whatsapp_messages m
+          JOIN (
+            SELECT tenant_code, phone, MAX(id) AS max_id
+            FROM whatsapp_messages
+            GROUP BY tenant_code, phone
+          ) latest ON latest.max_id = m.id
+          ORDER BY datetime(m.at) DESC, m.id DESC
+          LIMIT ?
+        `,
+      ).all(limit);
+
+    return res.json({ status: "ok", tenantCode: tenantCode || null, data: rows });
   } catch (error) {
     return res.status(500).json({
       status: "error",
@@ -8838,23 +13061,43 @@ app.get("/api/db/conversations", (req, res) => {
 
 app.get("/api/db/messages", (req, res) => {
   try {
+    const principal = requireAdminPrincipal(req, res);
+    if (!principal) {
+      return;
+    }
+
+    const requestedTenantCode = normalizeTenantCode(req.query.tenantCode || req.query.tenant || "");
+    const tenantCode = principal.role === "tenant"
+      ? normalizeTenantCode(principal.tenantCode)
+      : requestedTenantCode;
     const phone = normalizePhone(req.query.phone || "");
     if (!phone) {
       return res.status(400).json({ message: "Informe ?phone=numero" });
     }
 
     const limit = Math.min(Math.max(Number(req.query.limit || 100), 1), 1000);
-    const rows = db.prepare(
-      `
-        SELECT id, phone, role, content, sender_name AS senderName, at, source
-        FROM whatsapp_messages
-        WHERE phone = ?
-        ORDER BY datetime(at) DESC, id DESC
-        LIMIT ?
-      `,
-    ).all(phone, limit);
+    const rows = tenantCode
+      ? db.prepare(
+        `
+          SELECT id, phone, role, content, sender_name AS senderName, at, source, tenant_code AS tenantCode
+          FROM whatsapp_messages
+          WHERE phone = ?
+            AND tenant_code = ?
+          ORDER BY datetime(at) DESC, id DESC
+          LIMIT ?
+        `,
+      ).all(phone, tenantCode, limit)
+      : db.prepare(
+        `
+          SELECT id, phone, role, content, sender_name AS senderName, at, source, tenant_code AS tenantCode
+          FROM whatsapp_messages
+          WHERE phone = ?
+          ORDER BY datetime(at) DESC, id DESC
+          LIMIT ?
+        `,
+      ).all(phone, limit);
 
-    return res.json({ status: "ok", phone, messages: rows.reverse() });
+    return res.json({ status: "ok", phone, tenantCode: tenantCode || null, messages: rows.reverse() });
   } catch (error) {
     return res.status(500).json({
       status: "error",
@@ -8865,6 +13108,15 @@ app.get("/api/db/messages", (req, res) => {
 
 app.get("/api/db/appointments-audit", (req, res) => {
   try {
+    const principal = requireAdminPrincipal(req, res);
+    if (!principal) {
+      return;
+    }
+
+    const requestedTenantCode = normalizeTenantCode(req.query.tenantCode || req.query.tenant || "");
+    const tenantCode = principal.role === "tenant"
+      ? normalizeTenantCode(principal.tenantCode)
+      : requestedTenantCode;
     const limit = Math.min(Math.max(Number(req.query.limit || 100), 1), 1000);
     const phone = normalizePhone(req.query.phone || "");
     const status = toNonEmptyString(req.query.status);
@@ -8881,6 +13133,10 @@ app.get("/api/db/appointments-audit", (req, res) => {
 
     const params = [];
     const conditions = [];
+    if (tenantCode) {
+      conditions.push("tenant_code = ?");
+      params.push(tenantCode);
+    }
     if (phone) {
       conditions.push("client_phone = ?");
       params.push(phone);
@@ -8901,7 +13157,7 @@ app.get("/api/db/appointments-audit", (req, res) => {
       responsePayload: row.responsePayload ? safeJsonParse(row.responsePayload) : null,
     }));
 
-    return res.json({ status: "ok", data: rows });
+    return res.json({ status: "ok", tenantCode: tenantCode || null, data: rows });
   } catch (error) {
     return res.status(500).json({
       status: "error",
@@ -8912,6 +13168,15 @@ app.get("/api/db/appointments-audit", (req, res) => {
 
 app.get("/api/db/webhook-events", (req, res) => {
   try {
+    const principal = requireAdminPrincipal(req, res);
+    if (!principal) {
+      return;
+    }
+
+    const requestedTenantCode = normalizeTenantCode(req.query.tenantCode || req.query.tenant || "");
+    const tenantCode = principal.role === "tenant"
+      ? normalizeTenantCode(principal.tenantCode)
+      : requestedTenantCode;
     const limit = Math.min(Math.max(Number(req.query.limit || 200), 1), 2000);
     const phone = normalizePhone(req.query.phone || "");
     const status = toNonEmptyString(req.query.status);
@@ -8927,6 +13192,10 @@ app.get("/api/db/webhook-events", (req, res) => {
 
     const params = [];
     const conditions = [];
+    if (tenantCode) {
+      conditions.push("tenant_code = ?");
+      params.push(tenantCode);
+    }
     if (phone) {
       conditions.push("sender_number = ?");
       params.push(phone);
@@ -8950,7 +13219,7 @@ app.get("/api/db/webhook-events", (req, res) => {
       details: row.details ? safeJsonParse(row.details) : null,
     }));
 
-    return res.json({ status: "ok", data: rows });
+    return res.json({ status: "ok", tenantCode: tenantCode || null, data: rows });
   } catch (error) {
     return res.status(500).json({
       status: "error",
@@ -8960,18 +13229,36 @@ app.get("/api/db/webhook-events", (req, res) => {
 });
 
 app.get("/api/whatsapp/inbox", (req, res) => {
-  const conversations = summarizeWhatsappConversations();
-  return res.json({ status: "ok", conversations });
+  const principal = requireAdminPrincipal(req, res);
+  if (!principal) {
+    return;
+  }
+
+  const requestedTenantCode = normalizeTenantCode(req.query.tenantCode || req.query.tenant || "");
+  const tenantCode = principal.role === "tenant"
+    ? normalizeTenantCode(principal.tenantCode)
+    : requestedTenantCode;
+  const conversations = summarizeWhatsappConversations({ tenantCode });
+  return res.json({ status: "ok", tenantCode: tenantCode || null, conversations });
 });
 
 app.get("/api/whatsapp/messages", (req, res) => {
+  const principal = requireAdminPrincipal(req, res);
+  if (!principal) {
+    return;
+  }
+
+  const requestedTenantCode = normalizeTenantCode(req.query.tenantCode || req.query.tenant || "");
+  const tenantCode = principal.role === "tenant"
+    ? normalizeTenantCode(principal.tenantCode)
+    : requestedTenantCode;
   const phone = normalizePhone(req.query.phone || "");
   if (!phone) {
     return res.status(400).json({ message: "Informe ?phone=numero" });
   }
 
-  const messages = getWhatsappHistory(phone);
-  return res.json({ status: "ok", phone, messages });
+  const messages = getWhatsappHistory(phone, { tenantCode });
+  return res.json({ status: "ok", phone, tenantCode: tenantCode || null, messages });
 });
 
 app.post("/api/evolution/send-text", async (req, res) => {
@@ -8990,8 +13277,22 @@ app.post("/api/evolution/send-text", async (req, res) => {
     const trimmedText = String(text).trim();
     const normalizedTarget = normalizePhone(to);
 
+    const conversationContext = resolveConversationTenantContext({
+      tenantCode: req.body?.tenantCode || req.body?.tenant || "",
+      instanceName: instance,
+      establishmentId: resolveConversationTenantFallbackEstablishmentId(),
+    });
+    const tenantCode = normalizeTenantScopeCode(conversationContext.tenantCode);
+    if (!tenantCode && isMultiTenantModeActive()) {
+      return res.status(422).json({
+        status: "error",
+        message:
+          "Nao foi possivel identificar o tenant da instancia informada. Verifique o identificador evolution_instance para evitar mistura entre saloes.",
+      });
+    }
+
     if (normalizedTarget && /^\/(retomar(\s|-)?ia|ia\s+on)$/i.test(trimmedText)) {
-      clearHumanHandoffSession(normalizedTarget);
+      clearHumanHandoffSession(normalizedTarget, tenantCode);
       return res.json({
         status: "ok",
         action: "handoffResumed",
@@ -9003,6 +13304,7 @@ app.post("/api/evolution/send-text", async (req, res) => {
       const session = setHumanHandoffSession(normalizedTarget, {
         source: "manualCommand",
         reason: "Ativado manualmente pelo painel",
+        tenantCode,
       });
       return res.json({
         status: "ok",
@@ -9020,11 +13322,13 @@ app.post("/api/evolution/send-text", async (req, res) => {
     const result = await evolutionRequest(`/message/sendText/${instance}`, {
       method: "POST",
       body: payload,
+      tenantCode,
+      instanceName: instance,
     });
 
     const normalized = normalizePhone(to);
     if (normalized) {
-      pushWhatsappHistory(normalized, "assistant", text);
+      pushWhatsappHistory(normalized, "assistant", text, "", { tenantCode });
     }
 
     return res.json({ status: "sent", result });
@@ -9043,10 +13347,17 @@ app.get("/api/handoff/status", (req, res) => {
     return res.status(400).json({ message: "Informe ?phone=numero" });
   }
 
-  const session = getHumanHandoffSession(phone);
+  const context = resolveConversationTenantContext({
+    tenantCode: req.query.tenantCode || req.query.tenant || "",
+    instanceName: req.query.instance || req.query.instanceName || "",
+    establishmentId: req.query.establishmentId || null,
+  });
+  const tenantCode = normalizeTenantScopeCode(context.tenantCode);
+  const session = getHumanHandoffSession(phone, tenantCode);
   return res.json({
     status: "ok",
     phone,
+    tenantCode: tenantCode || null,
     active: Boolean(session?.active),
     session: session || null,
   });
@@ -9058,16 +13369,24 @@ app.post("/api/handoff/activate", (req, res) => {
     return res.status(400).json({ message: "Campo obrigatorio: phone" });
   }
 
+  const context = resolveConversationTenantContext({
+    tenantCode: req.body?.tenantCode || req.body?.tenant || "",
+    instanceName: req.body?.instance || req.body?.instanceName || "",
+    establishmentId: req.body?.establishmentId || null,
+  });
+  const tenantCode = normalizeTenantScopeCode(context.tenantCode);
   const session = setHumanHandoffSession(phone, {
     source: "api",
     reason: toNonEmptyString(req.body?.reason) || "Ativado por endpoint",
     customerName: toNonEmptyString(req.body?.customerName),
+    tenantCode,
   });
 
   return res.json({
     status: "ok",
     action: "handoffActivated",
     phone,
+    tenantCode: tenantCode || null,
     session,
   });
 });
@@ -9079,8 +13398,14 @@ app.post("/api/handoff/resume", async (req, res) => {
       return res.status(400).json({ message: "Campo obrigatorio: phone" });
     }
 
-    const hadSession = Boolean(getHumanHandoffSession(phone));
-    clearHumanHandoffSession(phone);
+    const conversationContext = resolveConversationTenantContext({
+      tenantCode: req.body?.tenantCode || req.body?.tenant || "",
+      instanceName: req.body?.instance || req.body?.instanceName || "",
+      establishmentId: req.body?.establishmentId || resolveConversationTenantFallbackEstablishmentId(),
+    });
+    const tenantCode = normalizeTenantScopeCode(conversationContext.tenantCode);
+    const hadSession = Boolean(getHumanHandoffSession(phone, tenantCode));
+    clearHumanHandoffSession(phone, tenantCode);
 
     const notifyClient = Boolean(req.body?.notifyClient);
     if (notifyClient) {
@@ -9091,15 +13416,22 @@ app.post("/api/handoff/resume", async (req, res) => {
         });
       }
 
+      const conciergeName = resolveConciergeDisplayName(
+        conversationContext.knowledge,
+        conversationContext.tenantCode,
+      );
+      const defaultResumeMessage = `Perfeito. Voltei com o atendimento automatico da ${conciergeName} para te ajudar.`;
       const message =
         toNonEmptyString(req.body?.message) ||
-        "Perfeito. Voltei com o atendimento automatico do Jacques para te ajudar.";
+        defaultResumeMessage;
 
       await evolutionRequest(`/message/sendText/${instance}`, {
         method: "POST",
         body: { number: phone, text: message },
+        tenantCode,
+        instanceName: instance,
       });
-      pushWhatsappHistory(phone, "assistant", message);
+      pushWhatsappHistory(phone, "assistant", message, "", { tenantCode });
     }
 
     return res.json({
@@ -9124,10 +13456,18 @@ app.post("/webhook/whatsapp", webhookBodyParser, async (req, res) => {
   try {
     payloadParse = parseWebhookPayload(req.body);
     incoming = extractIncomingWhatsapp(payloadParse.payload || {});
+    const inferTenantCodeFromInstance = (instanceName = "") => {
+      const context = resolveConversationTenantContext({
+        instanceName,
+        establishmentId: resolveConversationTenantFallbackEstablishmentId(),
+      });
+      return normalizeTenantScopeCode(context.tenantCode);
+    };
 
     if (payloadParse.parseError) {
       const inferredSender = incoming.senderNumber || inferSenderFromRawWebhookText(payloadParse.rawText);
       recordWebhookEvent({
+        tenantCode: inferTenantCodeFromInstance(incoming.instanceName),
         event: incoming.event,
         instanceName: incoming.instanceName,
         senderRaw: incoming.senderRaw,
@@ -9153,6 +13493,7 @@ app.post("/webhook/whatsapp", webhookBodyParser, async (req, res) => {
 
     if (incoming.fromMe) {
       recordWebhookEvent({
+        tenantCode: inferTenantCodeFromInstance(incoming.instanceName),
         event: incoming.event,
         instanceName: incoming.instanceName,
         senderRaw: incoming.senderRaw,
@@ -9169,6 +13510,7 @@ app.post("/webhook/whatsapp", webhookBodyParser, async (req, res) => {
 
     if (incoming.isGroup) {
       recordWebhookEvent({
+        tenantCode: inferTenantCodeFromInstance(incoming.instanceName),
         event: incoming.event,
         instanceName: incoming.instanceName,
         senderRaw: incoming.senderRaw,
@@ -9194,6 +13536,7 @@ app.post("/webhook/whatsapp", webhookBodyParser, async (req, res) => {
         instance: incoming.instanceName || null,
       });
       recordWebhookEvent({
+        tenantCode: inferTenantCodeFromInstance(incoming.instanceName),
         event: incoming.event,
         instanceName: incoming.instanceName,
         senderRaw: incoming.senderRaw,
@@ -9215,9 +13558,35 @@ app.post("/webhook/whatsapp", webhookBodyParser, async (req, res) => {
 
     const conversationContext = resolveConversationTenantContext({
       instanceName: incoming.instanceName,
-      establishmentId: getConfiguredEstablishmentId(),
+      establishmentId: resolveConversationTenantFallbackEstablishmentId(),
     });
+    const webhookTenantCode = normalizeTenantScopeCode(conversationContext.tenantCode);
     const establishmentId = conversationContext.establishmentId;
+    if (!webhookTenantCode && isMultiTenantModeActive()) {
+      recordWebhookEvent({
+        tenantCode: "",
+        event: incoming.event,
+        instanceName: incoming.instanceName,
+        senderRaw: incoming.senderRaw,
+        senderNumber: incoming.senderNumber,
+        senderName: incoming.senderName,
+        messageId: incoming.messageId,
+        messageType: incoming.messageType,
+        messageText: incoming.messageText,
+        status: "ignored",
+        reason: "unresolvedTenantInstance",
+        details: {
+          instanceName: incoming.instanceName || "",
+          note:
+            "Instancia sem mapeamento de tenant em ambiente multi-tenant. Mensagem ignorada para evitar mistura.",
+        },
+      });
+      return res.status(200).json({
+        received: true,
+        ignored: true,
+        reason: "unresolvedTenantInstance",
+      });
+    }
 
     if (!incoming.messageText) {
       const messageEvent = isLikelyIncomingMessageEvent(incoming);
@@ -9230,7 +13599,9 @@ app.post("/webhook/whatsapp", webhookBodyParser, async (req, res) => {
         const instance = resolveEvolutionInstance(incoming.instanceName);
         const placeholder = unsupportedInboundPlaceholder(incoming);
 
-        pushWhatsappHistory(incoming.senderNumber, "user", placeholder, effectiveClientName);
+        pushWhatsappHistory(incoming.senderNumber, "user", placeholder, effectiveClientName, {
+          tenantCode: webhookTenantCode,
+        });
 
         if (instance) {
           await evolutionRequest(`/message/sendText/${instance}`, {
@@ -9240,10 +13611,13 @@ app.post("/webhook/whatsapp", webhookBodyParser, async (req, res) => {
               text: UNSUPPORTED_MESSAGE_REPLY,
             },
           });
-          pushWhatsappHistory(incoming.senderNumber, "assistant", UNSUPPORTED_MESSAGE_REPLY);
+          pushWhatsappHistory(incoming.senderNumber, "assistant", UNSUPPORTED_MESSAGE_REPLY, "", {
+            tenantCode: webhookTenantCode,
+          });
         }
 
         recordWebhookEvent({
+          tenantCode: webhookTenantCode,
           event: incoming.event,
           instanceName: incoming.instanceName,
           senderRaw: incoming.senderRaw,
@@ -9280,6 +13654,7 @@ app.post("/webhook/whatsapp", webhookBodyParser, async (req, res) => {
         instance: incoming.instanceName || null,
       });
       recordWebhookEvent({
+        tenantCode: webhookTenantCode,
         event: incoming.event,
         instanceName: incoming.instanceName,
         senderRaw: incoming.senderRaw,
@@ -9299,8 +13674,9 @@ app.post("/webhook/whatsapp", webhookBodyParser, async (req, res) => {
       });
     }
 
-    if (isDuplicateIncomingWhatsapp(incoming)) {
+    if (isDuplicateIncomingWhatsapp(incoming, { tenantCode: webhookTenantCode, instanceName: incoming.instanceName })) {
       recordWebhookEvent({
+        tenantCode: webhookTenantCode,
         event: incoming.event,
         instanceName: incoming.instanceName,
         senderRaw: incoming.senderRaw,
@@ -9338,20 +13714,130 @@ app.post("/webhook/whatsapp", webhookBodyParser, async (req, res) => {
       throw instanceError;
     }
 
-    const previousHistory = getWhatsappHistory(incoming.senderNumber);
-    pushWhatsappHistory(incoming.senderNumber, "user", incoming.messageText, effectiveClientName);
+    const previousHistory = getWhatsappHistory(incoming.senderNumber, {
+      tenantCode: webhookTenantCode,
+    });
+    pushWhatsappHistory(incoming.senderNumber, "user", incoming.messageText, effectiveClientName, {
+      tenantCode: webhookTenantCode,
+    });
+
+    const activeBotSession = getBotAutoClosedSession(incoming.senderNumber, webhookTenantCode);
+    if (activeBotSession?.active) {
+      if (isExplicitHumanReopenMessage(incoming.messageText)) {
+        clearBotAutoClosedSession(incoming.senderNumber, webhookTenantCode);
+      } else {
+        recordWebhookEvent({
+          tenantCode: webhookTenantCode,
+          event: incoming.event,
+          instanceName: instance,
+          senderRaw: incoming.senderRaw,
+          senderNumber: incoming.senderNumber,
+          senderName: effectiveClientName,
+          messageId: incoming.messageId,
+          messageType: incoming.messageType,
+          messageText: incoming.messageText,
+          status: "processed",
+          reason: "botConversationClosedIgnored",
+          details: {
+            botSessionCreatedAt: Number(activeBotSession.createdAt || 0),
+            botSessionExpiresAt: Number(activeBotSession.expiresAt || 0),
+          },
+        });
+
+        return res.status(200).json({
+          received: true,
+          processed: true,
+          botConversationClosed: true,
+          reason: "botConversationClosedIgnored",
+          instance,
+          to: incoming.senderNumber,
+          event: incoming.event || null,
+          messageId: incoming.messageId || null,
+        });
+      }
+    }
+
+    const botClosureDecision = shouldAutoCloseBotConversation({
+      message: incoming.messageText,
+      history: previousHistory,
+      knownClientName,
+    });
+    if (botClosureDecision.shouldClose) {
+      const closureText = buildBotAutoCloseMessage({
+        tenantName: resolveTenantDisplayName(
+          conversationContext.knowledge,
+          conversationContext.tenantCode,
+        ),
+      });
+
+      await evolutionRequest(`/message/sendText/${instance}`, {
+        method: "POST",
+        body: {
+          number: incoming.senderNumber,
+          text: closureText,
+        },
+      });
+      pushWhatsappHistory(incoming.senderNumber, "assistant", closureText, "", {
+        tenantCode: webhookTenantCode,
+      });
+      setBotAutoClosedSession(incoming.senderNumber, webhookTenantCode, {
+        source: "autoDetection",
+        detection: {
+          score: botClosureDecision.signal.score,
+          reasons: botClosureDecision.signal.reasons,
+          recentHits: botClosureDecision.recentHits,
+          repeatedCount: botClosureDecision.repeatedCount,
+        },
+        messageId: incoming.messageId || "",
+      });
+
+      recordWebhookEvent({
+        tenantCode: webhookTenantCode,
+        event: incoming.event,
+        instanceName: instance,
+        senderRaw: incoming.senderRaw,
+        senderNumber: incoming.senderNumber,
+        senderName: effectiveClientName,
+        messageId: incoming.messageId,
+        messageType: incoming.messageType,
+        messageText: incoming.messageText,
+        status: "processed",
+        reason: "botConversationAutoClosed",
+        details: {
+          score: botClosureDecision.signal.score,
+          reasons: botClosureDecision.signal.reasons,
+          recentHits: botClosureDecision.recentHits,
+          repeatedCount: botClosureDecision.repeatedCount,
+        },
+      });
+
+      return res.status(200).json({
+        received: true,
+        processed: true,
+        botConversationClosed: true,
+        reason: "botConversationAutoClosed",
+        instance,
+        to: incoming.senderNumber,
+        event: incoming.event || null,
+        messageId: incoming.messageId || null,
+      });
+    }
 
     if (isHumanHandoffEnabled()) {
       const askedHuman = isHumanHandoffRequest(incoming.messageText);
       const askedResume = isHumanHandoffResumeRequest(incoming.messageText);
-      const activeHandoff = getHumanHandoffSession(incoming.senderNumber);
+      const activeHandoff = getHumanHandoffSession(incoming.senderNumber, webhookTenantCode);
 
       if (askedResume && activeHandoff?.active) {
-        clearHumanHandoffSession(incoming.senderNumber);
+        clearHumanHandoffSession(incoming.senderNumber, webhookTenantCode);
 
+        const conciergeName = resolveConciergeDisplayName(
+          conversationContext.knowledge,
+          conversationContext.tenantCode,
+        );
         const resumeMessage =
           toNonEmptyString(process.env.HUMAN_HANDOFF_RESUME_MESSAGE) ||
-          "Perfeito. Voltei com o atendimento automatico do Jacques para te ajudar.";
+          `Perfeito. Voltei com o atendimento automatico da ${conciergeName} para te ajudar.`;
 
         await evolutionRequest(`/message/sendText/${instance}`, {
           method: "POST",
@@ -9360,8 +13846,11 @@ app.post("/webhook/whatsapp", webhookBodyParser, async (req, res) => {
             text: resumeMessage,
           },
         });
-        pushWhatsappHistory(incoming.senderNumber, "assistant", resumeMessage);
+        pushWhatsappHistory(incoming.senderNumber, "assistant", resumeMessage, "", {
+          tenantCode: webhookTenantCode,
+        });
         recordWebhookEvent({
+          tenantCode: webhookTenantCode,
           event: incoming.event,
           instanceName: instance,
           senderRaw: incoming.senderRaw,
@@ -9393,6 +13882,7 @@ app.post("/webhook/whatsapp", webhookBodyParser, async (req, res) => {
           establishmentId,
           customerName: effectiveClientName,
           messageId: incoming.messageId || "",
+          tenantCode: webhookTenantCode,
         });
 
         const ackMessage =
@@ -9406,7 +13896,9 @@ app.post("/webhook/whatsapp", webhookBodyParser, async (req, res) => {
             text: ackMessage,
           },
         });
-        pushWhatsappHistory(incoming.senderNumber, "assistant", ackMessage);
+        pushWhatsappHistory(incoming.senderNumber, "assistant", ackMessage, "", {
+          tenantCode: webhookTenantCode,
+        });
 
         const alertResult = await notifyHumanAlertPhones({
           instance,
@@ -9416,6 +13908,7 @@ app.post("/webhook/whatsapp", webhookBodyParser, async (req, res) => {
           customerMessage: incoming.messageText,
         });
         recordWebhookEvent({
+          tenantCode: webhookTenantCode,
           event: incoming.event,
           instanceName: instance,
           senderRaw: incoming.senderRaw,
@@ -9464,15 +13957,19 @@ app.post("/webhook/whatsapp", webhookBodyParser, async (req, res) => {
               text: waitingMessage,
             },
           });
-          pushWhatsappHistory(incoming.senderNumber, "assistant", waitingMessage);
+          pushWhatsappHistory(incoming.senderNumber, "assistant", waitingMessage, "", {
+            tenantCode: webhookTenantCode,
+          });
 
           setHumanHandoffSession(incoming.senderNumber, {
             ...activeHandoff,
             lastWaitAckAt: now,
+            tenantCode: webhookTenantCode,
           });
         }
 
         recordWebhookEvent({
+          tenantCode: webhookTenantCode,
           event: incoming.event,
           instanceName: instance,
           senderRaw: incoming.senderRaw,
@@ -9507,14 +14004,17 @@ app.post("/webhook/whatsapp", webhookBodyParser, async (req, res) => {
         name: effectiveClientName,
         phone: incoming.senderNumber,
         fromTrinks: Boolean(knownClientName),
+        internalTester: isInternalTestPhone(incoming.senderNumber),
       },
       knowledge: conversationContext.knowledge,
       tenantCode: conversationContext.tenantCode,
     });
-    const answer = toNonEmptyString(answerPayload?.text || answerPayload);
+    let answer = toNonEmptyString(answerPayload?.text || answerPayload);
     const marketingMedia = answerPayload?.marketingMedia && typeof answerPayload.marketingMedia === "object"
       ? answerPayload.marketingMedia
       : null;
+    let marketingMediaSent = false;
+    let marketingMediaError = "";
 
     if (marketingMedia?.url) {
       try {
@@ -9524,8 +14024,22 @@ app.post("/webhook/whatsapp", webhookBodyParser, async (req, res) => {
           mediaUrl: marketingMedia.url,
           caption: toNonEmptyString(marketingMedia.caption),
         });
+        marketingMediaSent = true;
       } catch (mediaError) {
+        marketingMediaError = toNonEmptyString(mediaError?.message || "");
         console.error("[marketing] failed to send media offer:", mediaError?.message || mediaError);
+      }
+    }
+
+    if (marketingMedia?.url && !marketingMediaSent) {
+      const fallbackOffer = [
+        toNonEmptyString(marketingMedia.caption),
+        `Imagem da oferta: ${toNonEmptyString(marketingMedia.url)}`,
+      ]
+        .filter(Boolean)
+        .join("\n");
+      if (fallbackOffer) {
+        answer = `${fallbackOffer}\n\n${answer}`;
       }
     }
 
@@ -9537,8 +14051,11 @@ app.post("/webhook/whatsapp", webhookBodyParser, async (req, res) => {
       },
     });
 
-    pushWhatsappHistory(incoming.senderNumber, "assistant", answer);
+    pushWhatsappHistory(incoming.senderNumber, "assistant", answer, "", {
+      tenantCode: webhookTenantCode,
+    });
     recordWebhookEvent({
+      tenantCode: webhookTenantCode,
       event: incoming.event,
       instanceName: instance,
       senderRaw: incoming.senderRaw,
@@ -9555,6 +14072,8 @@ app.post("/webhook/whatsapp", webhookBodyParser, async (req, res) => {
               actionId: toNonEmptyString(marketingMedia.actionId),
               actionName: toNonEmptyString(marketingMedia.actionName),
               url: toNonEmptyString(marketingMedia.url),
+              sent: marketingMediaSent,
+              error: marketingMediaSent ? "" : marketingMediaError,
             },
           }
         : null,
@@ -9584,13 +14103,27 @@ app.post("/webhook/whatsapp", webhookBodyParser, async (req, res) => {
             text: fallbackText,
           },
         });
-        pushWhatsappHistory(fallbackPhone, "assistant", fallbackText);
+        const fallbackTenantCode = normalizeTenantScopeCode(
+          resolveConversationTenantContext({
+            instanceName: incoming?.instanceName,
+            establishmentId: resolveConversationTenantFallbackEstablishmentId(),
+          }).tenantCode,
+        );
+        pushWhatsappHistory(fallbackPhone, "assistant", fallbackText, "", {
+          tenantCode: fallbackTenantCode,
+        });
       } catch {
         // Evita falha em cascata: ainda devolvemos 200 para o webhook.
       }
     }
 
     recordWebhookEvent({
+      tenantCode: normalizeTenantScopeCode(
+        resolveConversationTenantContext({
+          instanceName: incoming?.instanceName,
+          establishmentId: resolveConversationTenantFallbackEstablishmentId(),
+        }).tenantCode,
+      ),
       event: incoming?.event || "",
       instanceName: incoming?.instanceName || "",
       senderRaw: incoming?.senderRaw || "",

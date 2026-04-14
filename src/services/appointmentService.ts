@@ -147,6 +147,146 @@ type AdminPrincipal = {
   expiresAt?: string;
 };
 
+type CrmSettings = {
+  crmReturnEnabled?: boolean;
+  crmMode?: "beta" | "manual" | "automatic";
+  bookingMaxDaysAhead?: number;
+  messageSendingWindowStart?: string;
+  messageSendingWindowEnd?: string;
+  messageDailyLimit?: number;
+  stopFlowOnAnyFutureBooking?: boolean;
+  maxSteps?: number;
+  humanHandoffEnabled?: boolean;
+  humanHandoffClientNumber?: string;
+  humanHandoffInternalNumber?: string;
+  humanHandoffMessageTemplate?: string;
+  humanHandoffSendInternalSummary?: boolean;
+  humanHandoffPauseAi?: boolean;
+  opportunityTrackingEnabled?: boolean;
+  allowOnlyWhitelistedPhonesInBeta?: boolean;
+  betaTestPhones?: string[];
+};
+
+type CrmServiceRule = {
+  id?: number;
+  serviceKey: string;
+  serviceName: string;
+  categoryKey?: string;
+  categoryName?: string;
+  active?: boolean;
+  returnDays?: number | null;
+  useDefaultFlow?: boolean;
+  step1DelayDays?: number | null;
+  step1MessageTemplate?: string;
+  step2DelayDays?: number | null;
+  step2MessageTemplate?: string;
+  step3DelayDays?: number | null;
+  step3MessageTemplate?: string;
+  priority?: "low" | "medium" | "high";
+  notes?: string;
+};
+
+type CrmCategoryRule = {
+  id?: number;
+  categoryKey: string;
+  categoryName: string;
+  opportunityTrackingEnabled?: boolean;
+  opportunityDaysWithoutReturn?: number | null;
+  opportunityPriority?: "low" | "medium" | "high";
+  allowManualCampaign?: boolean;
+  suggestedMessageTemplate?: string;
+  notes?: string;
+};
+
+type CrmClientBlock = {
+  id?: number;
+  clientId?: number | null;
+  clientName?: string;
+  phone: string;
+  isBlocked?: boolean;
+  blockReason?: string;
+  blockNotes?: string;
+  blockedAt?: string;
+  blockedBy?: string;
+  createdAt?: string;
+  updatedAt?: string;
+};
+
+type CrmFlowItem = {
+  id?: number;
+  clientId?: number | null;
+  clientName?: string;
+  phone?: string;
+  originServiceName?: string;
+  originCategoryName?: string;
+  lastVisitAt?: string;
+  lastProfessionalId?: number | null;
+  lastProfessionalName?: string;
+  lastProfessionalActive?: boolean | null;
+  flowStatus?: string;
+  currentStep?: number;
+  enteredFlowAt?: string;
+  lastMessageSentAt?: string;
+  nextScheduledSendAt?: string;
+  stopReason?: string;
+  convertedAppointmentId?: number | null;
+  convertedAt?: string;
+};
+
+type CrmOpportunityItem = {
+  id?: number;
+  clientId?: number | null;
+  clientName?: string;
+  phone?: string;
+  categoryKey?: string;
+  categoryName?: string;
+  sourceServiceName?: string;
+  lastRelevantVisitAt?: string;
+  daysWithoutReturn?: number | null;
+  lastProfessionalId?: number | null;
+  lastProfessionalName?: string;
+  lastProfessionalActive?: boolean | null;
+  opportunityStatus?: string;
+  priority?: "low" | "medium" | "high";
+  owner?: string;
+  notes?: string;
+};
+
+type CrmCatalogService = {
+  serviceKey: string;
+  serviceName: string;
+  categoryKey?: string;
+  categoryName?: string;
+  serviceId?: number | null;
+  durationMinutes?: number | null;
+  price?: number | null;
+  active?: boolean;
+  visibleToClient?: boolean | null;
+  rule?: CrmServiceRule | null;
+};
+
+type CrmDashboard = {
+  settings?: CrmSettings;
+  totals?: Record<string, number>;
+  flowsByStatus?: Record<string, number>;
+  opportunitiesByStatus?: Record<string, number>;
+  topServices?: CrmServiceRule[];
+  topCategories?: CrmCategoryRule[];
+  recentBlocks?: CrmClientBlock[];
+  recentFlows?: CrmFlowItem[];
+  recentOpportunities?: CrmOpportunityItem[];
+};
+
+type CrmPreviewResult = {
+  generatedAt?: string;
+  materialize?: boolean;
+  crmMode?: string;
+  summary?: Record<string, number>;
+  flowCandidates?: Array<Record<string, unknown>>;
+  opportunityCandidates?: Array<Record<string, unknown>>;
+  skipped?: Array<Record<string, unknown>>;
+};
+
 export class AppointmentService {
   private backendUrl: string;
   private establishmentId: string;
@@ -214,16 +354,22 @@ export class AppointmentService {
     });
   }
 
-  async sendMessage(message: string, history: ChatHistoryItem[] = []) {
-    if (!this.establishmentId) {
-      throw new Error("VITE_TRINKS_ESTABLISHMENT_ID nao configurado.");
+  async sendMessage(
+    message: string,
+    history: ChatHistoryItem[] = [],
+    options: { tenantCode?: string } = {},
+  ) {
+    const tenantCode = String(options?.tenantCode || "").trim();
+    if (!this.establishmentId && !tenantCode) {
+      throw new Error("Configure tenantCode da sessao ou VITE_TRINKS_ESTABLISHMENT_ID.");
     }
 
     const response = await fetch(this.getBackendEndpoint("/api/chat"), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        establishmentId: Number(this.establishmentId),
+        ...(this.establishmentId ? { establishmentId: Number(this.establishmentId) } : {}),
+        ...(tenantCode ? { tenantCode } : {}),
         message,
         history,
       }),
@@ -447,12 +593,51 @@ export class AppointmentService {
     return Array.isArray(data.conversations) ? data.conversations : [];
   }
 
+  async getWhatsappConversationsWithAuth(authToken: string) {
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    if (authToken.trim()) {
+      headers["x-admin-token"] = authToken.trim();
+    }
+    const response = await fetch(this.getBackendEndpoint("/api/whatsapp/inbox"), {
+      method: "GET",
+      headers,
+    });
+
+    if (!response.ok) {
+      throw new Error(`Falha ao carregar inbox (${response.status}).`);
+    }
+
+    const data = (await response.json()) as { conversations?: WhatsappConversation[] };
+    return Array.isArray(data.conversations) ? data.conversations : [];
+  }
+
   async getWhatsappMessages(phone: string) {
     const response = await fetch(
       this.getBackendEndpoint(`/api/whatsapp/messages?phone=${encodeURIComponent(phone)}`),
       {
         method: "GET",
         headers: { "Content-Type": "application/json" },
+      },
+    );
+
+    if (!response.ok) {
+      throw new Error(`Falha ao carregar mensagens (${response.status}).`);
+    }
+
+    const data = (await response.json()) as { messages?: WhatsappMessage[] };
+    return Array.isArray(data.messages) ? data.messages : [];
+  }
+
+  async getWhatsappMessagesWithAuth(phone: string, authToken: string) {
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    if (authToken.trim()) {
+      headers["x-admin-token"] = authToken.trim();
+    }
+    const response = await fetch(
+      this.getBackendEndpoint(`/api/whatsapp/messages?phone=${encodeURIComponent(phone)}`),
+      {
+        method: "GET",
+        headers,
       },
     );
 
@@ -487,12 +672,16 @@ export class AppointmentService {
     return response.json();
   }
 
-  async getDbConversations(limit = 100) {
+  async getDbConversations(limit = 100, authToken = "") {
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    if (authToken.trim()) {
+      headers["x-admin-token"] = authToken.trim();
+    }
     const response = await fetch(
       this.getBackendEndpoint(`/api/db/conversations?limit=${encodeURIComponent(String(limit))}`),
       {
         method: "GET",
-        headers: { "Content-Type": "application/json" },
+        headers,
       },
     );
 
@@ -504,14 +693,18 @@ export class AppointmentService {
     return Array.isArray(data.data) ? data.data : [];
   }
 
-  async getDbMessages(phone: string, limit = 300) {
+  async getDbMessages(phone: string, limit = 300, authToken = "") {
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    if (authToken.trim()) {
+      headers["x-admin-token"] = authToken.trim();
+    }
     const response = await fetch(
       this.getBackendEndpoint(
         `/api/db/messages?phone=${encodeURIComponent(phone)}&limit=${encodeURIComponent(String(limit))}`,
       ),
       {
         method: "GET",
-        headers: { "Content-Type": "application/json" },
+        headers,
       },
     );
 
@@ -523,7 +716,10 @@ export class AppointmentService {
     return Array.isArray(data.messages) ? data.messages : [];
   }
 
-  async getAppointmentsAudit(options: { phone?: string; status?: string; limit?: number } = {}) {
+  async getAppointmentsAudit(
+    options: { phone?: string; status?: string; limit?: number } = {},
+    authToken = "",
+  ) {
     const params = new URLSearchParams();
     params.set("limit", String(options.limit ?? 300));
     if (options.phone) {
@@ -533,11 +729,15 @@ export class AppointmentService {
       params.set("status", options.status);
     }
 
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    if (authToken.trim()) {
+      headers["x-admin-token"] = authToken.trim();
+    }
     const response = await fetch(
       this.getBackendEndpoint(`/api/db/appointments-audit?${params.toString()}`),
       {
         method: "GET",
-        headers: { "Content-Type": "application/json" },
+        headers,
       },
     );
 
@@ -549,7 +749,10 @@ export class AppointmentService {
     return Array.isArray(data.data) ? data.data : [];
   }
 
-  async getWebhookEvents(options: { phone?: string; status?: string; reason?: string; limit?: number } = {}) {
+  async getWebhookEvents(
+    options: { phone?: string; status?: string; reason?: string; limit?: number } = {},
+    authToken = "",
+  ) {
     const params = new URLSearchParams();
     params.set("limit", String(options.limit ?? 300));
     if (options.phone) {
@@ -562,11 +765,15 @@ export class AppointmentService {
       params.set("reason", options.reason);
     }
 
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    if (authToken.trim()) {
+      headers["x-admin-token"] = authToken.trim();
+    }
     const response = await fetch(
       this.getBackendEndpoint(`/api/db/webhook-events?${params.toString()}`),
       {
         method: "GET",
-        headers: { "Content-Type": "application/json" },
+        headers,
       },
     );
 
@@ -752,6 +959,146 @@ export class AppointmentService {
       adminToken,
       {
         method: "PUT",
+        body: JSON.stringify(payload),
+      },
+    );
+  }
+
+  async getTenantCrmSettings(adminToken: string, code: string) {
+    return this.adminRequest<{ settings?: CrmSettings }>(
+      `/api/admin/tenants/${encodeURIComponent(code)}/crm/settings`,
+      adminToken,
+      { method: "GET" },
+    );
+  }
+
+  async saveTenantCrmSettings(adminToken: string, code: string, settings: CrmSettings) {
+    return this.adminRequest<{ settings?: CrmSettings }>(
+      `/api/admin/tenants/${encodeURIComponent(code)}/crm/settings`,
+      adminToken,
+      {
+        method: "PUT",
+        body: JSON.stringify({ settings }),
+      },
+    );
+  }
+
+  async getTenantCrmServiceCatalog(adminToken: string, code: string) {
+    return this.adminRequest<{ data?: CrmCatalogService[] }>(
+      `/api/admin/tenants/${encodeURIComponent(code)}/crm/services/catalog`,
+      adminToken,
+      { method: "GET" },
+    );
+  }
+
+  async getTenantCrmServiceRules(adminToken: string, code: string) {
+    return this.adminRequest<{ rules?: CrmServiceRule[] }>(
+      `/api/admin/tenants/${encodeURIComponent(code)}/crm/services/rules`,
+      adminToken,
+      { method: "GET" },
+    );
+  }
+
+  async saveTenantCrmServiceRules(adminToken: string, code: string, rules: CrmServiceRule[]) {
+    return this.adminRequest<{ rules?: CrmServiceRule[] }>(
+      `/api/admin/tenants/${encodeURIComponent(code)}/crm/services/rules`,
+      adminToken,
+      {
+        method: "PUT",
+        body: JSON.stringify({ rules }),
+      },
+    );
+  }
+
+  async getTenantCrmCategoryRules(adminToken: string, code: string) {
+    return this.adminRequest<{ rules?: CrmCategoryRule[] }>(
+      `/api/admin/tenants/${encodeURIComponent(code)}/crm/categories/rules`,
+      adminToken,
+      { method: "GET" },
+    );
+  }
+
+  async saveTenantCrmCategoryRules(adminToken: string, code: string, rules: CrmCategoryRule[]) {
+    return this.adminRequest<{ rules?: CrmCategoryRule[] }>(
+      `/api/admin/tenants/${encodeURIComponent(code)}/crm/categories/rules`,
+      adminToken,
+      {
+        method: "PUT",
+        body: JSON.stringify({ rules }),
+      },
+    );
+  }
+
+  async getTenantCrmBlocks(adminToken: string, code: string) {
+    return this.adminRequest<{ blocks?: CrmClientBlock[] }>(
+      `/api/admin/tenants/${encodeURIComponent(code)}/crm/blocks`,
+      adminToken,
+      { method: "GET" },
+    );
+  }
+
+  async saveTenantCrmBlock(adminToken: string, code: string, payload: CrmClientBlock) {
+    return this.adminRequest<{ block?: CrmClientBlock; blocks?: CrmClientBlock[] }>(
+      `/api/admin/tenants/${encodeURIComponent(code)}/crm/blocks`,
+      adminToken,
+      {
+        method: "POST",
+        body: JSON.stringify(payload),
+      },
+    );
+  }
+
+  async getTenantCrmFlows(
+    adminToken: string,
+    code: string,
+    options: { status?: string; phone?: string; limit?: number } = {},
+  ) {
+    const params = new URLSearchParams();
+    if (options.status) params.set("status", options.status);
+    if (options.phone) params.set("phone", options.phone);
+    if (options.limit != null) params.set("limit", String(options.limit));
+    const suffix = params.toString() ? `?${params.toString()}` : "";
+    return this.adminRequest<{ data?: CrmFlowItem[] }>(
+      `/api/admin/tenants/${encodeURIComponent(code)}/crm/flows${suffix}`,
+      adminToken,
+      { method: "GET" },
+    );
+  }
+
+  async getTenantCrmOpportunities(
+    adminToken: string,
+    code: string,
+    options: { status?: string; limit?: number } = {},
+  ) {
+    const params = new URLSearchParams();
+    if (options.status) params.set("status", options.status);
+    if (options.limit != null) params.set("limit", String(options.limit));
+    const suffix = params.toString() ? `?${params.toString()}` : "";
+    return this.adminRequest<{ data?: CrmOpportunityItem[] }>(
+      `/api/admin/tenants/${encodeURIComponent(code)}/crm/opportunities${suffix}`,
+      adminToken,
+      { method: "GET" },
+    );
+  }
+
+  async getTenantCrmDashboard(adminToken: string, code: string) {
+    return this.adminRequest<{ dashboard?: CrmDashboard }>(
+      `/api/admin/tenants/${encodeURIComponent(code)}/crm/dashboard`,
+      adminToken,
+      { method: "GET" },
+    );
+  }
+
+  async runTenantCrmPreview(
+    adminToken: string,
+    code: string,
+    payload: { lookbackDays?: number; limit?: number; materialize?: boolean } = {},
+  ) {
+    return this.adminRequest<{ preview?: CrmPreviewResult; dashboard?: CrmDashboard }>(
+      `/api/admin/tenants/${encodeURIComponent(code)}/crm/preview-run`,
+      adminToken,
+      {
+        method: "POST",
         body: JSON.stringify(payload),
       },
     );
