@@ -3066,16 +3066,16 @@ function findOpenCrmCategoryOpportunityRow(tenantId, phone, categoryKey) {
   ).get(tenantId, normalizePhone(phone), toNonEmptyString(categoryKey));
 }
 
-function recordCrmFlowEvent({ flowId = null, tenantId, eventType, step = null, metadata = {}, messagePreview = "" }) {
+function recordCrmFlowEvent({ flowId = null, tenantId, eventType, step = null, metadata = {}, messagePreview = "", messageSent = "", replySummary = "", bookingId = null }) {
   if (!tenantId || !eventType) {
     return;
   }
   db.prepare(
     `
       INSERT INTO crm_flow_events (
-        flow_id, tenant_id, event_type, step, message_preview, metadata_json, created_at
+        flow_id, tenant_id, event_type, step, message_preview, message_sent, reply_summary, booking_id, metadata_json, created_at
       )
-      VALUES (?, ?, ?, ?, ?, ?, ?)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `,
   ).run(
     flowId,
@@ -3083,9 +3083,95 @@ function recordCrmFlowEvent({ flowId = null, tenantId, eventType, step = null, m
     toNonEmptyString(eventType),
     Number.isFinite(Number(step)) ? Number(step) : null,
     toNonEmptyString(messagePreview),
+    toNonEmptyString(messageSent),
+    toNonEmptyString(replySummary),
+    bookingId != null ? Number(bookingId) || null : null,
     safeJsonStringify(metadata || {}),
     new Date().toISOString(),
   );
+}
+
+// ---------- CRM Phase 6 helpers ----------
+
+function getActiveCrmFlowForPhone(tenantId, phone) {
+  const normalizedPhone = normalizePhone(phone);
+  if (!normalizedPhone || !tenantId) return null;
+  return db.prepare(
+    `SELECT * FROM crm_return_flows
+     WHERE tenant_id = ? AND phone = ?
+       AND flow_status NOT IN ('converted', 'stopped', 'expired', 'opted_out')
+     ORDER BY datetime(created_at) DESC LIMIT 1`,
+  ).get(tenantId, normalizedPhone) || null;
+}
+
+function updateCrmFlowStatus(flowId, tenantId, updates = {}) {
+  const now = new Date().toISOString();
+  const sets = ["updated_at = ?"];
+  const params = [now];
+  if (updates.flow_status !== undefined) { sets.push("flow_status = ?"); params.push(updates.flow_status); }
+  if (updates.stop_reason !== undefined) { sets.push("stop_reason = ?"); params.push(updates.stop_reason); }
+  if (updates.current_step !== undefined) { sets.push("current_step = ?"); params.push(Number(updates.current_step)); }
+  if (updates.entered_flow_at !== undefined) { sets.push("entered_flow_at = ?"); params.push(updates.entered_flow_at); }
+  if (updates.last_message_sent_at !== undefined) { sets.push("last_message_sent_at = ?"); params.push(updates.last_message_sent_at); }
+  if (updates.next_scheduled_send_at !== undefined) { sets.push("next_scheduled_send_at = ?"); params.push(updates.next_scheduled_send_at); }
+  if (updates.converted_at !== undefined) { sets.push("converted_at = ?"); params.push(updates.converted_at); }
+  if (updates.converted_appointment_id !== undefined) { sets.push("converted_appointment_id = ?"); params.push(updates.converted_appointment_id != null ? Number(updates.converted_appointment_id) || null : null); }
+  params.push(flowId, tenantId);
+  db.prepare(`UPDATE crm_return_flows SET ${sets.join(", ")} WHERE id = ? AND tenant_id = ?`).run(...params);
+}
+
+function getCrmFlowEventsByFlowId(flowId, tenantId) {
+  return db.prepare(
+    `SELECT id, flow_id AS flowId, event_type AS eventType, step,
+            message_preview AS messagePreview, message_sent AS messageSent,
+            reply_summary AS replySummary, booking_id AS bookingId,
+            metadata_json AS metadataJson, created_at AS createdAt
+     FROM crm_flow_events
+     WHERE flow_id = ? AND tenant_id = ?
+     ORDER BY created_at ASC`,
+  ).all(flowId, tenantId).map((row) => ({
+    id: Number(row.id),
+    flowId: Number(row.flowId),
+    eventType: toNonEmptyString(row.eventType),
+    step: row.step != null ? Number(row.step) : null,
+    messagePreview: toNonEmptyString(row.messagePreview),
+    messageSent: toNonEmptyString(row.messageSent),
+    replySummary: toNonEmptyString(row.replySummary),
+    bookingId: row.bookingId != null ? Number(row.bookingId) : null,
+    metadata: parseJsonObjectLoose(row.metadataJson, {}),
+    createdAt: toNonEmptyString(row.createdAt),
+  }));
+}
+
+function getCrmFlowById(flowId, tenantId) {
+  return db.prepare(`SELECT * FROM crm_return_flows WHERE id = ? AND tenant_id = ? LIMIT 1`).get(flowId, tenantId) || null;
+}
+
+function isCrmOptOutText(text) {
+  const n = normalizeForMatch(text);
+  return /\b(nao\s*quero\s*(mais\s*)?(receber|mensagens?)|para\s*de\s*mandar|cancela[rm]?\s*mensagens?|nao\s*me\s*mande|nao\s*quero\s*mais\s*mensagens?|parar\s*mensagens?|remov[ae][rm]?.*(lista|contato)|sair\s*da\s*lista|opt-?out)\b/.test(n);
+}
+
+function formatCrmStepMessage(template, context = {}) {
+  const { clientName = "", serviceName = "", lastVisitAt = "", humanNumber = "" } = context;
+  return String(template || "")
+    .replace(/\{\{client_name\}\}/gi, clientName)
+    .replace(/\{\{service_name\}\}/gi, serviceName)
+    .replace(/\{\{last_visit_at\}\}/gi, lastVisitAt ? isoToBrDate(lastVisitAt) || lastVisitAt : "sua ultima visita")
+    .replace(/\{\{human_number\}\}/gi, humanNumber);
+}
+
+function findVeryRecentBookingAuditForPhone(tenantCode, phone, withinSeconds = 120) {
+  const normalizedPhone = normalizePhone(phone);
+  if (!normalizedPhone || !tenantCode) return null;
+  const cutoff = new Date(Date.now() - withinSeconds * 1000).toISOString();
+  return db.prepare(
+    `SELECT id, appointment_id AS appointmentId, confirmation_code AS confirmationCode
+     FROM appointment_audit
+     WHERE tenant_code = ? AND client_phone = ? AND status = 'success' AND event_type = 'create'
+       AND created_at >= ?
+     ORDER BY created_at DESC LIMIT 1`,
+  ).get(normalizeTenantScopeCode(tenantCode), normalizedPhone, cutoff) || null;
 }
 
 function materializeCrmFlowCandidate(tenant, candidate, crmMode = "beta") {
@@ -6401,7 +6487,7 @@ function historyHasProfessionalContext(history) {
   });
 }
 
-function buildConversationPrompt(history, message, knowledge, customerContext = null, tenantCode = "") {
+function buildConversationPrompt(history, message, knowledge, customerContext = null, tenantCode = "", crmContext = null) {
   const dateContext = getSaoPauloDateContext();
   const relativeDate = detectRelativeDateReference(message, dateContext);
   const knownClientName = clientFirstName(customerContext?.name);
@@ -6413,12 +6499,29 @@ function buildConversationPrompt(history, message, knowledge, customerContext = 
         .join("\n")
     : "";
 
+  const crmLines = [];
+  if (crmContext && typeof crmContext === "object") {
+    crmLines.push("", "Contexto especial - Fluxo CRM de retorno de cliente:");
+    crmLines.push("- Esta cliente esta em um fluxo de recuperacao de agenda do CRM.");
+    if (crmContext.originServiceName) crmLines.push(`- Servico de origem: ${crmContext.originServiceName}`);
+    if (crmContext.originCategoryName) crmLines.push(`- Categoria: ${crmContext.originCategoryName}`);
+    if (crmContext.lastVisitAt) crmLines.push(`- Ultima visita registrada: ${isoToBrDate(crmContext.lastVisitAt) || crmContext.lastVisitAt}`);
+    if (crmContext.currentStep) crmLines.push(`- Etapa atual: ${crmContext.currentStep}`);
+    if (crmContext.lastProfessionalName) {
+      const statusNote = crmContext.lastProfessionalActive === false ? " (profissional INATIVA - nao oferecer como opcao)" : "";
+      crmLines.push(`- Ultimo profissional atendeu: ${crmContext.lastProfessionalName}${statusNote}`);
+    }
+    crmLines.push(`- Objetivo principal: converter esta cliente para um novo agendamento de ${crmContext.originServiceName || "servico adequado"}.`);
+    crmLines.push("- Instrucao especial: priorize oferecer horarios disponiveis e facilitar o agendamento. Seja direto e objetivo.");
+  }
+
   return [
     "Historico da conversa:",
     transcript || "Sem historico anterior.",
     "",
     formatKnowledgeForPrompt(knowledge, tenantCode),
     `- Tenant em atendimento: ${toNonEmptyString(tenantCode) || "nao informado"}`,
+    ...crmLines,
     "",
     "Contexto temporal oficial (usar como verdade):",
     `- Fuso horario: ${dateContext.timeZone}`,
@@ -10033,6 +10136,7 @@ async function sendChatMessage({
   customerContext,
   knowledge: scopedKnowledge = null,
   tenantCode = "",
+  crmContext = null,
 }) {
   const knowledge = scopedKnowledge && typeof scopedKnowledge === "object" && !Array.isArray(scopedKnowledge)
     ? scopedKnowledge
@@ -10404,6 +10508,7 @@ async function sendChatMessage({
       knowledge,
       customerContext || null,
       tenantCode,
+      crmContext,
     ),
   });
 
@@ -12170,6 +12275,134 @@ app.post("/api/admin/tenants/:code/crm/preview-run", async (req, res) => {
       status: "error",
       message: error.message || "Erro ao rodar preview do CRM.",
       details: error.details || null,
+    });
+  }
+});
+
+// CRM Phase 6 routes: flow events, approve, stop
+
+app.get("/api/admin/tenants/:code/crm/flows/:id/events", (req, res) => {
+  try {
+    const principal = requireAdminPrincipal(req, res);
+    if (!principal) return;
+    if (!principalCanAccessTenant(principal, req.params.code)) {
+      return res.status(403).json({ status: "error", message: "Sem permissao para este tenant." });
+    }
+    const tenant = getTenantByCode(req.params.code);
+    if (!tenant) return res.status(404).json({ status: "error", message: "Tenant nao encontrado." });
+    const flowId = Number(req.params.id);
+    if (!flowId) return res.status(400).json({ status: "error", message: "ID invalido." });
+    const events = getCrmFlowEventsByFlowId(flowId, tenant.id);
+    const flow = getCrmFlowById(flowId, tenant.id);
+    return res.json({ status: "ok", flow, events });
+  } catch (error) {
+    return res.status(error.status || 500).json({ status: "error", message: error.message || "Erro." });
+  }
+});
+
+app.post("/api/admin/tenants/:code/crm/flows/:id/approve", async (req, res) => {
+  try {
+    const principal = requireAdminPrincipal(req, res);
+    if (!principal) return;
+    if (!principalCanAccessTenant(principal, req.params.code)) {
+      return res.status(403).json({ status: "error", message: "Sem permissao para este tenant." });
+    }
+    const tenant = getTenantByCode(req.params.code);
+    if (!tenant) return res.status(404).json({ status: "error", message: "Tenant nao encontrado." });
+    const flowId = Number(req.params.id);
+    if (!flowId) return res.status(400).json({ status: "error", message: "ID invalido." });
+    const flow = getCrmFlowById(flowId, tenant.id);
+    if (!flow) return res.status(404).json({ status: "error", message: "Fluxo nao encontrado." });
+    if (!["pending_approval", "scheduled_step_1", "eligible"].includes(flow.flow_status)) {
+      return res.status(400).json({
+        status: "error",
+        message: `Fluxo nao pode ser aprovado no status: ${flow.flow_status}`,
+      });
+    }
+    const crmSettings = getTenantCrmSettingsByCode(req.params.code)?.config || getDefaultCrmSettings();
+    const serviceRule = db.prepare(
+      `SELECT * FROM tenant_service_return_rules WHERE tenant_id = ? AND service_key = ? LIMIT 1`,
+    ).get(tenant.id, flow.origin_service_key);
+    const step1Template = toNonEmptyString(serviceRule?.step1_message_template);
+    const messageToSend = formatCrmStepMessage(
+      step1Template || "Ola {{client_name}}! Faz um tempo que voce nao nos visita para {{service_name}}. Que tal agendar um horario?",
+      {
+        clientName: toNonEmptyString(flow.client_name),
+        serviceName: toNonEmptyString(flow.origin_service_name),
+        lastVisitAt: toNonEmptyString(flow.last_visit_at),
+        humanNumber: toNonEmptyString(crmSettings.humanHandoffClientNumber),
+      },
+    );
+    const instance = resolveEvolutionInstance(null, { tenantCode: req.params.code });
+    if (!instance) {
+      return res.status(500).json({ status: "error", message: "Instancia Evolution nao configurada para este tenant." });
+    }
+    await evolutionRequest(`/message/sendText/${instance}`, {
+      method: "POST",
+      body: { number: flow.phone, text: messageToSend },
+    });
+    const now = new Date().toISOString();
+    const step2DelayDays = Number(serviceRule?.step2_delay_days || 7);
+    const nextSendAt = addDaysToIsoDate(now.slice(0, 10), step2DelayDays) + "T09:00:00";
+    const maxSteps = Number(crmSettings.maxSteps || 3);
+    const nextStatus = maxSteps <= 1 ? "expired" : "scheduled_step_2";
+    updateCrmFlowStatus(flowId, tenant.id, {
+      flow_status: nextStatus,
+      current_step: 1,
+      entered_flow_at: now,
+      last_message_sent_at: now,
+      next_scheduled_send_at: maxSteps <= 1 ? "" : nextSendAt,
+      stop_reason: maxSteps <= 1 ? "exhausted" : "",
+    });
+    recordCrmFlowEvent({
+      flowId,
+      tenantId: tenant.id,
+      eventType: "step_sent",
+      step: 1,
+      messageSent: messageToSend,
+      messagePreview: messageToSend.slice(0, 200),
+    });
+    return res.json({
+      status: "ok",
+      message: "Etapa 1 enviada com sucesso.",
+      nextStatus,
+      messageSent: messageToSend,
+    });
+  } catch (error) {
+    return res.status(error.status || 500).json({
+      status: "error",
+      message: error.message || "Erro ao aprovar fluxo.",
+    });
+  }
+});
+
+app.post("/api/admin/tenants/:code/crm/flows/:id/stop", (req, res) => {
+  try {
+    const principal = requireAdminPrincipal(req, res);
+    if (!principal) return;
+    if (!principalCanAccessTenant(principal, req.params.code)) {
+      return res.status(403).json({ status: "error", message: "Sem permissao para este tenant." });
+    }
+    const tenant = getTenantByCode(req.params.code);
+    if (!tenant) return res.status(404).json({ status: "error", message: "Tenant nao encontrado." });
+    const flowId = Number(req.params.id);
+    if (!flowId) return res.status(400).json({ status: "error", message: "ID invalido." });
+    const stopReason = toNonEmptyString(req.body?.reason) || "manual_stop";
+    updateCrmFlowStatus(flowId, tenant.id, {
+      flow_status: "stopped",
+      stop_reason: stopReason,
+    });
+    recordCrmFlowEvent({
+      flowId,
+      tenantId: tenant.id,
+      eventType: "stopped",
+      metadata: { reason: stopReason, stoppedBy: toNonEmptyString(principal.tenantCode || "admin") },
+    });
+    return res.json({ status: "ok", message: "Fluxo encerrado." });
+  } catch (error) {
+    return res.status(error.status || 500).json({
+      status: "error",
+      message: error.message || "Erro ao encerrar fluxo.",
     });
   }
 });
@@ -13996,6 +14229,84 @@ app.post("/webhook/whatsapp", webhookBodyParser, async (req, res) => {
       }
     }
 
+    // ---- CRM Phase 6: reply detection, opt-out, context injection ----
+    const webhookTenant = webhookTenantCode ? getTenantByCode(webhookTenantCode) : null;
+    const activeCrmFlow = webhookTenant?.id
+      ? getActiveCrmFlowForPhone(webhookTenant.id, incoming.senderNumber)
+      : null;
+    let crmContext = null;
+
+    if (activeCrmFlow) {
+      if (isCrmOptOutText(incoming.messageText)) {
+        updateCrmFlowStatus(activeCrmFlow.id, webhookTenant.id, {
+          flow_status: "opted_out",
+          stop_reason: "opt_out",
+        });
+        recordCrmFlowEvent({
+          flowId: activeCrmFlow.id,
+          tenantId: webhookTenant.id,
+          eventType: "opted_out",
+          replySummary: incoming.messageText.slice(0, 300),
+        });
+        const optOutAck =
+          "Tudo bem! Vou remover voce da nossa lista de comunicacoes. Se quiser agendar no futuro, estaremos aqui.";
+        await evolutionRequest(`/message/sendText/${instance}`, {
+          method: "POST",
+          body: { number: incoming.senderNumber, text: optOutAck },
+        });
+        pushWhatsappHistory(incoming.senderNumber, "assistant", optOutAck, "", {
+          tenantCode: webhookTenantCode,
+        });
+        recordWebhookEvent({
+          tenantCode: webhookTenantCode,
+          event: incoming.event,
+          instanceName: instance,
+          senderRaw: incoming.senderRaw,
+          senderNumber: incoming.senderNumber,
+          senderName: effectiveClientName,
+          messageId: incoming.messageId,
+          messageType: incoming.messageType,
+          messageText: incoming.messageText,
+          status: "processed",
+          reason: "crmOptOut",
+        });
+        return res.status(200).json({
+          received: true,
+          processed: true,
+          reason: "crmOptOut",
+          instance,
+          to: incoming.senderNumber,
+          event: incoming.event || null,
+          messageId: incoming.messageId || null,
+        });
+      }
+
+      recordCrmFlowEvent({
+        flowId: activeCrmFlow.id,
+        tenantId: webhookTenant.id,
+        eventType: "reply",
+        step: activeCrmFlow.current_step || null,
+        replySummary: incoming.messageText.slice(0, 300),
+      });
+
+      const scheduledCrmStatuses = ["scheduled_step_1", "scheduled_step_2", "scheduled_step_3", "pending_approval"];
+      if (scheduledCrmStatuses.includes(activeCrmFlow.flow_status)) {
+        updateCrmFlowStatus(activeCrmFlow.id, webhookTenant.id, { flow_status: "in_progress" });
+      }
+
+      crmContext = {
+        originServiceName: toNonEmptyString(activeCrmFlow.origin_service_name),
+        originCategoryName: toNonEmptyString(activeCrmFlow.origin_category_name),
+        lastVisitAt: toNonEmptyString(activeCrmFlow.last_visit_at),
+        currentStep: Number(activeCrmFlow.current_step) || 0,
+        lastProfessionalName: toNonEmptyString(activeCrmFlow.last_professional_name),
+        lastProfessionalActive: activeCrmFlow.last_professional_active == null
+          ? null
+          : Number(activeCrmFlow.last_professional_active) !== 0,
+      };
+    }
+    // ---- end CRM pre-processing ----
+
     const answerPayload = await sendChatMessage({
       establishmentId,
       message: incoming.messageText,
@@ -14008,7 +14319,39 @@ app.post("/webhook/whatsapp", webhookBodyParser, async (req, res) => {
       },
       knowledge: conversationContext.knowledge,
       tenantCode: conversationContext.tenantCode,
+      crmContext,
     });
+
+    // ---- CRM Phase 6: conversion detection ----
+    if (activeCrmFlow && webhookTenant?.id) {
+      try {
+        const recentBooking = findVeryRecentBookingAuditForPhone(
+          webhookTenantCode,
+          incoming.senderNumber,
+          180,
+        );
+        if (recentBooking) {
+          updateCrmFlowStatus(activeCrmFlow.id, webhookTenant.id, {
+            flow_status: "converted",
+            converted_at: new Date().toISOString(),
+            converted_appointment_id: recentBooking.appointmentId ? Number(recentBooking.appointmentId) : null,
+            stop_reason: "",
+          });
+          recordCrmFlowEvent({
+            flowId: activeCrmFlow.id,
+            tenantId: webhookTenant.id,
+            eventType: "converted",
+            step: Number(activeCrmFlow.current_step) || null,
+            bookingId: recentBooking.appointmentId ? Number(recentBooking.appointmentId) : null,
+            metadata: { confirmationCode: recentBooking.confirmationCode || "" },
+          });
+        }
+      } catch (crmConvertError) {
+        console.error("[crm] conversion detection error:", crmConvertError?.message);
+      }
+    }
+    // ---- end CRM conversion detection ----
+
     let answer = toNonEmptyString(answerPayload?.text || answerPayload);
     const marketingMedia = answerPayload?.marketingMedia && typeof answerPayload.marketingMedia === "object"
       ? answerPayload.marketingMedia
@@ -14182,5 +14525,78 @@ app.use((error, req, res, next) => {
 app.listen(port, () => {
   console.log(`Backend online em http://localhost:${port}`);
 });
+
+// CRM return-flow scheduler: sends steps 2 and 3 automatically
+async function runCrmReturnFlowScheduler() {
+  try {
+    const tenants = listTenants({ includeInactive: false });
+    for (const tenant of tenants) {
+      if (!tenant.id || !tenant.code) continue;
+      const settings = getTenantCrmSettingsByCode(tenant.code)?.config;
+      if (!settings?.crmReturnEnabled) continue;
+      const nowIso = new Date().toISOString();
+      const dueFlows = db.prepare(
+        `SELECT * FROM crm_return_flows
+         WHERE tenant_id = ?
+           AND flow_status IN ('scheduled_step_2', 'scheduled_step_3')
+           AND next_scheduled_send_at IS NOT NULL AND next_scheduled_send_at != ''
+           AND next_scheduled_send_at <= ?
+         LIMIT 50`,
+      ).all(tenant.id, nowIso);
+      if (!dueFlows.length) continue;
+      const instance = resolveEvolutionInstance(null, { tenantCode: tenant.code });
+      if (!instance) continue;
+      for (const flow of dueFlows) {
+        try {
+          const stepNumber = flow.flow_status === "scheduled_step_2" ? 2 : 3;
+          const serviceRule = db.prepare(
+            `SELECT * FROM tenant_service_return_rules WHERE tenant_id = ? AND service_key = ? LIMIT 1`,
+          ).get(tenant.id, flow.origin_service_key);
+          const template = toNonEmptyString(
+            stepNumber === 2 ? serviceRule?.step2_message_template : serviceRule?.step3_message_template,
+          );
+          const msg = formatCrmStepMessage(
+            template || "Ola {{client_name}}! Passamos para lembrar que voce pode agendar seu {{service_name}} conosco.",
+            {
+              clientName: toNonEmptyString(flow.client_name),
+              serviceName: toNonEmptyString(flow.origin_service_name),
+              lastVisitAt: toNonEmptyString(flow.last_visit_at),
+              humanNumber: toNonEmptyString(settings.humanHandoffClientNumber),
+            },
+          );
+          await evolutionRequest(`/message/sendText/${instance}`, {
+            method: "POST",
+            body: { number: flow.phone, text: msg },
+          });
+          const maxSteps = Number(settings.maxSteps || 3);
+          const isLast = stepNumber >= maxSteps;
+          const step3DelayDays = Number(serviceRule?.step3_delay_days || 14);
+          const nextAt = addDaysToIsoDate(nowIso.slice(0, 10), step3DelayDays) + "T09:00:00";
+          updateCrmFlowStatus(flow.id, tenant.id, {
+            flow_status: isLast ? "expired" : "scheduled_step_3",
+            current_step: stepNumber,
+            last_message_sent_at: nowIso,
+            next_scheduled_send_at: isLast ? "" : nextAt,
+            stop_reason: isLast ? "exhausted" : "",
+          });
+          recordCrmFlowEvent({
+            flowId: flow.id,
+            tenantId: tenant.id,
+            eventType: "step_sent",
+            step: stepNumber,
+            messageSent: msg,
+            messagePreview: msg.slice(0, 200),
+          });
+        } catch (innerErr) {
+          console.error(`[crm-scheduler] flow ${flow.id} step error:`, innerErr?.message);
+        }
+      }
+    }
+  } catch (err) {
+    console.error("[crm-scheduler] error:", err?.message);
+  }
+}
+
+setInterval(runCrmReturnFlowScheduler, 5 * 60 * 1000);
 
 

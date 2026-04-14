@@ -220,6 +220,21 @@ type CrmFlowItem = {
   flowStatus?: string;
   currentStep?: number;
   stopReason?: string;
+  lastMessageSentAt?: string;
+  convertedAt?: string;
+};
+
+type CrmFlowEvent = {
+  id?: number;
+  flowId?: number;
+  eventType?: string;
+  step?: number | null;
+  messagePreview?: string;
+  messageSent?: string;
+  replySummary?: string;
+  bookingId?: number | null;
+  metadata?: Record<string, unknown>;
+  createdAt?: string;
 };
 
 type CrmOpportunityItem = {
@@ -513,6 +528,9 @@ export default function App() {
   const [crmPreview, setCrmPreview] = useState<CrmPreviewResult | null>(null);
   const [crmStatus, setCrmStatus] = useState('');
   const [isLoadingCrm, setIsLoadingCrm] = useState(false);
+  const [expandedFlowId, setExpandedFlowId] = useState<number | null>(null);
+  const [crmFlowEvents, setCrmFlowEvents] = useState<Record<number, CrmFlowEvent[]>>({});
+  const [crmFlowActionLoading, setCrmFlowActionLoading] = useState<number | null>(null);
   const [crmPreviewLookbackDays, setCrmPreviewLookbackDays] = useState(365);
   const [crmBlockPhone, setCrmBlockPhone] = useState('');
   const [crmBlockClientName, setCrmBlockClientName] = useState('');
@@ -1870,6 +1888,60 @@ export default function App() {
     }
   };
 
+  const handleApproveCrmFlow = async (flowId: number) => {
+    if (!appointmentService.current || !adminToken.trim()) return;
+    const tenantCode = resolveCrmTenantScopeCode();
+    if (!tenantCode || !flowId) return;
+    setCrmFlowActionLoading(flowId);
+    setCrmStatus('');
+    try {
+      const response = await appointmentService.current.approveCrmFlow(adminToken, tenantCode, flowId);
+      setCrmStatus(`Etapa 1 enviada: ${response.messageSent || 'ok'}`);
+      await loadCrmData();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Erro ao aprovar fluxo.';
+      setCrmStatus(message);
+    } finally {
+      setCrmFlowActionLoading(null);
+    }
+  };
+
+  const handleStopCrmFlow = async (flowId: number) => {
+    if (!appointmentService.current || !adminToken.trim()) return;
+    const tenantCode = resolveCrmTenantScopeCode();
+    if (!tenantCode || !flowId) return;
+    setCrmFlowActionLoading(flowId);
+    setCrmStatus('');
+    try {
+      await appointmentService.current.stopCrmFlow(adminToken, tenantCode, flowId);
+      setCrmStatus('Fluxo encerrado.');
+      await loadCrmData();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Erro ao encerrar fluxo.';
+      setCrmStatus(message);
+    } finally {
+      setCrmFlowActionLoading(null);
+    }
+  };
+
+  const handleToggleCrmFlowEvents = async (flowId: number) => {
+    if (expandedFlowId === flowId) {
+      setExpandedFlowId(null);
+      return;
+    }
+    setExpandedFlowId(flowId);
+    if (crmFlowEvents[flowId]) return;
+    if (!appointmentService.current || !adminToken.trim()) return;
+    const tenantCode = resolveCrmTenantScopeCode();
+    if (!tenantCode) return;
+    try {
+      const response = await appointmentService.current.getCrmFlowEvents(adminToken, tenantCode, flowId);
+      setCrmFlowEvents((prev) => ({ ...prev, [flowId]: response.events || [] }));
+    } catch {
+      setCrmFlowEvents((prev) => ({ ...prev, [flowId]: [] }));
+    }
+  };
+
   const selectedAdminTenant = adminTenants.find((item) => item.code === selectedAdminTenantCode) || null;
   const isSuperAdminSession = adminPrincipal?.role === 'superadmin';
   const isTenantSession = adminPrincipal?.role === 'tenant';
@@ -2943,18 +3015,76 @@ export default function App() {
                     <p className="text-sm uppercase tracking-wider text-white/70 mb-3">Fluxos Atuais</p>
                     <div className="space-y-2 max-h-[320px] overflow-y-auto pr-1">
                       {!crmFlows.length && <p className="text-sm text-white/60">Ainda nao existem fluxos operacionais criados.</p>}
-                      {crmFlows.map((item) => (
-                        <div key={`crm-flow-${item.id || item.phone}`} className="rounded-lg bg-white/5 border border-white/10 p-3">
-                          <div className="text-sm text-white">{item.clientName || item.phone || 'Cliente sem nome'}</div>
-                          <div className="text-xs text-white/60">
-                            {item.originServiceName || 'sem servico'} | etapa {item.currentStep || 0} | {item.flowStatus || 'sem status'}
+                      {crmFlows.map((item) => {
+                        const flowId = item.id ?? 0;
+                        const isExpanded = expandedFlowId === flowId;
+                        const isActionable = ['pending_approval', 'eligible', 'scheduled_step_1'].includes(item.flowStatus || '');
+                        const isStoppable = !['converted', 'stopped', 'expired', 'opted_out'].includes(item.flowStatus || '');
+                        const isLoadingThis = crmFlowActionLoading === flowId;
+                        return (
+                          <div key={`crm-flow-${flowId || item.phone}`} className="rounded-lg bg-white/5 border border-white/10 p-3 space-y-2">
+                            <div className="flex items-start justify-between gap-2">
+                              <div className="min-w-0 flex-1">
+                                <div className="text-sm text-white">{item.clientName || item.phone || 'Cliente sem nome'}</div>
+                                <div className="text-xs text-white/60">
+                                  {item.originServiceName || 'sem servico'} | etapa {item.currentStep || 0} | {item.flowStatus || 'sem status'}
+                                </div>
+                                <div className="text-xs text-white/75">
+                                  Ultimo profissional: {item.lastProfessionalName || 'nao informado'}
+                                  {item.lastProfessionalActive === false ? ' (inativo)' : ''}
+                                </div>
+                              </div>
+                              <div className="flex gap-1 flex-shrink-0">
+                                {isActionable && flowId > 0 && (
+                                  <button
+                                    onClick={() => handleApproveCrmFlow(flowId)}
+                                    disabled={isLoadingThis}
+                                    className="px-2 py-1 rounded bg-green-600/80 text-white text-xs disabled:opacity-50"
+                                    title="Enviar etapa 1 e aprovar fluxo"
+                                  >
+                                    {isLoadingThis ? '...' : 'Aprovar'}
+                                  </button>
+                                )}
+                                {isStoppable && flowId > 0 && (
+                                  <button
+                                    onClick={() => handleStopCrmFlow(flowId)}
+                                    disabled={isLoadingThis}
+                                    className="px-2 py-1 rounded bg-red-600/70 text-white text-xs disabled:opacity-50"
+                                    title="Encerrar este fluxo"
+                                  >
+                                    {isLoadingThis ? '...' : 'Parar'}
+                                  </button>
+                                )}
+                                {flowId > 0 && (
+                                  <button
+                                    onClick={() => handleToggleCrmFlowEvents(flowId)}
+                                    className="px-2 py-1 rounded bg-white/10 text-white/70 text-xs"
+                                    title="Ver historico de eventos"
+                                  >
+                                    {isExpanded ? '▲' : '▼'}
+                                  </button>
+                                )}
+                              </div>
+                            </div>
+                            {isExpanded && (
+                              <div className="border-t border-white/10 pt-2 space-y-1">
+                                {(crmFlowEvents[flowId] || []).length === 0 && (
+                                  <p className="text-xs text-white/50">Sem eventos registrados.</p>
+                                )}
+                                {(crmFlowEvents[flowId] || []).map((evt, idx) => (
+                                  <div key={idx} className="text-xs text-white/70 flex gap-2">
+                                    <span className="text-white/40 flex-shrink-0">{evt.createdAt?.slice(0, 16).replace('T', ' ')}</span>
+                                    <span className="uppercase tracking-wide text-white/60">{evt.eventType}</span>
+                                    {evt.step != null && <span>etapa {evt.step}</span>}
+                                    {evt.replySummary && <span className="truncate italic">{evt.replySummary}</span>}
+                                    {evt.messageSent && !evt.replySummary && <span className="truncate">{evt.messageSent.slice(0, 80)}</span>}
+                                  </div>
+                                ))}
+                              </div>
+                            )}
                           </div>
-                          <div className="text-xs text-white/75 mt-1">
-                            Ultimo profissional: {item.lastProfessionalName || 'nao informado'}
-                            {item.lastProfessionalActive === false ? ' (inativo)' : ''}
-                          </div>
-                        </div>
-                      ))}
+                        );
+                      })}
                     </div>
                   </div>
 
