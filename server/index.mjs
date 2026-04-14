@@ -13039,6 +13039,96 @@ app.get("/api/admin/tenants/:code/crm/dashboard", (req, res) => {
   }
 });
 
+// Backfill appointment_audit from Trinks historical data — populates CRM with real client base
+app.post("/api/admin/tenants/:code/crm/sync-history", async (req, res) => {
+  try {
+    const principal = requireAdminPrincipal(req, res);
+    if (!principal) {
+      return;
+    }
+    if (!principalCanAccessTenant(principal, req.params.code)) {
+      return res.status(403).json({ status: "error", message: "Sem permissao para este tenant." });
+    }
+
+    const tenantCode = normalizeTenantScopeCode(req.params.code);
+    const tenant = getTenantByCode(tenantCode);
+    if (!tenant) {
+      return res.status(404).json({ status: "error", message: "Tenant nao encontrado." });
+    }
+
+    const lookbackDays = Math.min(Math.max(Number(req.body?.lookbackDays || 365), 7), 730);
+    const limit = Math.min(Math.max(Number(req.body?.limit || 2000), 50), 5000);
+
+    // Pull ALL services from Trinks — no service rule filter — so every client enters audit
+    const rows = await queryRecentTenantAppointmentsFromTrinks(tenant, {
+      lookbackDays,
+      limit,
+      serviceRules: [],
+    });
+
+    // Build set of appointment_ids already in audit (from previous backfills) to avoid duplicates
+    const existingIds = new Set(
+      db.prepare(
+        "SELECT appointment_id FROM appointment_audit WHERE tenant_code = ? AND event_type = 'trinks_backfill' AND appointment_id IS NOT NULL",
+      ).all(tenantCode).map((r) => Number(r.appointment_id)),
+    );
+
+    const insertStmt = db.prepare(`
+      INSERT INTO appointment_audit (
+        tenant_code, event_type, status, establishment_id, appointment_id,
+        client_phone, client_name, service_name, professional_name,
+        appointment_date, appointment_time, created_at
+      ) VALUES (?, 'trinks_backfill', 'success', ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+
+    let inserted = 0;
+    let skipped = 0;
+    const insertMany = db.transaction((items) => {
+      for (const row of items) {
+        if (!row.clientPhone || !row.serviceName) {
+          skipped += 1;
+          continue;
+        }
+        const apptId = row.id ? Number(row.id) : null;
+        if (apptId && existingIds.has(apptId)) {
+          skipped += 1;
+          continue;
+        }
+        insertStmt.run(
+          tenantCode,
+          row.establishmentId ? Number(row.establishmentId) : null,
+          apptId,
+          normalizePhone(row.clientPhone),
+          String(row.clientName || ""),
+          String(row.serviceName || ""),
+          String(row.professionalName || ""),
+          String(row.appointmentDate || ""),
+          String(row.appointmentTime || ""),
+          new Date().toISOString(),
+        );
+        inserted += 1;
+        if (apptId) existingIds.add(apptId);
+      }
+    });
+    insertMany(rows);
+
+    console.log(`[crm-sync-history] tenant=${tenantCode} fetched=${rows.length} inserted=${inserted} skipped=${skipped}`);
+
+    return res.json({
+      status: "ok",
+      tenantCode,
+      fetched: rows.length,
+      inserted,
+      skipped,
+      lookbackDays,
+      message: `Historico sincronizado. ${inserted} novos registros inseridos no appointment_audit.`,
+    });
+  } catch (error) {
+    console.error("[crm-sync-history] error:", error?.message || error);
+    return res.status(500).json({ status: "error", message: error?.message || "Erro interno." });
+  }
+});
+
 app.post("/api/admin/tenants/:code/crm/preview-run", async (req, res) => {
   try {
     const principal = requireAdminPrincipal(req, res);
