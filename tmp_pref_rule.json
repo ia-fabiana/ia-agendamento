@@ -1,0 +1,12 @@
+﻿{
+  "establishmentId": 62260,
+  "message": "Sim, Fabiana",
+  "history": [
+    {"role": "user", "content": "Olá\nGostaria de agendar um horário para fazer escova dia 01 de abril às 12:00 hs"},
+    {"role": "assistant", "content": "Perfeito, Juliana. Antes de eu sugerir os horarios, voce tem preferencia por alguma profissional?"}
+  ],
+  "customerContext": {
+    "name": "JULIANA CAMPOS",
+    "phone": "5511996373419"
+  }
+}

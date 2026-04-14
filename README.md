@@ -44,8 +44,17 @@ TRINKS_API_KEY=sua_chave_trinks
 EVOLUTION_API_BASE_URL=https://api.iafabiana.com.br
 EVOLUTION_API_KEY=sua_chave_evolution
 EVOLUTION_INSTANCE=nome_da_instancia
+KNOWLEDGE_ADMIN_TOKEN=token_admin_forte
+STRICT_TEST_BOOKING_GUARD_ENABLED=true
+TEST_BOOKING_MARKER=#TESTE
+INTERNAL_TEST_PHONES=5511999999999,5511888888888
 PORT=3001
 ```
+
+Regras de seguranca para testes de agendamento:
+- Se a mensagem/requisicao indicar teste (ex: `#TESTE`), o backend bloqueia criacao sem autorizacao valida de admin.
+- Para liberar um teste, envie `testAuthorization` com `approved=true`, `approvedBy` e `reason`, junto de credencial admin (`X-Admin-Token` ou sessao autenticada de tenant).
+- Sem autorizacao valida, o backend retorna `blocked_requires_admin_authorization`.
 
 2. Rode o backend em outro terminal:
 
@@ -149,3 +158,33 @@ Importante: como a Vercel serve em HTTPS, o backend também precisa estar em HTT
 - Edite o arquivo [server/salonKnowledge.json](server/salonKnowledge.json) para ensinar respostas comerciais (servicos, politicas, FAQ, horarios e contatos).
 - O backend carrega esse arquivo em cada mensagem da IA no endpoint de chat.
 - Sempre que atualizar o JSON, a IA passa a usar o novo conteudo sem alterar o frontend.
+
+## Multi-salao (tenant) sem duplicar projeto
+- O backend ja suporta multiplos saloes via tabela `tenants` + identificadores (`tenant_identifiers`) + provider por tenant (`tenant_provider_configs`).
+- Para subir o segundo salao, mantenha o mesmo projeto e cadastre um novo tenant.
+
+### Bootstrap rapido por arquivo JSON
+1. Copie [server/tenants/bootstrap.example.json](server/tenants/bootstrap.example.json) para um novo arquivo (exemplo: `server/tenants/jacques-vsf.bootstrap.json`).
+2. Preencha:
+- `tenant.code`, `tenant.name`, `tenant.establishmentId`
+- `knowledge` (conteudo exclusivo do salao)
+- `identifiers` (ex.: `evolution_instance` da unidade)
+- `providerConfigs` (`trinks` ou `google_calendar`)
+- `users` (usuario admin do tenant)
+3. Rode em modo simulacao:
+
+```bash
+npm run tenant:upsert -- --file server/tenants/jacques-vsf.bootstrap.json --dry-run
+```
+
+4. Persista no banco:
+
+```bash
+npm run tenant:upsert -- --file server/tenants/jacques-vsf.bootstrap.json
+```
+
+5. Valide no painel Admin (`/admin`) ou pela API `GET /api/admin/tenants?withDetails=true`.
+
+### Regra de ouro para escalar com seguranca
+- Diferenca de comportamento entre saloes = mudar `knowledge`/regras/config do tenant.
+- Mudanca de motor (fluxo global) = mudar o core uma vez para todos.

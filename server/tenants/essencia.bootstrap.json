@@ -1,0 +1,212 @@
+{
+  "tenant": {
+    "code": "essencia",
+    "name": "Essencia Instituto de Beleza",
+    "segment": "salao",
+    "active": true,
+    "defaultProvider": "trinks",
+    "establishmentId": 62217
+  },
+  "knowledge": {
+    "identity": {
+      "brandName": "Essencia Instituto de Beleza",
+      "assistantName": "Rebeka",
+      "toneGuide": "acolhedor, transparente, objetivo, grato",
+      "toneOptions": [
+        "acolhedor",
+        "objetivo"
+      ],
+      "toneCustom": "transparente, grato"
+    },
+    "business": {
+      "address": "R. Dr. Paulo Ferraz da Costa Aguiar, 1603 - Vila Sao Francisco",
+      "phone": "551136823002",
+      "openingHours": "Atendimento com agenda ativa para Claudia e Mari (consulte horarios no momento do pedido)",
+      "paymentMethods": [
+        "PIX",
+        "Cartao de credito",
+        "Cartao de debito"
+      ],
+      "allowedProfessionals": [
+        "Claudia",
+        "Mari"
+      ]
+    },
+    "policies": {
+      "latePolicy": "Atendimento com agenda reduzida. Recomendamos pontualidade para preservar os horarios.",
+      "cancellationPolicy": "Cancelamentos e remarcacoes com antecedencia ajudam a reorganizar a agenda da Claudia e da Mari.",
+      "noShowPolicy": "Faltas sem aviso podem impactar novos encaixes na agenda atual."
+    },
+    "services": [
+      {
+        "name": "Corte Feminino",
+        "durationMinutes": 60,
+        "price": "a partir de 215"
+      },
+      {
+        "name": "Corte Masculino",
+        "durationMinutes": 30,
+        "price": "a partir de 120"
+      },
+      {
+        "name": "Escova Curta",
+        "durationMinutes": 30,
+        "price": "a partir de 88"
+      },
+      {
+        "name": "Escova Media",
+        "durationMinutes": 30,
+        "price": "a partir de 99"
+      },
+      {
+        "name": "Escova Longa",
+        "durationMinutes": 30,
+        "price": "a partir de 110"
+      },
+      {
+        "name": "Coloracao Curta",
+        "durationMinutes": 60,
+        "price": "a partir de 413"
+      },
+      {
+        "name": "Coloracao Media",
+        "durationMinutes": 60,
+        "price": "a partir de 482"
+      },
+      {
+        "name": "Coloracao Longa",
+        "durationMinutes": 60,
+        "price": "a partir de 592"
+      },
+      {
+        "name": "Tonalizante Curto",
+        "durationMinutes": 45,
+        "price": "a partir de 393"
+      },
+      {
+        "name": "Tonalizante Medio",
+        "durationMinutes": 45,
+        "price": "a partir de 481"
+      },
+      {
+        "name": "Tonalizante Longo",
+        "durationMinutes": 45,
+        "price": "a partir de 613"
+      },
+      {
+        "name": "Reflexo Curto",
+        "durationMinutes": 60,
+        "price": "a partir de 506"
+      },
+      {
+        "name": "Reflexo Medio",
+        "durationMinutes": 60,
+        "price": "a partir de 644"
+      },
+      {
+        "name": "Reflexo Longo",
+        "durationMinutes": 60,
+        "price": "a partir de 748"
+      },
+      {
+        "name": "Hidratacao",
+        "durationMinutes": 30,
+        "price": "a partir de 220"
+      },
+      {
+        "name": "Reconstrucao Capilar",
+        "durationMinutes": 60,
+        "price": "a partir de 314"
+      },
+      {
+        "name": "Botox / Progressiva",
+        "durationMinutes": 60,
+        "price": "a partir de 660"
+      },
+      {
+        "name": "Maquiagem",
+        "durationMinutes": 60,
+        "price": "a partir de 286"
+      },
+      {
+        "name": "Maquiagem com Cilios",
+        "durationMinutes": 60,
+        "price": "a partir de 374"
+      },
+      {
+        "name": "Penteado Preso",
+        "durationMinutes": 30,
+        "price": "a partir de 292"
+      },
+      {
+        "name": "Penteado Semi-preso",
+        "durationMinutes": 60,
+        "price": "a partir de 259"
+      },
+      {
+        "name": "Manicure",
+        "durationMinutes": 30,
+        "price": "sob consulta"
+      },
+      {
+        "name": "Pedicure",
+        "durationMinutes": 30,
+        "price": "sob consulta"
+      }
+    ],
+    "faq": [
+      {
+        "question": "A unidade Essencia encerrou as atividades?",
+        "answer": "Sim. A unidade encerrou as atividades com muita gratidao por 20 anos de historia."
+      },
+      {
+        "question": "Quem atende atualmente pelo Essencia?",
+        "answer": "No momento, seguimos com atendimento da Claudia e da Mari enquanto a nova fase delas fica pronta."
+      },
+      {
+        "question": "Posso agendar com outros profissionais por este numero?",
+        "answer": "Agora eu nao consigo confirmar agenda ou contato de outros profissionais por este canal."
+      },
+      {
+        "question": "Qual telefone para falar com voces?",
+        "answer": "Telefone: (11) 3682-3002. WhatsApp: (11) 98951-3465."
+      },
+      {
+        "question": "Como agendar com Claudia e Mari?",
+        "answer": "Me diga o servico desejado, data e horario preferido que eu verifico disponibilidade e sigo com seu agendamento."
+      }
+    ],
+    "marketing": {
+      "enabled": false,
+      "actions": []
+    }
+  },
+  "identifiers": [
+    {
+      "kind": "evolution_instance",
+      "value": "essencia"
+    },
+    {
+      "kind": "evolution_number",
+      "value": "5511989513465"
+    }
+  ],
+  "providerConfigs": {
+    "trinks": {
+      "enabled": true,
+      "config": {}
+    },
+    "google_calendar": {
+      "enabled": false,
+      "config": {}
+    }
+  },
+  "users": [
+    {
+      "username": "admin.essencia",
+      "displayName": "Admin Essencia",
+      "password": "S$LgqJmcxBTgmcR%sG",
+      "active": true
+    }
+  ]
+}

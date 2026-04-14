@@ -1,7 +1,12 @@
 {
   "identity": {
     "brandName": "Jacques Janine Vila Leopoldina",
-    "toneGuide": "sofisticado, acolhedor, objetivo"
+    "toneGuide": "sofisticado, acolhedor, objetivo",
+    "toneOptions": [
+      "sofisticado",
+      "acolhedor",
+      "objetivo"
+    ]
   },
   "business": {
     "address": "Rua Carlos Weber 1048 - Vila Leopoldina - São Paulo ",

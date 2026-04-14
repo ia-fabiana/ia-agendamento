@@ -617,6 +617,8 @@ export default function App() {
   const [crmServiceSearch, setCrmServiceSearch] = useState('');
   const [crmServiceCategoryFilter, setCrmServiceCategoryFilter] = useState('all');
   const [crmShowOnlySelectedServices, setCrmShowOnlySelectedServices] = useState(true);
+  const [crmDiagnostic, setCrmDiagnostic] = useState<any>(null);
+  const [crmDiagnosticLoading, setCrmDiagnosticLoading] = useState(false);
   const [uploadingMarketingIndex, setUploadingMarketingIndex] = useState<number | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const appointmentService = useRef<AppointmentService | null>(null);
@@ -2020,6 +2022,24 @@ export default function App() {
     }
   };
 
+  const handleSendCrmFlowNow = async (flowId: number) => {
+    if (!appointmentService.current || !adminToken.trim()) return;
+    const tenantCode = resolveCrmTenantScopeCode();
+    if (!tenantCode || !flowId) return;
+    setCrmFlowActionLoading(flowId);
+    setCrmStatus('');
+    try {
+      const response = await appointmentService.current.sendCrmFlowNow(adminToken, tenantCode, flowId);
+      setCrmStatus(response.message || 'Etapa enviada.');
+      await loadCrmData();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Erro ao enviar etapa do fluxo.';
+      setCrmStatus(message);
+    } finally {
+      setCrmFlowActionLoading(null);
+    }
+  };
+
   const handleStopCrmFlow = async (flowId: number) => {
     if (!appointmentService.current || !adminToken.trim()) return;
     const tenantCode = resolveCrmTenantScopeCode();
@@ -2706,7 +2726,7 @@ export default function App() {
                       disabled={isLoadingCrm || !adminToken.trim()}
                       className="px-4 py-2 rounded-lg bg-brand-blue text-white text-xs uppercase tracking-wider disabled:opacity-50"
                     >
-                      Materializar
+                      Aplicar preview
                     </button>
                     <button
                       onClick={handleRefreshCrmEligibleNow}
@@ -2721,7 +2741,7 @@ export default function App() {
                       disabled={isLoadingCrm || !adminToken.trim()}
                       className="px-4 py-2 rounded-lg bg-white/10 text-white text-xs uppercase tracking-wider disabled:opacity-50"
                     >
-                      {isLoadingCrm ? 'Atualizando...' : 'Atualizar CRM'}
+                      {isLoadingCrm ? 'Atualizando...' : 'Recarregar tela'}
                     </button>
                     <button
                       onClick={handleSaveCrmSettings}
@@ -2734,6 +2754,9 @@ export default function App() {
                 </div>
 
                 {crmStatus && <p className="text-xs text-brand-green">{crmStatus}</p>}
+                <p className="text-[11px] text-white/50 -mt-1">
+                  `Preview beta` simula. `Aplicar preview` grava o que saiu no preview. `Atualizar elegiveis` recalcula e grava na hora. `Recarregar tela` apenas atualiza a lista ja salva.
+                </p>
 
                 {crmPreview && (
                   <div className="rounded-xl bg-white/5 border border-white/10 p-4 space-y-4">
@@ -3118,6 +3141,89 @@ export default function App() {
                       </tbody>
                     </table>
                   </div>
+
+                  <div className="rounded-lg border border-white/10 bg-white/5 p-3 space-y-2">
+                    <div className="flex items-center justify-between gap-3 flex-wrap">
+                      <p className="text-xs uppercase tracking-wider text-white/60">Diagnosticar Serviços</p>
+                      <button
+                        onClick={async () => {
+                          if (!adminToken.trim() || !sessionTenantCode) return;
+                          setCrmDiagnosticLoading(true);
+                          try {
+                            const response = await fetch(
+                              `${import.meta.env.VITE_BACKEND_URL}/api/admin/tenants/${sessionTenantCode}/crm/diagnostic`,
+                              {
+                                method: 'GET',
+                                headers: {
+                                  'Authorization': `Bearer ${adminToken}`,
+                                  'Content-Type': 'application/json',
+                                },
+                              }
+                            );
+                            const result = await response.json();
+                            if (result.status === 'ok') {
+                              setCrmDiagnostic(result);
+                            } else {
+                              setAdminMessage(`Erro: ${result.message}`);
+                            }
+                          } catch (err) {
+                            setAdminMessage(`Erro ao diagnosticar: ${err}`);
+                          } finally {
+                            setCrmDiagnosticLoading(false);
+                          }
+                        }}
+                        disabled={crmDiagnosticLoading || !adminToken.trim()}
+                        className="px-4 py-2 rounded-lg bg-white/10 text-white text-xs uppercase tracking-wider disabled:opacity-50"
+                      >
+                        {crmDiagnosticLoading ? 'Carregando...' : 'Ver Diagnóstico'}
+                      </button>
+                    </div>
+                    <p className="text-[11px] text-white/50">
+                      Identifique quais serviços da história de agendamentos não encontram correspondência nas regras configuradas.
+                    </p>
+                    {crmDiagnostic?.status === 'ok' && (
+                      <div className="mt-3 space-y-2 text-xs text-white/80">
+                        <div className="grid grid-cols-4 gap-2">
+                          <div className="rounded bg-white/5 p-2">
+                            <p className="text-white/50 text-[10px]">Em Histórico</p>
+                            <p className="text-lg font-bold text-white">{crmDiagnostic.summary.serviceNamesInHistory}</p>
+                          </div>
+                          <div className="rounded bg-white/5 p-2">
+                            <p className="text-white/50 text-[10px]">Configuradas</p>
+                            <p className="text-lg font-bold text-white">{crmDiagnostic.summary.configuredRules}</p>
+                          </div>
+                          <div className="rounded bg-white/5 p-2">
+                            <p className="text-white/50 text-[10px]">Match</p>
+                            <p className="text-lg font-bold text-emerald-400">{crmDiagnostic.summary.matched}</p>
+                          </div>
+                          <div className="rounded bg-white/5 p-2">
+                            <p className="text-white/50 text-[10px]">Sem Match</p>
+                            <p className="text-lg font-bold text-red-400">{crmDiagnostic.summary.unmatched}</p>
+                          </div>
+                        </div>
+                        {crmDiagnostic.summary.unmatched > 0 && crmDiagnostic.unmatchedServices?.length > 0 && (
+                          <div className="rounded bg-red-500/10 border border-red-400/20 p-2 space-y-1">
+                            <p className="text-red-200 font-semibold">Serviços sem correspondência:</p>
+                            <div className="text-[11px] text-red-300">
+                              {crmDiagnostic.unmatchedServices.map((sn: string) => (
+                                <div key={sn}>• {sn}</div>
+                              ))}
+                            </div>
+                          </div>
+                        )}
+                        {crmDiagnostic.configuredRulesNotInHistory?.length > 0 && (
+                          <div className="rounded bg-yellow-500/10 border border-yellow-400/20 p-2 space-y-1">
+                            <p className="text-yellow-200 font-semibold">Regras sem uso no histórico:</p>
+                            <div className="text-[11px] text-yellow-300 space-y-1">
+                              {crmDiagnostic.configuredRulesNotInHistory.map((r: any) => (
+                                <div key={r.serviceName}>• {r.serviceName} {r.aliases && `(aliases: ${r.aliases})`}</div>
+                              ))}
+                            </div>
+                          </div>
+                        )}
+                      </div>
+                    )}
+                  </div>
                 </div>
 
                 <div className="grid xl:grid-cols-[minmax(0,1.2fr)_minmax(0,0.8fr)] gap-4">
@@ -3271,7 +3377,9 @@ export default function App() {
                       {crmFlows.map((item) => {
                         const flowId = item.id ?? 0;
                         const isExpanded = expandedFlowId === flowId;
-                        const isActionable = ['pending_approval', 'eligible', 'scheduled_step_1'].includes(item.flowStatus || '');
+                        const flowStatus = item.flowStatus || '';
+                        const isActionable = ['pending_approval', 'eligible', 'scheduled_step_1'].includes(flowStatus);
+                        const canSendNextStepNow = ['scheduled_step_2', 'scheduled_step_3'].includes(flowStatus);
                         const isStoppable = !['converted', 'stopped', 'expired', 'opted_out'].includes(item.flowStatus || '');
                         const canHandoff = !['converted', 'stopped', 'expired'].includes(item.flowStatus || '');
                         const isLoadingThis = crmFlowActionLoading === flowId;
@@ -3325,9 +3433,19 @@ export default function App() {
                                     onClick={() => handleApproveCrmFlow(flowId)}
                                     disabled={isLoadingThis}
                                     className="px-2 py-1 rounded bg-green-600/80 text-white text-xs disabled:opacity-50"
-                                    title="Enviar etapa 1 e aprovar fluxo"
+                                    title="Enviar etapa 1"
                                   >
-                                    {isLoadingThis ? '...' : 'Aprovar'}
+                                    {isLoadingThis ? '...' : 'Etapa 1'}
+                                  </button>
+                                )}
+                                {canSendNextStepNow && flowId > 0 && (
+                                  <button
+                                    onClick={() => handleSendCrmFlowNow(flowId)}
+                                    disabled={isLoadingThis}
+                                    className="px-2 py-1 rounded bg-cyan-500/80 text-slate-950 text-xs font-medium disabled:opacity-50"
+                                    title="Enviar a proxima etapa agora"
+                                  >
+                                    {isLoadingThis ? '...' : flowStatus === 'scheduled_step_2' ? 'Etapa 2 agora' : 'Etapa 3 agora'}
                                   </button>
                                 )}
                                 {isStoppable && flowId > 0 && (

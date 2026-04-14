@@ -1,0 +1,66 @@
+{
+  "tenant": {
+    "code": "jacques-vsf",
+    "name": "Jacques Janine VSF",
+    "segment": "salao",
+    "active": true,
+    "defaultProvider": "trinks",
+    "establishmentId": 0
+  },
+  "knowledge": {
+    "identity": {
+      "brandName": "Jacques Janine VSF",
+      "toneGuide": "sofisticado, acolhedor, objetivo",
+      "toneOptions": [
+        "sofisticado",
+        "acolhedor",
+        "objetivo"
+      ]
+    },
+    "business": {
+      "address": "",
+      "phone": "",
+      "openingHours": "",
+      "paymentMethods": [
+        "PIX",
+        "Cartao de credito",
+        "Cartao de debito"
+      ]
+    },
+    "policies": {
+      "latePolicy": "",
+      "cancellationPolicy": "",
+      "noShowPolicy": ""
+    },
+    "services": [],
+    "faq": [],
+    "marketing": {
+      "enabled": false,
+      "actions": []
+    }
+  },
+  "identifiers": [
+    {
+      "kind": "evolution_instance",
+      "value": "ia-jacques-vsf"
+    }
+  ],
+  "providerConfigs": {
+    "trinks": {
+      "enabled": true,
+      "config": {}
+    },
+    "google_calendar": {
+      "enabled": false,
+      "config": {}
+    }
+  },
+  "users": [
+    {
+      "username": "admin.vsf",
+      "displayName": "Admin VSF",
+      "password": "TroqueEstaSenha123",
+      "active": true
+    }
+  ]
+}

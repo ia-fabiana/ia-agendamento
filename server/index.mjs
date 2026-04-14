@@ -265,6 +265,7 @@ function initDatabase() {
       step3_delay_days INTEGER,
       step3_message_template TEXT DEFAULT '',
       priority TEXT DEFAULT 'medium',
+      service_name_aliases TEXT DEFAULT '',
       notes TEXT DEFAULT '',
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL,
@@ -2939,10 +2940,17 @@ function findMatchingServiceRuleForName(serviceName = "", rules = []) {
     return null;
   }
 
-  const candidates = rules.map((rule) => ({
-    nome: rule.serviceName,
-    rule,
-  }));
+  const candidates = rules.map((rule) => {
+    const aliases = toNonEmptyString(rule.serviceNameAliases || rule.service_name_aliases || "")
+      .split("|")
+      .map((a) => toNonEmptyString(a))
+      .filter(Boolean);
+    return {
+      nome: rule.serviceName,
+      rule,
+      aliases,
+    };
+  });
   const matched = findBestServiceMatch(target, candidates);
   return matched?.rule || null;
 }
@@ -3245,6 +3253,138 @@ function stopCrmFlowForSystemReason(flowId, tenantId, reason, metadata = {}) {
   });
 }
 
+async function sendCrmFlowStepNow({
+  tenant,
+  flow,
+  crmSettings = {},
+  source = "manual",
+} = {}) {
+  if (!tenant?.id || !tenant?.code || !flow?.id) {
+    const error = new Error("Fluxo CRM invalido para envio.");
+    error.status = 400;
+    throw error;
+  }
+
+  const settings = crmSettings && typeof crmSettings === "object"
+    ? crmSettings
+    : (getTenantCrmSettingsByCode(tenant.code)?.config || getDefaultCrmSettings());
+  const status = toNonEmptyString(flow.flow_status || flow.flowStatus);
+  let stepNumber = 0;
+  if (["pending_approval", "scheduled_step_1", "eligible"].includes(status)) {
+    stepNumber = 1;
+  } else if (status === "scheduled_step_2") {
+    stepNumber = 2;
+  } else if (status === "scheduled_step_3") {
+    stepNumber = 3;
+  } else {
+    const error = new Error(`Fluxo nao permite envio manual no status: ${status || "desconhecido"}`);
+    error.status = 400;
+    throw error;
+  }
+
+  if (isCrmPhoneBlockedForTenantCode(tenant.code, flow.phone)) {
+    stopCrmFlowForSystemReason(flow.id, tenant.id, "client_blocked", {
+      source,
+      phone: normalizePhone(flow.phone),
+    });
+    const error = new Error("Esta cliente esta bloqueada no CRM. O fluxo foi encerrado.");
+    error.status = 409;
+    throw error;
+  }
+
+  if (settings.stopFlowOnAnyFutureBooking) {
+    const futureBooking = await detectFutureBookingForPhone(
+      tenant,
+      flow.phone,
+      new Map(),
+      getSaoPauloDateContext().isoToday,
+    );
+    if (futureBooking?.hasFutureBooking) {
+      stopCrmFlowForSystemReason(flow.id, tenant.id, "future_booking", {
+        source,
+        phone: normalizePhone(flow.phone),
+        firstFutureBooking: futureBooking.firstFutureBooking || null,
+      });
+      const error = new Error("A cliente ja possui agendamento futuro. O fluxo foi encerrado.");
+      error.status = 409;
+      throw error;
+    }
+  }
+
+  const serviceRule = db.prepare(
+    `SELECT * FROM tenant_service_return_rules WHERE tenant_id = ? AND service_key = ? LIMIT 1`,
+  ).get(tenant.id, flow.origin_service_key);
+  const template = toNonEmptyString(
+    stepNumber === 1
+      ? serviceRule?.step1_message_template
+      : stepNumber === 2
+        ? serviceRule?.step2_message_template
+        : serviceRule?.step3_message_template,
+  );
+  const fallbackTemplate = stepNumber === 1
+    ? "Ola {{client_name}}! Faz um tempo que voce nao nos visita para {{service_name}}. Que tal agendar um horario?"
+    : "Ola {{client_name}}! Passamos para lembrar que voce pode agendar seu {{service_name}} conosco.";
+  const messageToSend = formatCrmStepMessage(template || fallbackTemplate, {
+    clientName: toNonEmptyString(flow.client_name || flow.clientName),
+    serviceName: toNonEmptyString(flow.origin_service_name || flow.originServiceName),
+    lastVisitAt: toNonEmptyString(flow.last_visit_at || flow.lastVisitAt),
+    humanNumber: toNonEmptyString(settings.humanHandoffClientNumber),
+  });
+
+  const instance = resolveEvolutionInstance(null, { tenantCode: tenant.code });
+  if (!instance) {
+    const error = new Error("Instancia Evolution nao configurada para este tenant.");
+    error.status = 500;
+    throw error;
+  }
+
+  await evolutionRequest(`/message/sendText/${instance}`, {
+    method: "POST",
+    body: { number: flow.phone, text: messageToSend },
+  });
+
+  const now = new Date().toISOString();
+  const maxSteps = Number(settings.maxSteps || 3);
+  const step2DelayDays = Number(serviceRule?.step2_delay_days || 7);
+  const step3DelayDays = Number(serviceRule?.step3_delay_days || 14);
+  let nextStatus = "expired";
+  let nextSendAt = "";
+  if (stepNumber < maxSteps) {
+    if (stepNumber === 1) {
+      nextStatus = "scheduled_step_2";
+      nextSendAt = `${addDaysToIsoDate(now.slice(0, 10), step2DelayDays)}T09:00:00`;
+    } else if (stepNumber === 2) {
+      nextStatus = "scheduled_step_3";
+      nextSendAt = `${addDaysToIsoDate(now.slice(0, 10), step3DelayDays)}T09:00:00`;
+    }
+  }
+
+  updateCrmFlowStatus(flow.id, tenant.id, {
+    flow_status: nextStatus,
+    current_step: stepNumber,
+    entered_flow_at: toNonEmptyString(flow.entered_flow_at || flow.enteredFlowAt) || now,
+    last_message_sent_at: now,
+    next_scheduled_send_at: nextSendAt,
+    stop_reason: nextStatus === "expired" ? "exhausted" : "",
+  });
+  recordCrmFlowEvent({
+    flowId: flow.id,
+    tenantId: tenant.id,
+    eventType: "step_sent",
+    step: stepNumber,
+    messageSent: messageToSend,
+    messagePreview: messageToSend.slice(0, 200),
+    metadata: { source },
+  });
+
+  return {
+    stepNumber,
+    nextStatus,
+    nextSendAt,
+    messageSent: messageToSend,
+  };
+}
+
 function materializeCrmFlowCandidate(tenant, candidate, crmMode = "beta") {
   const phone = normalizePhone(candidate.phone);
   const now = new Date().toISOString();
@@ -3489,11 +3629,20 @@ async function runTenantCrmPreview(code, { lookbackDays = 365, materialize = fal
     }
 
     const futureBooking = await detectFutureBookingForPhone(tenant, phone, futureBookingCache, todayIso);
+    let resolvedClientName = toNonEmptyString(futureBooking.clientName || row.clientName);
+    if (!resolvedClientName && tenant.establishmentId) {
+      try {
+        const knownClient = await findExistingClientByPhone(tenant.establishmentId, phone);
+        resolvedClientName = toNonEmptyString(clientDisplayNameFrom(knownClient));
+      } catch {
+        resolvedClientName = "";
+      }
+    }
     if (futureBooking.hasFutureBooking) {
       skipped.push({
         type: "flow",
         phone,
-        clientName: row.clientName,
+        clientName: resolvedClientName,
         reason: "future_booking",
         serviceName: rule.serviceName,
         firstFutureBooking: futureBooking.firstFutureBooking,
@@ -3516,7 +3665,7 @@ async function runTenantCrmPreview(code, { lookbackDays = 365, materialize = fal
     const candidate = {
       phone,
       clientId: futureBooking.clientId,
-      clientName: futureBooking.clientName || row.clientName,
+      clientName: resolvedClientName,
       originServiceKey: rule.serviceKey,
       originServiceName: rule.serviceName,
       originCategoryKey: rule.categoryKey,
@@ -7704,6 +7853,28 @@ function scoreServiceMatch(serviceName, candidate) {
     return 1;
   }
 
+  // Check aliases for perfect match or strong overlap
+  if (Array.isArray(candidate?.aliases) && candidate.aliases.length) {
+    for (const alias of candidate.aliases) {
+      const normalizedAlias = normalizeServiceText(alias);
+      if (target === normalizedAlias || targetRaw === normalizeForMatch(alias).trim()) {
+        return 1;
+      }
+      const aliasTokens = normalizedAlias.split(" ").filter(Boolean);
+      const targetTokens = target.split(" ").filter(Boolean);
+      if (aliasTokens.length && targetTokens.length) {
+        const aliasSet = new Set(aliasTokens);
+        const overlap = targetTokens.filter((token) => aliasSet.has(token)).length;
+        if (overlap === targetTokens.length && overlap > 0) {
+          return 0.95;
+        }
+        if (normalizedAlias.includes(target) || target.includes(normalizedAlias)) {
+          return 0.85;
+        }
+      }
+    }
+  }
+
   const targetTokens = target.split(" ").filter(Boolean);
   const candidateTokens = candidateName.split(" ").filter(Boolean);
   if (!targetTokens.length || !candidateTokens.length) {
@@ -7716,9 +7887,6 @@ function scoreServiceMatch(serviceName, candidate) {
     return 0;
   }
 
-  // Caso comum: cliente digita apenas o nome base do servico ("escova")
-  // e a Trinks retorna variantes ("escova definitiva", "escova*"). Aqui
-  // privilegiamos o match mais direto para evitar mudar o servico no meio do fluxo.
   const allTargetTokensPresent = overlap === targetTokens.length;
   if (allTargetTokensPresent) {
     const extraTokens = Math.max(0, candidateTokens.length - targetTokens.length);
@@ -12595,6 +12763,69 @@ app.post("/api/admin/tenants/:code/crm/preview-run", async (req, res) => {
   }
 });
 
+app.get("/api/admin/tenants/:code/crm/diagnostic", async (req, res) => {
+  try {
+    const principal = requireAdminPrincipal(req, res);
+    if (!principal) return;
+    if (!principalCanAccessTenant(principal, req.params.code)) {
+      return res.status(403).json({ status: "error", message: "Sem permissao para este tenant." });
+    }
+    const tenant = getTenantByCode(req.params.code);
+    if (!tenant) return res.status(404).json({ status: "error", message: "Tenant nao encontrado." });
+    const serviceRules = listTenantServiceReturnRulesByCode(tenant.code).filter(
+      (item) => item.active && Number(item.returnDays) > 0,
+    );
+    const auditRows = queryRecentTenantAppointmentAudit(tenant.code, { limit: 2000 });
+    const serviceNamesInHistory = new Set();
+    for (const row of auditRows) {
+      if (toNonEmptyString(row.serviceName)) {
+        serviceNamesInHistory.add(toNonEmptyString(row.serviceName));
+      }
+    }
+    const matchedServices = [];
+    const unmatchedServices = [];
+    for (const serviceName of serviceNamesInHistory) {
+      const rule = findMatchingServiceRuleForName(serviceName, serviceRules);
+      if (rule) {
+        matchedServices.push({ serviceName, matchedRule: rule.serviceName });
+      } else {
+        unmatchedServices.push(serviceName);
+      }
+    }
+    const configuredRulesNotInHistory = serviceRules.filter(
+      (rule) => !Array.from(serviceNamesInHistory).some(
+        (sn) => findMatchingServiceRuleForName(sn, [rule]) !== null,
+      ),
+    );
+    return res.json({
+      status: "ok",
+      tenant: {
+        code: tenant.code,
+        name: tenant.name,
+      },
+      summary: {
+        serviceNamesInHistory: serviceNamesInHistory.size,
+        configuredRules: serviceRules.length,
+        matched: matchedServices.length,
+        unmatched: unmatchedServices.length,
+        configuredNotInHistory: configuredRulesNotInHistory.length,
+      },
+      matchedServices: matchedServices.slice(0, 50),
+      unmatchedServices: Array.from(unmatchedServices).slice(0, 50),
+      configuredRulesNotInHistory: configuredRulesNotInHistory.map((r) => ({
+        serviceName: r.serviceName,
+        returnDays: r.returnDays,
+        aliases: toNonEmptyString(r.serviceNameAliases || r.service_name_aliases || ""),
+      })).slice(0, 50),
+    });
+  } catch (error) {
+    return res.status(error.status || 500).json({
+      status: "error",
+      message: error.message || "Erro ao diagnosticar CRM.",
+    });
+  }
+});
+
 // CRM Phase 6 routes: flow events, approve, stop
 
 app.get("/api/admin/tenants/:code/crm/flows/:id/events", (req, res) => {
@@ -12636,82 +12867,17 @@ app.post("/api/admin/tenants/:code/crm/flows/:id/approve", async (req, res) => {
       });
     }
     const crmSettings = getTenantCrmSettingsByCode(req.params.code)?.config || getDefaultCrmSettings();
-    if (isCrmPhoneBlockedForTenantCode(tenant.code, flow.phone)) {
-      stopCrmFlowForSystemReason(flowId, tenant.id, "client_blocked", {
-        source: "approve",
-        phone: normalizePhone(flow.phone),
-      });
-      return res.status(409).json({
-        status: "error",
-        message: "Esta cliente esta bloqueada no CRM. O fluxo foi encerrado.",
-      });
-    }
-    if (crmSettings.stopFlowOnAnyFutureBooking) {
-      const futureBooking = await detectFutureBookingForPhone(
-        tenant,
-        flow.phone,
-        new Map(),
-        getSaoPauloDateContext().isoToday,
-      );
-      if (futureBooking?.hasFutureBooking) {
-        stopCrmFlowForSystemReason(flowId, tenant.id, "future_booking", {
-          source: "approve",
-          phone: normalizePhone(flow.phone),
-          firstFutureBooking: futureBooking.firstFutureBooking || null,
-        });
-        return res.status(409).json({
-          status: "error",
-          message: "A cliente ja possui agendamento futuro. O fluxo foi encerrado.",
-        });
-      }
-    }
-    const serviceRule = db.prepare(
-      `SELECT * FROM tenant_service_return_rules WHERE tenant_id = ? AND service_key = ? LIMIT 1`,
-    ).get(tenant.id, flow.origin_service_key);
-    const step1Template = toNonEmptyString(serviceRule?.step1_message_template);
-    const messageToSend = formatCrmStepMessage(
-      step1Template || "Ola {{client_name}}! Faz um tempo que voce nao nos visita para {{service_name}}. Que tal agendar um horario?",
-      {
-        clientName: toNonEmptyString(flow.client_name),
-        serviceName: toNonEmptyString(flow.origin_service_name),
-        lastVisitAt: toNonEmptyString(flow.last_visit_at),
-        humanNumber: toNonEmptyString(crmSettings.humanHandoffClientNumber),
-      },
-    );
-    const instance = resolveEvolutionInstance(null, { tenantCode: req.params.code });
-    if (!instance) {
-      return res.status(500).json({ status: "error", message: "Instancia Evolution nao configurada para este tenant." });
-    }
-    await evolutionRequest(`/message/sendText/${instance}`, {
-      method: "POST",
-      body: { number: flow.phone, text: messageToSend },
-    });
-    const now = new Date().toISOString();
-    const step2DelayDays = Number(serviceRule?.step2_delay_days || 7);
-    const nextSendAt = addDaysToIsoDate(now.slice(0, 10), step2DelayDays) + "T09:00:00";
-    const maxSteps = Number(crmSettings.maxSteps || 3);
-    const nextStatus = maxSteps <= 1 ? "expired" : "scheduled_step_2";
-    updateCrmFlowStatus(flowId, tenant.id, {
-      flow_status: nextStatus,
-      current_step: 1,
-      entered_flow_at: now,
-      last_message_sent_at: now,
-      next_scheduled_send_at: maxSteps <= 1 ? "" : nextSendAt,
-      stop_reason: maxSteps <= 1 ? "exhausted" : "",
-    });
-    recordCrmFlowEvent({
-      flowId,
-      tenantId: tenant.id,
-      eventType: "step_sent",
-      step: 1,
-      messageSent: messageToSend,
-      messagePreview: messageToSend.slice(0, 200),
+    const sendResult = await sendCrmFlowStepNow({
+      tenant,
+      flow,
+      crmSettings,
+      source: "approve",
     });
     return res.json({
       status: "ok",
-      message: "Etapa 1 enviada com sucesso.",
-      nextStatus,
-      messageSent: messageToSend,
+      message: `Etapa ${sendResult.stepNumber} enviada com sucesso.`,
+      nextStatus: sendResult.nextStatus,
+      messageSent: sendResult.messageSent,
     });
   } catch (error) {
     return res.status(error.status || 500).json({
@@ -12748,6 +12914,43 @@ app.post("/api/admin/tenants/:code/crm/flows/:id/stop", (req, res) => {
     return res.status(error.status || 500).json({
       status: "error",
       message: error.message || "Erro ao encerrar fluxo.",
+    });
+  }
+});
+
+app.post("/api/admin/tenants/:code/crm/flows/:id/send-now", async (req, res) => {
+  try {
+    const principal = requireAdminPrincipal(req, res);
+    if (!principal) return;
+    if (!principalCanAccessTenant(principal, req.params.code)) {
+      return res.status(403).json({ status: "error", message: "Sem permissao para este tenant." });
+    }
+    const tenant = getTenantByCode(req.params.code);
+    if (!tenant) return res.status(404).json({ status: "error", message: "Tenant nao encontrado." });
+    const flowId = Number(req.params.id);
+    if (!flowId) return res.status(400).json({ status: "error", message: "ID invalido." });
+    const flow = getCrmFlowById(flowId, tenant.id);
+    if (!flow) return res.status(404).json({ status: "error", message: "Fluxo nao encontrado." });
+
+    const crmSettings = getTenantCrmSettingsByCode(req.params.code)?.config || getDefaultCrmSettings();
+    const sendResult = await sendCrmFlowStepNow({
+      tenant,
+      flow,
+      crmSettings,
+      source: "send_now",
+    });
+    return res.json({
+      status: "ok",
+      message: `Etapa ${sendResult.stepNumber} enviada manualmente.`,
+      nextStatus: sendResult.nextStatus,
+      messageSent: sendResult.messageSent,
+      flow: getCrmFlowById(flowId, tenant.id),
+    });
+  } catch (error) {
+    return res.status(error.status || 500).json({
+      status: "error",
+      message: error.message || "Erro ao enviar etapa do CRM.",
+      details: error.details || null,
     });
   }
 });

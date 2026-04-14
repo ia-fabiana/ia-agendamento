@@ -1112,6 +1112,14 @@ export class AppointmentService {
     );
   }
 
+  async sendCrmFlowNow(adminToken: string, code: string, flowId: number) {
+    return this.adminRequest<{ message?: string; nextStatus?: string; messageSent?: string }>(
+      `/api/admin/tenants/${encodeURIComponent(code)}/crm/flows/${flowId}/send-now`,
+      adminToken,
+      { method: "POST", body: JSON.stringify({}) },
+    );
+  }
+
   async stopCrmFlow(adminToken: string, code: string, flowId: number, reason?: string) {
     return this.adminRequest<{ message?: string }>(
       `/api/admin/tenants/${encodeURIComponent(code)}/crm/flows/${flowId}/stop`,
