@@ -3020,16 +3020,28 @@ async function detectFutureBookingForPhone(tenant, phone, cache, todayIso) {
     const client = await findExistingClientByPhone(tenant.establishmentId, normalizedPhone);
     const clientId = Number(clientIdFrom(client));
     if (Number.isFinite(clientId) && clientId > 0) {
+      const dateToIso = addDaysToIsoDate(todayIso, 120);
       const futureItems = await listAppointmentsByClientId(
         tenant.establishmentId,
         clientId,
-        { dateFrom: todayIso, dateTo: addDaysToIsoDate(todayIso, 120) },
+        { dateFrom: todayIso, dateTo: dateToIso },
       );
       const normalizedAppointments = futureItems
         .map(normalizeAppointmentItem)
         .filter(Boolean)
         .filter((item) => !appointmentLooksCanceled(item.raw))
         .filter((item) => toNonEmptyString(item.date) >= todayIso)
+        .filter((item) => {
+          const date = toNonEmptyString(item.date);
+          return !dateToIso || (date && date <= dateToIso);
+        })
+        .filter((item) => {
+          const apptClientId = Number(appointmentClientIdFrom(item?.raw || item));
+          if (Number.isFinite(apptClientId) && apptClientId > 0) {
+            return apptClientId === clientId;
+          }
+          return true;
+        })
         .sort((left, right) => appointmentSortDateTime(left).localeCompare(appointmentSortDateTime(right)));
 
       result = {
