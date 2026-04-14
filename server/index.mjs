@@ -414,6 +414,9 @@ function ensureTenantIsolationColumns(database) {
   if (!tableHasColumn(database, "webhook_events", "tenant_code")) {
     database.exec("ALTER TABLE webhook_events ADD COLUMN tenant_code TEXT DEFAULT ''");
   }
+  if (!tableHasColumn(database, "tenant_service_return_rules", "service_name_aliases")) {
+    database.exec("ALTER TABLE tenant_service_return_rules ADD COLUMN service_name_aliases TEXT DEFAULT ''");
+  }
 
   database.exec(`
     CREATE INDEX IF NOT EXISTS idx_whatsapp_messages_tenant_phone_at
@@ -2259,6 +2262,7 @@ function sanitizeServiceRuleInput(input = {}) {
   const step1DelayDays = Number(source.step1DelayDays);
   const step2DelayDays = Number(source.step2DelayDays);
   const step3DelayDays = Number(source.step3DelayDays);
+  const serviceNameAliases = toNonEmptyString(source.serviceNameAliases || source.service_name_aliases);
 
   return {
     serviceKey,
@@ -2275,6 +2279,7 @@ function sanitizeServiceRuleInput(input = {}) {
     step3DelayDays: Number.isFinite(step3DelayDays) && step3DelayDays >= 0 ? Math.min(365, Math.trunc(step3DelayDays)) : null,
     step3MessageTemplate: toNonEmptyString(source.step3MessageTemplate),
     priority: normalizePriority(source.priority, "medium"),
+    serviceNameAliases,
     notes: toNonEmptyString(source.notes),
   };
 }
@@ -2293,7 +2298,8 @@ function listTenantServiceReturnRulesByCode(code) {
              step1_delay_days AS step1DelayDays, step1_message_template AS step1MessageTemplate,
              step2_delay_days AS step2DelayDays, step2_message_template AS step2MessageTemplate,
              step3_delay_days AS step3DelayDays, step3_message_template AS step3MessageTemplate,
-             priority, notes, created_at AS createdAt, updated_at AS updatedAt
+              priority, notes, service_name_aliases AS serviceNameAliases,
+              created_at AS createdAt, updated_at AS updatedAt
       FROM tenant_service_return_rules
       WHERE tenant_id = ?
       ORDER BY category_name COLLATE NOCASE ASC, service_name COLLATE NOCASE ASC, id ASC
@@ -2314,6 +2320,7 @@ function listTenantServiceReturnRulesByCode(code) {
     step3DelayDays: Number.isFinite(Number(row.step3DelayDays)) ? Number(row.step3DelayDays) : null,
     step3MessageTemplate: toNonEmptyString(row.step3MessageTemplate),
     priority: normalizePriority(row.priority, "medium"),
+    serviceNameAliases: toNonEmptyString(row.serviceNameAliases),
     notes: toNonEmptyString(row.notes),
     createdAt: toNonEmptyString(row.createdAt),
     updatedAt: toNonEmptyString(row.updatedAt),
@@ -2338,9 +2345,9 @@ function upsertTenantServiceReturnRulesByCode(code, rules = []) {
         step1_delay_days, step1_message_template,
         step2_delay_days, step2_message_template,
         step3_delay_days, step3_message_template,
-        priority, notes, created_at, updated_at
+        priority, service_name_aliases, notes, created_at, updated_at
       )
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(tenant_id, service_key) DO UPDATE SET
         service_name = excluded.service_name,
         category_key = excluded.category_key,
@@ -2355,6 +2362,7 @@ function upsertTenantServiceReturnRulesByCode(code, rules = []) {
         step3_delay_days = excluded.step3_delay_days,
         step3_message_template = excluded.step3_message_template,
         priority = excluded.priority,
+        service_name_aliases = excluded.service_name_aliases,
         notes = excluded.notes,
         updated_at = excluded.updated_at
     `,
@@ -2382,6 +2390,7 @@ function upsertTenantServiceReturnRulesByCode(code, rules = []) {
         sanitized.step3DelayDays,
         sanitized.step3MessageTemplate,
         sanitized.priority,
+        sanitized.serviceNameAliases,
         sanitized.notes,
         now,
         now,
@@ -7876,13 +7885,38 @@ function scoreServiceMatch(serviceName, candidate) {
   }
 
   const targetTokens = target.split(" ").filter(Boolean);
+  const synonymMap = {
+    escova: ["brushing", "brush"],
+    brushing: ["escova", "escov"],
+    hidratacao: ["hidratação", "hydrat", "hydration"],
+  };
+  const expandTokens = (tokens) => {
+    const expanded = new Set(tokens);
+    for (const token of tokens) {
+      const mapped = synonymMap[token];
+      if (!mapped) continue;
+      for (const item of mapped) {
+        const normalized = normalizeServiceText(item);
+        if (normalized) {
+          normalized.split(" ").filter(Boolean).forEach((part) => expanded.add(part));
+        }
+      }
+    }
+    return [...expanded];
+  };
   const candidateTokens = candidateName.split(" ").filter(Boolean);
   if (!targetTokens.length || !candidateTokens.length) {
     return 0;
   }
 
+  const expandedTargetTokens = expandTokens(targetTokens);
+  const expandedCandidateTokens = expandTokens(candidateTokens);
+
   const candidateSet = new Set(candidateTokens);
-  const overlap = targetTokens.filter((token) => candidateSet.has(token)).length;
+  const baseOverlap = targetTokens.filter((token) => candidateSet.has(token)).length;
+  const expandedSet = new Set(expandedCandidateTokens);
+  const expandedOverlap = expandedTargetTokens.filter((token) => expandedSet.has(token)).length;
+  const overlap = Math.max(baseOverlap, expandedOverlap);
   if (!overlap) {
     return 0;
   }
