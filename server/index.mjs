@@ -2990,6 +2990,148 @@ function queryRecentTenantAppointmentAudit(tenantCode, { limit = 2000 } = {}) {
   }));
 }
 
+async function queryRecentTenantAppointmentsFromTrinks(tenant, { lookbackDays = 365, limit = 4000, serviceRules = [] } = {}) {
+  if (!tenant?.establishmentId) {
+    return [];
+  }
+
+  const todayIso = getSaoPauloDateContext().isoToday;
+  const cutoffIso = addDaysToIsoDate(todayIso, -Math.abs(Number(lookbackDays || 365)));
+  const maxRows = Math.min(Math.max(Number(limit || 4000), 1), 5000);
+  const maxPages = Math.min(160, Math.max(10, Math.ceil(maxRows / 25)));
+  const appointmentRows = [];
+  const relevantClientIds = new Set();
+  const seenAppointmentIds = new Set();
+
+  for (let page = 1; page <= maxPages; page += 1) {
+    let payload = null;
+    try {
+      payload = await trinksRequest("/agendamentos", {
+        method: "GET",
+        estabelecimentoId: tenant.establishmentId,
+        tenantCode: tenant.code,
+        query: {
+          page,
+          pageSize: 50,
+        },
+      });
+    } catch {
+      break;
+    }
+
+    const items = extractItems(payload);
+    if (!items.length) {
+      break;
+    }
+
+    let pageOldestDate = "";
+    for (const item of items) {
+      const normalized = normalizeAppointmentItem(item);
+      if (!normalized?.date || appointmentLooksCanceled(normalized.raw)) {
+        continue;
+      }
+
+      if (!pageOldestDate || normalized.date < pageOldestDate) {
+        pageOldestDate = normalized.date;
+      }
+
+      if (normalized.date > todayIso) {
+        continue;
+      }
+      if (cutoffIso && normalized.date < cutoffIso) {
+        continue;
+      }
+
+      const appointmentId = Number(normalized.id);
+      const appointmentKey = Number.isFinite(appointmentId) && appointmentId > 0
+        ? `id:${appointmentId}`
+        : `${normalized.date}|${normalized.time}|${normalized.client}|${normalized.professional}|${normalized.services.join("|")}`;
+      if (seenAppointmentIds.has(appointmentKey)) {
+        continue;
+      }
+      seenAppointmentIds.add(appointmentKey);
+
+      const serviceName = toNonEmptyString(normalized.services[0] || "");
+      if (!serviceName) {
+        continue;
+      }
+      if (Array.isArray(serviceRules) && serviceRules.length && !findMatchingServiceRuleForName(serviceName, serviceRules)) {
+        continue;
+      }
+
+      const clientId = Number(normalized.raw?.cliente?.id ?? normalized.raw?.clienteId ?? normalized.raw?.clientId);
+      if (Number.isFinite(clientId) && clientId > 0) {
+        relevantClientIds.add(clientId);
+      }
+
+      appointmentRows.push({
+        id: appointmentId || null,
+        tenantCode: tenant.code,
+        establishmentId: tenant.establishmentId,
+        clientId: Number.isFinite(clientId) && clientId > 0 ? clientId : null,
+        clientName: toNonEmptyString(normalized.client),
+        clientPhone: "",
+        serviceName,
+        professionalName: toNonEmptyString(normalized.professional),
+        appointmentDate: normalized.date,
+        appointmentTime: toNonEmptyString(normalized.time),
+        createdAt: toNonEmptyString(normalized.dateTime),
+        source: "trinks_history",
+      });
+
+      if (appointmentRows.length >= maxRows) {
+        break;
+      }
+    }
+
+    if (appointmentRows.length >= maxRows) {
+      break;
+    }
+    if (pageOldestDate && cutoffIso && pageOldestDate < cutoffIso) {
+      break;
+    }
+  }
+
+  if (!appointmentRows.length || !relevantClientIds.size) {
+    return appointmentRows;
+  }
+
+  const clientCache = new Map();
+  const clientIds = [...relevantClientIds];
+  for (let offset = 0; offset < clientIds.length; offset += 10) {
+    const batch = clientIds.slice(offset, offset + 10);
+    const results = await Promise.all(batch.map(async (clientId) => {
+      try {
+        const client = await getClientById(tenant.establishmentId, clientId);
+        const phone = extractPreferredPhoneFromClient(client);
+        const clientName = toNonEmptyString(
+          clientDisplayNameFrom(client) || appointmentRows.find((row) => row.clientId === clientId)?.clientName,
+        );
+        return { clientId, phone, clientName };
+      } catch {
+        return { clientId, phone: "", clientName: "" };
+      }
+    }));
+    for (const item of results) {
+      clientCache.set(item.clientId, { phone: item.phone, clientName: item.clientName });
+      if (item.phone) {
+        upsertClientPhoneMap(item.phone, item.clientId, item.clientName);
+      }
+    }
+  }
+
+  return appointmentRows
+    .map((row) => {
+      const resolved = clientCache.get(row.clientId) || null;
+      return {
+        ...row,
+        clientPhone: toNonEmptyString(resolved?.phone),
+        clientName: toNonEmptyString(resolved?.clientName || row.clientName),
+      };
+    })
+    .filter((row) => normalizePhone(row.clientPhone));
+}
+
 async function detectFutureBookingForPhone(tenant, phone, cache, todayIso) {
   const normalizedPhone = normalizePhone(phone);
   if (!tenant?.establishmentId || !normalizedPhone) {
@@ -3578,9 +3720,28 @@ async function runTenantCrmPreview(code, { lookbackDays = 365, materialize = fal
   );
   const todayIso = getSaoPauloDateContext().isoToday;
   const cutoffIso = addDaysToIsoDate(todayIso, -Math.abs(Number(lookbackDays || 365)));
-  const auditRows = queryRecentTenantAppointmentAudit(tenant.code, { limit: 4000 })
+  const localAuditRows = queryRecentTenantAppointmentAudit(tenant.code, { limit: 4000 })
     .filter((row) => toNonEmptyString(row.appointmentDate) && row.appointmentDate <= todayIso)
     .filter((row) => !cutoffIso || row.appointmentDate >= cutoffIso);
+  const trinksRows = await queryRecentTenantAppointmentsFromTrinks(tenant, {
+    lookbackDays,
+    limit: 4000,
+    serviceRules,
+  });
+  const seenHistoryKeys = new Set();
+  const auditRows = [...trinksRows, ...localAuditRows].filter((row) => {
+    const key = [
+      normalizePhone(row.clientPhone),
+      toNonEmptyString(row.serviceName),
+      toNonEmptyString(row.appointmentDate),
+      toNonEmptyString(row.appointmentTime),
+    ].join("|");
+    if (!key || seenHistoryKeys.has(key)) {
+      return false;
+    }
+    seenHistoryKeys.add(key);
+    return true;
+  });
 
   const latestByPhoneService = new Map();
   const latestByPhoneCategory = new Map();
@@ -5115,12 +5276,48 @@ function textLooksLikeBookingConfirmationRequest(text = "") {
   if (!normalized) {
     return false;
   }
+  if (
+    /\b(cancel|cancelar|cancelamento|desmarc|reagend|remarcar|alterar|alteracao|mudar horario|trocar horario)\b/.test(
+      normalized,
+    )
+  ) {
+    return false;
+  }
   return (
     /\b(podemos confirmar|posso confirmar|confirma estes|confirma este|se estiver certo responda|responda sim)\b/.test(
       normalized,
     ) &&
     /\b(agendamento|agendar|servic|horario|data)\b/.test(normalized)
   );
+}
+
+function historyHasRecentChangeConfirmationPrompt(history = []) {
+  if (!Array.isArray(history) || !history.length) {
+    return false;
+  }
+
+  const recent = history.slice(-8);
+  for (let index = recent.length - 1; index >= 0; index -= 1) {
+    const item = recent[index];
+    const role = toNonEmptyString(item?.role).toLowerCase();
+    if (role !== "assistant") {
+      continue;
+    }
+
+    const content = normalizeForMatch(item?.content || item?.text || "");
+    if (!content) {
+      continue;
+    }
+
+    if (
+      /\b(confirme|confirma|isso mesmo|responda sim|se sim|se estiver certo)\b/.test(content) &&
+      /\b(cancel|cancelar|cancelamento|desmarc|reagend|remarcar|alterar)\b/.test(content)
+    ) {
+      return true;
+    }
+  }
+
+  return false;
 }
 
 function extractIsoDateFromText(text, fallbackIsoDate = "") {
@@ -5819,6 +6016,48 @@ async function listClients(estabelecimentoId, query = {}) {
   return extractItems(payload);
 }
 
+async function getClientById(estabelecimentoId, clientId) {
+  const parsedClientId = Number(clientId);
+  if (!estabelecimentoId || !Number.isFinite(parsedClientId) || parsedClientId <= 0) {
+    return null;
+  }
+
+  return trinksRequest(`/clientes/${parsedClientId}`, {
+    method: "GET",
+    estabelecimentoId,
+  });
+}
+
+function extractPreferredPhoneFromClient(item) {
+  const candidates = [];
+  if (Array.isArray(item?.telefone)) {
+    candidates.push(...item.telefone);
+  }
+  if (Array.isArray(item?.telefones)) {
+    candidates.push(...item.telefones);
+  }
+  if (Array.isArray(item?.phones)) {
+    candidates.push(...item.phones);
+  }
+  if (item?.celular) {
+    candidates.push(item.celular);
+  }
+  if (item?.phone) {
+    candidates.push(item.phone);
+  }
+
+  for (const candidate of candidates) {
+    const normalized = typeof candidate === "object"
+      ? normalizeTrinksPhone(candidate)
+      : normalizePhone(candidate);
+    if (normalized) {
+      return normalized;
+    }
+  }
+
+  return "";
+}
+
 async function findExistingClientByPhone(estabelecimentoId, clientPhone) {
   const normalizedPhone = normalizePhone(clientPhone);
   if (!normalizedPhone) {
@@ -5977,15 +6216,13 @@ function buildRestrictedProfessionalMessage({ allowedProfessionalNames = [] } = 
 
 function buildBookingSingleMessageRetryHint({ allowedProfessionalNames = [] } = {}) {
   const displayNames = uniqueProfessionalDisplayNames(allowedProfessionalNames);
-  const sampleDate = getSaoPauloDateContext().brTomorrow || "14/04/2026";
-
   if (displayNames.length >= 2) {
-    return `Perfeito. Para evitar erro no fechamento, preciso que voce reenvie em uma unica mensagem: servico, data, horario e profissional. Exemplo: Escova com ${displayNames[0]} em ${sampleDate} as 13:00 e Manicure com ${displayNames[1]} as 13:00.`;
+    return `Perfeito. Podemos continuar por partes. Me diga so o que falta ajustar ou confirmar, como servico, data, horario ou profissional. Se quiser, voce pode citar algo como ${displayNames[0]} ou ${displayNames[1]}.`;
   }
   if (displayNames.length === 1) {
-    return `Perfeito. Para evitar erro no fechamento, preciso que voce reenvie em uma unica mensagem: servico, data, horario e profissional. Exemplo: Escova com ${displayNames[0]} em ${sampleDate} as 13:00.`;
+    return `Perfeito. Podemos continuar por partes. Me diga so o que falta ajustar ou confirmar, como servico, data, horario ou profissional. Se quiser, voce pode me informar a profissional ${displayNames[0]}.`;
   }
-  return "Perfeito. Para evitar erro no fechamento, preciso que voce reenvie em uma unica mensagem: servico, data, horario e profissional. Exemplo: Escova com [Profissional] em 14/04 as 13:00.";
+  return "Perfeito. Podemos continuar por partes. Me diga so o que falta ajustar ou confirmar: servico, data, horario ou profissional.";
 }
 
 function normalizeProfessionalConstraintName(value) {
@@ -10729,6 +10966,7 @@ async function sendChatMessage({
   const hasRescheduleIntent = messageSuggestsRescheduleIntent(message);
   const confirmationIntent = detectConfirmationIntent(message);
   const hasChangeRequestIntent = hasCancellationIntent || hasRescheduleIntent;
+  const hasRecentChangeConfirmationPrompt = historyHasRecentChangeConfirmationPrompt(history);
   const asksProfessionals = /(profission|quem atende|cabeleireir)/.test(normalizedMessageForGate);
   const hasProfessionalHintInMessage = messageContainsProfessionalPreferenceHint(message);
   const hasProfessionalHintInHistory = historyHasProfessionalContext(history);
@@ -10887,7 +11125,7 @@ async function sendChatMessage({
     confirmationIntent === "confirm" &&
     !pendingConfirmation
   ) {
-    if (recoveredDraft.items.length) {
+    if (recoveredDraft.items.length && !hasRecentChangeConfirmationPrompt) {
       const resolvedClientName = toNonEmptyString(customerContext?.name);
       const resolvedClientPhone = normalizePhone(customerContext?.phone);
 
@@ -10940,9 +11178,11 @@ async function sendChatMessage({
       );
     }
 
-    if (!historyHasRecentBookingConfirmationPrompt(history)) {
+    if (hasRecentChangeConfirmationPrompt) {
+      // Recent history is about cancellation/reschedule confirmation, so avoid treating "sim" as a booking confirmation.
+    } else if (!historyHasRecentBookingConfirmationPrompt(history)) {
       return finalizeChatResponse(
-        "Perfeito. Para eu confirmar com seguranca, me envie em uma unica mensagem: servico, data, horario e profissional.",
+        "Perfeito. Para eu confirmar com seguranca, podemos continuar por partes. Me diga o que falta ajustar ou confirmar: servico, data, horario ou profissional.",
       );
     }
 
