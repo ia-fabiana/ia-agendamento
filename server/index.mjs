@@ -909,7 +909,7 @@ function verifyTenantPassword(password, storedHash) {
 
   try {
     const expected = Buffer.from(expectedHex, "hex");
-    const actual = crypto.scryptSync(String(password || ""), salt, 64);
+    const actual = crypto.scryptSync(String(password || ""), Buffer.from(salt, "hex"), 64);
     if (!expected.length || expected.length !== actual.length) {
       return false;
     }
