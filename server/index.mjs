@@ -3004,6 +3004,11 @@ async function queryRecentTenantAppointmentsFromTrinks(tenant, { lookbackDays = 
   const seenAppointmentIds = new Set();
 
   for (let page = 1; page <= maxPages; page += 1) {
+    // Delay entre páginas para não estourar rate limit da Trinks (exceto página 1)
+    if (page > 1) {
+      await new Promise((resolve) => setTimeout(resolve, 400));
+    }
+
     let payload = null;
     try {
       payload = await trinksRequest("/agendamentos", {
@@ -3012,19 +3017,30 @@ async function queryRecentTenantAppointmentsFromTrinks(tenant, { lookbackDays = 
         tenantCode: tenant.code,
         query: {
           page,
-          pageSize: 50,
-          dataInicial: `${cutoffIso}T00:00:00`,
-          dataFinal: `${todayIso}T23:59:59`,
+          pageSize: 25,
         },
       });
     } catch (err) {
       const status = err?.status || 0;
       if (status === 429) {
-        console.warn(`[queryRecentTrinksAppointments] tenant=${tenant.code} rate limit (429) na pagina ${page} — parando paginacao.`);
+        console.warn(`[queryRecentTrinksAppointments] tenant=${tenant.code} rate limit (429) na pagina ${page} — aguardando 10s antes de continuar.`);
+        await new Promise((resolve) => setTimeout(resolve, 10000));
+        // Tenta a mesma página uma vez após o cooldown
+        try {
+          payload = await trinksRequest("/agendamentos", {
+            method: "GET",
+            estabelecimentoId: tenant.establishmentId,
+            tenantCode: tenant.code,
+            query: { page, pageSize: 25 },
+          });
+        } catch {
+          console.warn(`[queryRecentTrinksAppointments] tenant=${tenant.code} ainda em rate limit na pagina ${page} — parando.`);
+          break;
+        }
       } else {
         console.error(`[queryRecentTrinksAppointments] tenant=${tenant.code} erro na pagina ${page}:`, err?.message || err);
+        break;
       }
-      break;
     }
 
     const items = extractItems(payload);
