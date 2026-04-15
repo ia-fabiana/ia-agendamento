@@ -1,0 +1,11 @@
+.claude
+node_modules
+dist
+server.pid
+server/db.sqlite3
+server/data/*.sqlite-shm
+server/data/*.sqlite-wal
+*.log
+.env
+.env.local
+.env.vercel

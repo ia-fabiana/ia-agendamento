@@ -4,6 +4,19 @@
 };
 
 type KnowledgePayload = Record<string, unknown>;
+type PublicTenantContext = {
+  status?: string;
+  found?: boolean;
+  matchedBy?: string;
+  tenant?: {
+    code: string;
+    name: string;
+    segment?: string;
+    establishmentId?: number | null;
+  } | null;
+  knowledge?: KnowledgePayload;
+  message?: string;
+};
 type EvolutionStatusResponse = {
   status?: string;
   instance?: string;
@@ -418,6 +431,41 @@ export class AppointmentService {
 
     const data = (await response.json()) as { knowledge?: KnowledgePayload };
     return data.knowledge || {};
+  }
+
+  async getPublicTenantContext(options: { domain?: string; tenantCode?: string } = {}) {
+    const params = new URLSearchParams();
+    const normalizedDomain = String(options?.domain || "").trim();
+    const normalizedTenantCode = String(options?.tenantCode || "").trim();
+    if (normalizedDomain) {
+      params.set("domain", normalizedDomain);
+    }
+    if (normalizedTenantCode) {
+      params.set("tenantCode", normalizedTenantCode);
+    }
+
+    const response = await fetch(
+      this.getBackendEndpoint(`/api/public/tenant-context${params.toString() ? `?${params.toString()}` : ""}`),
+      {
+        method: "GET",
+        headers: { "Content-Type": "application/json" },
+      },
+    );
+
+    if (!response.ok) {
+      let message = `Falha ao resolver tenant publico (${response.status}).`;
+      try {
+        const payload = (await response.json()) as { message?: string };
+        if (payload?.message) {
+          message = payload.message;
+        }
+      } catch {
+        // Keep fallback message.
+      }
+      throw new Error(message);
+    }
+
+    return (await response.json()) as PublicTenantContext;
   }
 
   async saveKnowledge(knowledge: KnowledgePayload, adminToken = "", tenantCode = "") {

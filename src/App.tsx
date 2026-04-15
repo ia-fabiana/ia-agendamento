@@ -144,6 +144,18 @@ type AdminPrincipal = {
   expiresAt?: string;
 };
 
+type PublicTenantContext = {
+  found?: boolean;
+  matchedBy?: string;
+  tenant?: {
+    code: string;
+    name: string;
+    segment?: string;
+    establishmentId?: number | null;
+  } | null;
+  knowledge?: Record<string, unknown>;
+};
+
 type CrmSettings = {
   crmReturnEnabled?: boolean;
   crmMode?: 'beta' | 'manual' | 'automatic';
@@ -445,6 +457,22 @@ function mergeCategoryRulesWithCatalog(
   return [...map.values()].sort((a, b) => a.categoryName.localeCompare(b.categoryName, 'pt-BR'));
 }
 
+function compareTextPtBr(left: unknown, right: unknown) {
+  return String(left || '').localeCompare(String(right || ''), 'pt-BR', { sensitivity: 'base' });
+}
+
+function sortCategoryRulesAlphabetically(items: CrmCategoryRule[]) {
+  return [...(Array.isArray(items) ? items : [])].sort((left, right) =>
+    compareTextPtBr(left.categoryName, right.categoryName),
+  );
+}
+
+function sortCategoryOptionsAlphabetically(items: Array<{ categoryKey: string; categoryName: string }>) {
+  return [...(Array.isArray(items) ? items : [])].sort((left, right) =>
+    compareTextPtBr(left.categoryName, right.categoryName),
+  );
+}
+
 function extractEvolutionInstanceFromIdentifiers(identifiers: AdminTenantIdentifier[]) {
   const list = Array.isArray(identifiers) ? identifiers : [];
   const found = list.find((item) => String(item?.kind || '').trim().toLowerCase() === 'evolution_instance');
@@ -582,6 +610,8 @@ export default function App() {
   const [adminResolveValue, setAdminResolveValue] = useState('');
   const [adminResolveResult, setAdminResolveResult] = useState('');
   const [adminPrincipal, setAdminPrincipal] = useState<AdminPrincipal | null>(null);
+  const [publicTenantCode, setPublicTenantCode] = useState('');
+  const [publicTenantName, setPublicTenantName] = useState('');
   const [tenantLoginCode, setTenantLoginCode] = useState(() => {
     if (typeof window === 'undefined') return '';
     return window.localStorage.getItem(TENANT_LOGIN_LAST_STORAGE_KEY) || '';
@@ -638,8 +668,38 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    const resolvePublicTenant = async () => {
+      if (!appointmentService.current || typeof window === 'undefined') return;
+      const params = new URLSearchParams(window.location.search);
+      const tenantCodeHint = String(params.get('tenant') || '').trim();
+      const domainHint = tenantCodeHint ? '' : String(window.location.hostname || '').trim();
+
+      try {
+        const payload = (await appointmentService.current.getPublicTenantContext({
+          tenantCode: tenantCodeHint || undefined,
+          domain: domainHint || undefined,
+        })) as PublicTenantContext;
+        const resolvedCode = String(payload?.tenant?.code || '').trim();
+        const resolvedName = String(payload?.tenant?.name || '').trim();
+        setPublicTenantCode(resolvedCode);
+        setPublicTenantName(resolvedName);
+
+        if (!adminToken.trim() && payload?.knowledge && typeof payload.knowledge === 'object') {
+          setKnowledgeJson(JSON.stringify(payload.knowledge, null, 2));
+        }
+      } catch {
+        setPublicTenantCode('');
+        setPublicTenantName('');
+      }
+    };
+
+    resolvePublicTenant();
+  }, [adminToken]);
+
+  useEffect(() => {
     const loadKnowledge = async () => {
       if (!appointmentService.current) return;
+      if (!adminToken.trim() && publicTenantCode) return;
       setIsLoadingKnowledge(true);
       try {
         const tenantScopeCode = resolveKnowledgeTenantScopeCode();
@@ -654,7 +714,12 @@ export default function App() {
     };
 
     loadKnowledge();
-  }, [adminPrincipal?.role, adminToken, selectedAdminTenantCode]);
+  }, [adminPrincipal?.role, adminToken, publicTenantCode, selectedAdminTenantCode]);
+
+  useEffect(() => {
+    if (!publicTenantCode || tenantLoginCode.trim()) return;
+    setTenantLoginCode(publicTenantCode);
+  }, [publicTenantCode, tenantLoginCode]);
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -721,7 +786,7 @@ export default function App() {
           content: message.content,
         })),
         {
-          tenantCode: sessionTenantCode,
+          tenantCode: sessionTenantCode || publicTenantCode,
         },
       );
       const assistantMessage: Message = {
@@ -1868,13 +1933,15 @@ export default function App() {
 
   const handleCategoryRuleChange = (categoryKey: string, patch: Partial<CrmCategoryRule>) => {
     setCrmCategoryRules((current) =>
-      current.map((item) =>
-        item.categoryKey === categoryKey
-          ? {
-              ...item,
-              ...patch,
-            }
-          : item,
+      sortCategoryRulesAlphabetically(
+        current.map((item) =>
+          item.categoryKey === categoryKey
+            ? {
+                ...item,
+                ...patch,
+              }
+            : item,
+        ),
       ),
     );
   };
@@ -2138,8 +2205,9 @@ export default function App() {
         .filter(([categoryKey, categoryName]) => categoryKey && categoryName),
     ).entries(),
   )
-    .map(([categoryKey, categoryName]) => ({ categoryKey, categoryName }))
-    .sort((left, right) => left.categoryName.localeCompare(right.categoryName, 'pt-BR'));
+    .map(([categoryKey, categoryName]) => ({ categoryKey: String(categoryKey || ''), categoryName: String(categoryName || '') }));
+  const sortedCrmServiceCategoryOptions = sortCategoryOptionsAlphabetically(crmServiceCategoryOptions);
+  const sortedCrmCategoryRules = sortCategoryRulesAlphabetically(crmCategoryRules);
   const crmEnabledServices = crmServiceCatalog.filter((item) => Boolean(item.rule?.active));
   const crmServiceSearchToken = normalizeSearchText(crmServiceSearch);
   const crmFilteredServiceCatalog = crmServiceCatalog.filter((item) => {
@@ -2211,6 +2279,12 @@ export default function App() {
               <p className="text-sm text-white/70 mt-1">
                 Cliente entra com tenant, usuario e senha. Superadmin pode entrar por token.
               </p>
+              {publicTenantCode && (
+                <p className="text-xs text-white/60 mt-2">
+                  Tenant detectado automaticamente: <strong>{publicTenantName || publicTenantCode}</strong>
+                  {publicTenantName && publicTenantCode ? ` (${publicTenantCode})` : ''}
+                </p>
+              )}
             </div>
 
             <div className="space-y-2">
@@ -3113,7 +3187,7 @@ export default function App() {
                         className="rounded-md bg-[#0f1731] border border-white/15 text-white/90 px-3 py-2 text-sm"
                       >
                         <option value="all">Todas as categorias</option>
-                        {crmServiceCategoryOptions.map((item) => (
+                        {sortedCrmServiceCategoryOptions.map((item) => (
                           <option key={item.categoryKey} value={item.categoryKey}>
                             {item.categoryName}
                           </option>
@@ -3279,10 +3353,10 @@ export default function App() {
                             if (result.status === 'ok') {
                               setCrmDiagnostic(result);
                             } else {
-                              setAdminMessage(`Erro: ${result.message}`);
+                              setCrmStatus(`Erro: ${result.message}`);
                             }
                           } catch (err) {
-                            setAdminMessage(`Erro ao diagnosticar: ${err}`);
+                            setCrmStatus(`Erro ao diagnosticar: ${err}`);
                           } finally {
                             setCrmDiagnosticLoading(false);
                           }
@@ -3370,7 +3444,7 @@ export default function App() {
                               <td colSpan={5} className="py-3 text-white/60">Nenhuma categoria derivada do catalogo ainda.</td>
                             </tr>
                           )}
-                          {crmCategoryRules.map((item) => (
+                          {sortedCrmCategoryRules.map((item) => (
                             <tr key={item.categoryKey} className="border-t border-white/10 align-top">
                               <td className="py-2 pr-3">
                                 <input

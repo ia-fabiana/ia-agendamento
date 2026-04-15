@@ -637,7 +637,11 @@ app.use((req, res, next) => {
   return jsonBodyParser(req, res, next);
 });
 app.use((req, res, next) => {
-  res.header("Access-Control-Allow-Origin", "*");
+  const allowedOrigin = resolveAllowedCorsOrigin(req);
+  if (allowedOrigin) {
+    res.header("Access-Control-Allow-Origin", allowedOrigin);
+    res.header("Vary", "Origin");
+  }
   res.header("Access-Control-Allow-Methods", "GET,POST,PUT,PATCH,DELETE,OPTIONS");
   res.header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Api-Key, X-Admin-Token");
   if (req.method === "OPTIONS") {
@@ -880,6 +884,86 @@ function getConfiguredAdminToken() {
 
 function getAdminTokenFromRequest(req) {
   return toNonEmptyString(req?.headers?.["x-admin-token"] || "");
+}
+
+function extractHostnameCandidate(value) {
+  const raw = toNonEmptyString(value);
+  if (!raw) {
+    return "";
+  }
+
+  const candidate = raw.includes("://") ? raw : `https://${raw}`;
+  try {
+    return toNonEmptyString(new URL(candidate).hostname).toLowerCase();
+  } catch {
+    return raw
+      .replace(/^https?:\/\//i, "")
+      .split("/")[0]
+      .split(":")[0]
+      .trim()
+      .toLowerCase();
+  }
+}
+
+function isLocalDevelopmentHostname(hostname) {
+  const normalized = extractHostnameCandidate(hostname);
+  return ["localhost", "127.0.0.1", "::1"].includes(normalized);
+}
+
+function getRequestTenantDomain(req, explicitValue = "") {
+  const explicitHost = extractHostnameCandidate(explicitValue);
+  if (explicitHost) {
+    return explicitHost;
+  }
+
+  const candidates = [
+    req?.headers?.origin,
+    req?.headers?.referer,
+    req?.headers?.referrer,
+    req?.query?.domain,
+    req?.query?.hostname,
+    req?.body?.domain,
+    req?.body?.hostname,
+  ];
+
+  for (const candidate of candidates) {
+    const hostname = extractHostnameCandidate(candidate);
+    if (hostname) {
+      return hostname;
+    }
+  }
+
+  return "";
+}
+
+function resolveAllowedCorsOrigin(req) {
+  const origin = toNonEmptyString(req?.headers?.origin);
+  if (!origin) {
+    return "";
+  }
+
+  const originHost = extractHostnameCandidate(origin);
+  if (!originHost) {
+    return "";
+  }
+
+  if (isLocalDevelopmentHostname(originHost)) {
+    return origin;
+  }
+
+  const explicitAllowedOrigins = String(process.env.ALLOWED_CORS_ORIGINS || "")
+    .split(/[,;\s]+/g)
+    .map((item) => toNonEmptyString(item))
+    .filter(Boolean);
+  if (explicitAllowedOrigins.includes(origin)) {
+    return origin;
+  }
+
+  const matchedTenant = resolveTenantByIdentifier({
+    kind: "domain",
+    value: originHost,
+  });
+  return matchedTenant ? origin : "";
 }
 
 function normalizeTenantUsername(value) {
@@ -1585,12 +1669,24 @@ function resolveConversationTenantContext({
   tenantAlias = "",
   instanceName = "",
   establishmentId = null,
+  domain = "",
 } = {}) {
   const normalizedTenantCode = normalizeTenantCode(tenantCode || tenantAlias);
   let tenant = normalizedTenantCode ? getTenantByCode(normalizedTenantCode) : null;
 
   if (tenant && !tenant.active) {
     tenant = null;
+  }
+
+  const normalizedDomain = extractHostnameCandidate(domain);
+  if (!tenant && normalizedDomain) {
+    tenant = resolveTenantByIdentifier({
+      kind: "domain",
+      value: normalizedDomain,
+    });
+    if (tenant && !tenant.active) {
+      tenant = null;
+    }
   }
 
   const normalizedInstance = toNonEmptyString(instanceName);
@@ -11738,11 +11834,62 @@ app.get("/api/knowledge", (req, res) => {
       });
     }
 
+    const tenantFromDomain = resolveConversationTenantContext({
+      domain: getRequestTenantDomain(req),
+    });
+    if (tenantFromDomain?.tenant?.code) {
+      return res.json({
+        knowledge: tenantFromDomain.knowledge || {},
+        scope: "tenant_domain",
+        tenantCode: tenantFromDomain.tenant.code,
+      });
+    }
+
     const knowledge = loadSalonKnowledge();
     return res.json({ knowledge, scope: "global" });
   } catch (error) {
     return res.status(500).json({
       message: error.message || "Erro ao carregar base de conhecimento.",
+    });
+  }
+});
+
+app.get("/api/public/tenant-context", (req, res) => {
+  try {
+    const tenantCode = toNonEmptyString(req.query?.tenantCode || req.query?.tenant || "");
+    const domain = getRequestTenantDomain(req, req.query?.domain || req.query?.hostname || "");
+    const context = resolveConversationTenantContext({
+      tenantCode,
+      domain,
+    });
+
+    if (!context?.tenant) {
+      return res.json({
+        status: "ok",
+        found: false,
+        tenantCode: "",
+        matchedBy: domain ? "domain" : tenantCode ? "tenantCode" : "",
+      });
+    }
+
+    const knowledge = context.knowledge && typeof context.knowledge === "object" ? context.knowledge : {};
+    return res.json({
+      status: "ok",
+      found: true,
+      matchedBy: tenantCode ? "tenantCode" : "domain",
+      tenant: {
+        code: context.tenant.code,
+        name: context.tenant.name,
+        segment: context.tenant.segment,
+        establishmentId: context.establishmentId || null,
+      },
+      knowledge,
+    });
+  } catch (error) {
+    return res.status(error.status || 500).json({
+      status: "error",
+      message: error.message || "Erro ao resolver tenant publico.",
+      details: error.details || null,
     });
   }
 });
@@ -13967,6 +14114,7 @@ app.post("/api/chat", async (req, res) => {
       tenantAlias: tenant,
       instanceName: firstNonEmpty([instance, instanceName]),
       establishmentId,
+      domain: getRequestTenantDomain(req),
     });
 
     if (!message) {
