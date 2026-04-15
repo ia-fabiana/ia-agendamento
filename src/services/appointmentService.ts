@@ -1143,4 +1143,19 @@ export class AppointmentService {
       { method: "GET" },
     );
   }
+
+  async syncCrmHistory(
+    adminToken: string,
+    code: string,
+    payload: { lookbackDays?: number; limit?: number } = {},
+  ) {
+    return this.adminRequest<{ fetched?: number; inserted?: number; skipped?: number; message?: string }>(
+      `/api/admin/tenants/${encodeURIComponent(code)}/crm/sync-history`,
+      adminToken,
+      {
+        method: "POST",
+        body: JSON.stringify(payload),
+      },
+    );
+  }
 }

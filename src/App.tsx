@@ -619,6 +619,8 @@ export default function App() {
   const [crmShowOnlySelectedServices, setCrmShowOnlySelectedServices] = useState(true);
   const [crmDiagnostic, setCrmDiagnostic] = useState<any>(null);
   const [crmDiagnosticLoading, setCrmDiagnosticLoading] = useState(false);
+  const [crmSyncResult, setCrmSyncResult] = useState<{ fetched?: number; inserted?: number; skipped?: number; message?: string } | null>(null);
+  const [isSyncingCrmHistory, setIsSyncingCrmHistory] = useState(false);
   const [uploadingMarketingIndex, setUploadingMarketingIndex] = useState<number | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const appointmentService = useRef<AppointmentService | null>(null);
@@ -2004,6 +2006,32 @@ export default function App() {
     }
   };
 
+  const handleSyncCrmHistory = async () => {
+    if (!appointmentService.current || !adminToken.trim()) return;
+    const tenantCode = resolveCrmTenantScopeCode();
+    if (!tenantCode) {
+      setCrmStatus('Selecione um tenant para sincronizar o historico.');
+      return;
+    }
+    setIsSyncingCrmHistory(true);
+    setCrmStatus('');
+    setCrmSyncResult(null);
+    try {
+      const response = await appointmentService.current.syncCrmHistory(adminToken, tenantCode, {
+        lookbackDays: crmPreviewLookbackDays,
+        limit: 2000,
+      });
+      setCrmSyncResult(response);
+      setCrmStatus(response.message || `Historico sincronizado: ${response.inserted ?? 0} novos registros.`);
+      await loadCrmData();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Erro ao sincronizar historico do CRM.';
+      setCrmStatus(message);
+    } finally {
+      setIsSyncingCrmHistory(false);
+    }
+  };
+
   const handleApproveCrmFlow = async (flowId: number) => {
     if (!appointmentService.current || !adminToken.trim()) return;
     const tenantCode = resolveCrmTenantScopeCode();
@@ -2705,118 +2733,205 @@ export default function App() {
                     </p>
                   </div>
                   <div className="flex items-center gap-2 flex-wrap">
-                    <input
-                      type="number"
-                      min={30}
-                      max={730}
-                      value={crmPreviewLookbackDays}
-                      onChange={(e) => setCrmPreviewLookbackDays(Number(e.target.value || 365))}
-                      className="w-28 rounded-md bg-[#0f1731] border border-white/15 text-white/90 px-3 py-2 text-sm"
-                      title="Dias para olhar para tras no preview"
-                    />
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <span className="text-xs text-white/50">Janela de busca:</span>
+                      <input
+                        type="number"
+                        min={30}
+                        max={730}
+                        value={crmPreviewLookbackDays}
+                        onChange={(e) => setCrmPreviewLookbackDays(Number(e.target.value || 365))}
+                        className="w-24 rounded-md bg-[#0f1731] border border-white/15 text-white/90 px-3 py-2 text-sm"
+                        title="Quantos dias olhar para tras no historico"
+                      />
+                      <span className="text-xs text-white/50">dias</span>
+                    </div>
+                    <button
+                      onClick={handleSyncCrmHistory}
+                      disabled={isSyncingCrmHistory || isLoadingCrm || !adminToken.trim()}
+                      className="px-4 py-2 rounded-lg bg-amber-500 text-slate-950 text-xs font-semibold uppercase tracking-wider disabled:opacity-50"
+                      title="Importa o historico de agendamentos do Trinks para o banco local. Faca isso antes de rodar o preview."
+                    >
+                      {isSyncingCrmHistory ? 'Importando...' : '1. Importar Historico'}
+                    </button>
                     <button
                       onClick={() => handleRunCrmPreview(false)}
                       disabled={isLoadingCrm || !adminToken.trim()}
-                      className="px-4 py-2 rounded-lg bg-brand-green text-black text-xs uppercase tracking-wider disabled:opacity-50"
+                      className="px-4 py-2 rounded-lg bg-brand-green text-black text-xs font-semibold uppercase tracking-wider disabled:opacity-50"
+                      title="Simula quais clientes entrariam no fluxo. Nao grava nada."
                     >
-                      Preview beta
-                    </button>
-                    <button
-                      onClick={() => handleRunCrmPreview(true)}
-                      disabled={isLoadingCrm || !adminToken.trim()}
-                      className="px-4 py-2 rounded-lg bg-brand-blue text-white text-xs uppercase tracking-wider disabled:opacity-50"
-                    >
-                      Aplicar preview
+                      2. Simular Preview
                     </button>
                     <button
                       onClick={handleRefreshCrmEligibleNow}
                       disabled={isLoadingCrm || !adminToken.trim()}
-                      className="px-4 py-2 rounded-lg bg-emerald-500/80 text-slate-950 text-xs uppercase tracking-wider disabled:opacity-50"
-                      title="Recalcula quem esta elegivel agora e atualiza a lista operacional"
+                      className="px-4 py-2 rounded-lg bg-brand-blue text-white text-xs font-semibold uppercase tracking-wider disabled:opacity-50"
+                      title="Detecta clientes elegiveis agora e cria os fluxos no CRM."
                     >
-                      Atualizar elegiveis
+                      3. Ativar Fluxos
                     </button>
                     <button
                       onClick={loadCrmData}
                       disabled={isLoadingCrm || !adminToken.trim()}
                       className="px-4 py-2 rounded-lg bg-white/10 text-white text-xs uppercase tracking-wider disabled:opacity-50"
                     >
-                      {isLoadingCrm ? 'Atualizando...' : 'Recarregar tela'}
+                      {isLoadingCrm ? 'Atualizando...' : 'Recarregar'}
                     </button>
                     <button
                       onClick={handleSaveCrmSettings}
                       disabled={isLoadingCrm || !adminToken.trim()}
-                      className="px-4 py-2 rounded-lg bg-brand-blue text-white text-xs uppercase tracking-wider disabled:opacity-50"
+                      className="px-4 py-2 rounded-lg bg-white/15 text-white text-xs uppercase tracking-wider disabled:opacity-50"
                     >
-                      Salvar base CRM
+                      Salvar Config
                     </button>
                   </div>
                 </div>
 
-                {crmStatus && <p className="text-xs text-brand-green">{crmStatus}</p>}
-                <p className="text-[11px] text-white/50 -mt-1">
-                  `Preview beta` simula. `Aplicar preview` grava o que saiu no preview. `Atualizar elegiveis` recalcula e grava na hora. `Recarregar tela` apenas atualiza a lista ja salva.
-                </p>
+                {crmStatus && (
+                  <p className={`text-xs ${crmStatus.toLowerCase().includes('erro') ? 'text-red-400' : 'text-brand-green'}`}>
+                    {crmStatus}
+                  </p>
+                )}
+
+                {/* Painel de ativacao — mostra o que precisa ser feito */}
+                <div className="rounded-xl bg-white/5 border border-white/10 p-4">
+                  <p className="text-xs uppercase tracking-wider text-white/55 mb-3">Status de Ativacao do CRM</p>
+                  <div className="grid md:grid-cols-3 gap-3">
+                    <div className={`rounded-lg border p-3 ${crmSettingsDraft.crmReturnEnabled ? 'bg-emerald-500/10 border-emerald-400/30' : 'bg-red-500/10 border-red-400/30'}`}>
+                      <div className="flex items-center gap-2">
+                        <span className="text-base">{crmSettingsDraft.crmReturnEnabled ? '✅' : '❌'}</span>
+                        <span className="text-sm text-white font-medium">CRM Ativado</span>
+                      </div>
+                      {!crmSettingsDraft.crmReturnEnabled && (
+                        <p className="text-xs text-red-300 mt-1">Ative em "Configuracao Global" abaixo e salve.</p>
+                      )}
+                    </div>
+                    <div className={`rounded-lg border p-3 ${(crmDashboard?.totals?.auditAppointmentsTotal ?? 0) > 0 ? 'bg-emerald-500/10 border-emerald-400/30' : 'bg-red-500/10 border-red-400/30'}`}>
+                      <div className="flex items-center gap-2">
+                        <span className="text-base">{(crmDashboard?.totals?.auditAppointmentsTotal ?? 0) > 0 ? '✅' : '❌'}</span>
+                        <span className="text-sm text-white font-medium">Historico Importado</span>
+                      </div>
+                      <p className="text-xs text-white/60 mt-1">
+                        {(crmDashboard?.totals?.auditAppointmentsTotal ?? 0) > 0
+                          ? `${crmDashboard?.totals?.auditAppointmentsTotal} agendamentos no banco`
+                          : 'Clique em "1. Importar Historico" acima'}
+                      </p>
+                      {crmSyncResult && (
+                        <p className="text-xs text-amber-300 mt-1">
+                          Ultima sync: {crmSyncResult.inserted ?? 0} inseridos, {crmSyncResult.fetched ?? 0} encontrados no Trinks
+                        </p>
+                      )}
+                    </div>
+                    <div className={`rounded-lg border p-3 ${(crmDashboard?.totals?.activeServiceRules ?? 0) > 0 ? 'bg-emerald-500/10 border-emerald-400/30' : 'bg-red-500/10 border-red-400/30'}`}>
+                      <div className="flex items-center gap-2">
+                        <span className="text-base">{(crmDashboard?.totals?.activeServiceRules ?? 0) > 0 ? '✅' : '❌'}</span>
+                        <span className="text-sm text-white font-medium">Regras Configuradas</span>
+                      </div>
+                      <p className="text-xs text-white/60 mt-1">
+                        {(crmDashboard?.totals?.activeServiceRules ?? 0) > 0
+                          ? `${crmDashboard?.totals?.activeServiceRules} servicos ativos com regra de retorno`
+                          : 'Configure servicos em "Regras Por Servico" abaixo'}
+                      </p>
+                    </div>
+                  </div>
+                  {crmSettingsDraft.crmReturnEnabled && (crmDashboard?.totals?.auditAppointmentsTotal ?? 0) > 0 && (crmDashboard?.totals?.activeServiceRules ?? 0) > 0 && (
+                    <p className="text-xs text-emerald-400 mt-3">Tudo configurado! Clique em "3. Ativar Fluxos" para iniciar os fluxos de retorno.</p>
+                  )}
+                </div>
 
                 {crmPreview && (
                   <div className="rounded-xl bg-white/5 border border-white/10 p-4 space-y-4">
                     <div className="flex items-center justify-between gap-3 flex-wrap">
                       <div>
-                        <p className="text-sm uppercase tracking-wider text-white/70">Preview / Beta Manual</p>
+                        <p className="text-sm font-semibold text-white">Resultado do Preview</p>
                         <p className="text-xs text-white/55 mt-1">
-                          Gerado em {crmPreview.generatedAt ? new Date(crmPreview.generatedAt).toLocaleString('pt-BR') : '-'} | modo {crmPreview.crmMode || '-'}
+                          {crmPreview.generatedAt ? new Date(crmPreview.generatedAt).toLocaleString('pt-BR') : '-'} · modo: {
+                            crmPreview.crmMode === 'automatic' ? 'automatico' :
+                            crmPreview.crmMode === 'manual' ? 'aprovacao manual' : 'beta manual'
+                          }
                         </p>
                       </div>
-                      <div className="text-xs text-white/60">
-                        {crmPreview.materialize ? 'Preview materializado' : 'Apenas simulacao'}
+                      <div className={`text-xs px-3 py-1 rounded-full border ${crmPreview.materialize ? 'bg-emerald-500/15 border-emerald-400/30 text-emerald-300' : 'bg-white/5 border-white/10 text-white/60'}`}>
+                        {crmPreview.materialize ? 'Fluxos criados no CRM' : 'Simulacao — nada foi gravado'}
                       </div>
                     </div>
                     <div className="grid md:grid-cols-4 gap-3">
                       {[
-                        ['Candidatas a fluxo', crmPreview.summary?.flowCandidates || 0],
-                        ['Oportunidades', crmPreview.summary?.opportunityCandidates || 0],
-                        ['Puladas', crmPreview.summary?.skipped || 0],
-                        ['Linhas auditadas', crmPreview.summary?.auditedRows || 0],
-                      ].map(([label, value]) => (
+                        ['Entram no fluxo', crmPreview.summary?.flowCandidates || 0, 'text-emerald-300'],
+                        ['Oportunidades', crmPreview.summary?.opportunityCandidates || 0, 'text-sky-300'],
+                        ['Puladas', crmPreview.summary?.skipped || 0, 'text-amber-300'],
+                        ['Historico analisado', crmPreview.summary?.auditedRows || 0, 'text-white/70'],
+                      ].map(([label, value, color]) => (
                         <div key={String(label)} className="rounded-lg bg-white/5 border border-white/10 p-3">
                           <p className="text-[11px] uppercase tracking-wider text-white/55">{label}</p>
-                          <p className="heading-bold text-xl text-white mt-2">{value}</p>
+                          <p className={`heading-bold text-xl mt-2 ${color}`}>{value}</p>
                         </div>
                       ))}
                     </div>
-                    <div className="grid xl:grid-cols-2 gap-4">
+                    <div className="grid xl:grid-cols-3 gap-4">
                       <div className="rounded-lg bg-white/5 border border-white/10 p-3">
-                        <p className="text-xs uppercase tracking-wider text-white/60 mb-2">
-                          Candidatas ({Array.isArray(crmPreview.flowCandidates) ? crmPreview.flowCandidates.length : 0})
+                        <p className="text-xs uppercase tracking-wider text-emerald-400/80 mb-2">
+                          Entram no Fluxo ({Array.isArray(crmPreview.flowCandidates) ? crmPreview.flowCandidates.length : 0})
                         </p>
                         <div className="space-y-2 max-h-[260px] overflow-y-auto pr-1">
-                          {!crmPreview.flowCandidates?.length && <p className="text-sm text-white/60">Nenhuma candidata a fluxo neste preview.</p>}
+                          {!crmPreview.flowCandidates?.length && (
+                            <p className="text-sm text-white/50">Nenhuma cliente elegivel encontrada. Verifique se o historico foi importado e as regras estao ativas.</p>
+                          )}
                           {crmPreview.flowCandidates?.map((item, idx) => (
-                            <div key={`crm-preview-flow-${idx}`} className="rounded-lg bg-white/5 border border-white/10 p-3">
-                              <div className="text-sm text-white">{String(item.clientName || item.phone || 'Cliente')}</div>
-                              <div className="text-xs text-white/60">
-                                {String(item.originServiceName || '-')} | {String(item.originCategoryName || '-')}
+                            <div key={`crm-preview-flow-${idx}`} className="rounded-lg bg-emerald-500/10 border border-emerald-400/20 p-3">
+                              <div className="text-sm text-white font-medium">{String(item.clientName || item.phone || 'Cliente')}</div>
+                              <div className="text-xs text-white/65 mt-0.5">
+                                {String(item.originServiceName || '-')}
                               </div>
-                              <div className="text-xs text-white/75 mt-1">
-                                Ultima visita: {String(item.lastVisitAt || '-')} | Profissional: {String(item.lastProfessionalName || 'nao informado')}
+                              <div className="text-xs text-white/50 mt-1">
+                                Ultima visita: {String(item.lastVisitAt || '-')} · {String(item.daysSinceLastVisit || 0)} dias atras
                               </div>
                             </div>
                           ))}
                         </div>
                       </div>
                       <div className="rounded-lg bg-white/5 border border-white/10 p-3">
-                        <p className="text-xs uppercase tracking-wider text-white/60 mb-2">
+                        <p className="text-xs uppercase tracking-wider text-amber-400/80 mb-2">
+                          Puladas ({Array.isArray(crmPreview.skipped) ? crmPreview.skipped.filter((s: any) => s.type === 'flow').length : 0})
+                        </p>
+                        <div className="space-y-2 max-h-[260px] overflow-y-auto pr-1">
+                          {!crmPreview.skipped?.filter((s: any) => s.type === 'flow').length && (
+                            <p className="text-sm text-white/50">Nenhuma cliente foi pulada.</p>
+                          )}
+                          {crmPreview.skipped?.filter((s: any) => s.type === 'flow').map((item: any, idx: number) => {
+                            const reasonLabel: Record<string, string> = {
+                              future_booking: 'Ja tem agendamento futuro',
+                              already_open: 'Ja esta em fluxo ativo',
+                              client_blocked: 'Cliente bloqueada',
+                            };
+                            return (
+                              <div key={`crm-skipped-${idx}`} className="rounded-lg bg-amber-500/10 border border-amber-400/20 p-3">
+                                <div className="text-sm text-white">{String(item.clientName || item.phone || 'Cliente')}</div>
+                                <div className="text-xs text-amber-300 mt-0.5">
+                                  {reasonLabel[item.reason] || item.reason || 'Motivo desconhecido'}
+                                </div>
+                                <div className="text-xs text-white/50 mt-0.5">{String(item.serviceName || '-')}</div>
+                                {item.firstFutureBooking && (
+                                  <div className="text-xs text-white/40 mt-0.5">Proximo: {String(item.firstFutureBooking)}</div>
+                                )}
+                              </div>
+                            );
+                          })}
+                        </div>
+                      </div>
+                      <div className="rounded-lg bg-white/5 border border-white/10 p-3">
+                        <p className="text-xs uppercase tracking-wider text-sky-400/80 mb-2">
                           Oportunidades ({Array.isArray(crmPreview.opportunityCandidates) ? crmPreview.opportunityCandidates.length : 0})
                         </p>
                         <div className="space-y-2 max-h-[260px] overflow-y-auto pr-1">
-                          {!crmPreview.opportunityCandidates?.length && <p className="text-sm text-white/60">Nenhuma oportunidade neste preview.</p>}
+                          {!crmPreview.opportunityCandidates?.length && <p className="text-sm text-white/50">Nenhuma oportunidade neste preview.</p>}
                           {crmPreview.opportunityCandidates?.map((item, idx) => (
-                            <div key={`crm-preview-opportunity-${idx}`} className="rounded-lg bg-white/5 border border-white/10 p-3">
-                              <div className="text-sm text-white">{String(item.clientName || item.phone || 'Cliente')}</div>
-                              <div className="text-xs text-white/60">
-                                {String(item.categoryName || '-')} | origem {String(item.sourceServiceName || '-')}
+                            <div key={`crm-preview-opportunity-${idx}`} className="rounded-lg bg-sky-500/10 border border-sky-400/20 p-3">
+                              <div className="text-sm text-white font-medium">{String(item.clientName || item.phone || 'Cliente')}</div>
+                              <div className="text-xs text-white/65 mt-0.5">
+                                {String(item.categoryName || '-')} · origem: {String(item.sourceServiceName || '-')}
                               </div>
-                              <div className="text-xs text-white/75 mt-1">
+                              <div className="text-xs text-white/50 mt-1">
                                 Sem retorno ha {String(item.daysWithoutReturn || 0)} dias
                               </div>
                             </div>
@@ -2829,10 +2944,10 @@ export default function App() {
 
                 <div className="grid md:grid-cols-4 gap-3">
                   {[
-                    ['Servicos configurados', crmDashboard?.totals?.configuredServices || 0],
+                    ['Historico importado', crmDashboard?.totals?.auditAppointmentsTotal || 0],
                     ['Regras ativas', crmDashboard?.totals?.activeServiceRules || 0],
+                    ['Fluxos ativos', crmDashboard?.totals?.flowsTotal || 0],
                     ['Clientes bloqueadas', crmDashboard?.totals?.blockedClients || 0],
-                    ['Oportunidades', crmDashboard?.totals?.opportunitiesTotal || 0],
                   ].map(([label, value]) => (
                     <div key={String(label)} className="rounded-xl bg-white/5 border border-white/10 p-4">
                       <p className="text-xs uppercase tracking-wider text-white/60">{label}</p>
@@ -3371,9 +3486,17 @@ export default function App() {
 
                 <div className="grid xl:grid-cols-2 gap-4">
                   <div className="rounded-xl bg-white/5 border border-white/10 p-4">
-                    <p className="text-sm uppercase tracking-wider text-white/70 mb-3">Fluxos Atuais</p>
-                    <div className="space-y-2 max-h-[320px] overflow-y-auto pr-1">
-                      {!crmFlows.length && <p className="text-sm text-white/60">Ainda nao existem fluxos operacionais criados.</p>}
+                    <p className="text-sm font-semibold text-white mb-3">
+                      Fluxos Ativos
+                      {crmFlows.length > 0 && <span className="ml-2 text-xs text-white/50 font-normal">({crmFlows.length} total)</span>}
+                    </p>
+                    <div className="space-y-2 max-h-[480px] overflow-y-auto pr-1">
+                      {!crmFlows.length && (
+                        <div className="rounded-lg bg-white/5 border border-white/10 p-4 text-center">
+                          <p className="text-sm text-white/60">Nenhum fluxo criado ainda.</p>
+                          <p className="text-xs text-white/40 mt-1">Clique em "3. Ativar Fluxos" para iniciar.</p>
+                        </div>
+                      )}
                       {crmFlows.map((item) => {
                         const flowId = item.id ?? 0;
                         const isExpanded = expandedFlowId === flowId;
@@ -3392,13 +3515,24 @@ export default function App() {
                               : flowTiming.tone === 'info'
                                 ? 'bg-sky-500/15 border-sky-400/20 text-sky-100'
                                 : 'bg-white/5 border-white/10 text-white/70';
+                        const statusLabel: Record<string, string> = {
+                          pending_approval: 'Aguardando aprovacao',
+                          eligible: 'Elegivel',
+                          scheduled_step_1: 'Msg 1 agendada',
+                          scheduled_step_2: 'Msg 2 agendada',
+                          scheduled_step_3: 'Msg 3 agendada',
+                          converted: 'Convertida',
+                          stopped: 'Encerrado',
+                          expired: 'Expirado',
+                          opted_out: 'Optou por sair',
+                        };
                         return (
                           <div key={`crm-flow-${flowId || item.phone}`} className="rounded-lg bg-white/5 border border-white/10 p-3 space-y-2">
                             <div className="flex items-start justify-between gap-2">
                               <div className="min-w-0 flex-1">
-                                <div className="text-sm text-white">{item.clientName || item.phone || 'Cliente sem nome'}</div>
-                                <div className="text-xs text-white/60">
-                                  {item.originServiceName || 'sem servico'} | etapa {item.currentStep || 0} | {item.flowStatus || 'sem status'}
+                                <div className="text-sm text-white font-medium">{item.clientName || item.phone || 'Cliente sem nome'}</div>
+                                <div className="text-xs text-white/60 mt-0.5">
+                                  {item.originServiceName || 'sem servico'} · etapa {item.currentStep || 0} · <span className="text-white/80">{statusLabel[flowStatus] || flowStatus}</span>
                                 </div>
                                 <div className="text-xs text-white/75">
                                   Ultimo profissional: {item.lastProfessionalName || 'nao informado'}
