@@ -358,6 +358,13 @@ function normalizeSearchText(value: string) {
     .toLowerCase();
 }
 
+function buildManualCrmServiceKey(serviceName: string) {
+  const normalized = normalizeSearchText(serviceName)
+    .replace(/[^a-z0-9]+/g, '_')
+    .replace(/^_+|_+$/g, '');
+  return normalized ? `manual_${normalized}` : '';
+}
+
 function formatDateTimePtBr(value?: string | null) {
   if (!value) return '';
   const parsed = new Date(value);
@@ -1971,6 +1978,54 @@ export default function App() {
     );
   };
 
+  const handleAddManualCrmService = () => {
+    const serviceName = String(crmServiceSearch || '').trim();
+    const serviceKey = buildManualCrmServiceKey(serviceName);
+
+    if (!serviceName || !serviceKey) {
+      setCrmStatus('Digite o nome do servico para adicionar manualmente.');
+      return;
+    }
+
+    setCrmServiceCatalog((current) => {
+      if (current.some((item) => item.serviceKey === serviceKey || normalizeSearchText(item.serviceName) === normalizeSearchText(serviceName))) {
+        return current;
+      }
+
+      const manualItem: CrmCatalogService = {
+        serviceKey,
+        serviceName,
+        categoryKey: 'manual',
+        categoryName: 'Manual (sem Trinks)',
+        serviceId: null,
+        durationMinutes: null,
+        price: null,
+        active: true,
+        visibleToClient: null,
+        rule: {
+          serviceKey,
+          serviceName,
+          categoryKey: 'manual',
+          categoryName: 'Manual (sem Trinks)',
+          active: true,
+          useDefaultFlow: true,
+          priority: 'medium',
+          ...buildDefaultCrmStepTemplates(),
+        },
+      };
+
+      return [...current, manualItem].sort((a, b) =>
+        `${a.categoryName || ''} ${a.serviceName || ''}`.localeCompare(`${b.categoryName || ''} ${b.serviceName || ''}`, 'pt-BR', {
+          sensitivity: 'base',
+        }),
+      );
+    });
+
+    setCrmStatus('Servico adicionado manualmente. Voce ja pode salvar as regras.');
+    setCrmServiceCategoryFilter('all');
+    setCrmShowOnlySelectedServices(false);
+  };
+
   const handleSaveCrmServiceRules = async () => {
     if (!appointmentService.current || !adminToken.trim()) return;
     const tenantCode = resolveCrmTenantScopeCode();
@@ -2292,6 +2347,16 @@ export default function App() {
   const sortedCrmServiceCategoryOptions = sortCategoryOptionsAlphabetically(crmServiceCategoryOptions);
   const sortedCrmCategoryRules = sortCategoryRulesAlphabetically(crmCategoryRules);
   const crmEnabledServices = crmServiceCatalog.filter((item) => Boolean(item.rule?.active));
+  const crmManualServiceNameCandidate = String(crmServiceSearch || '').trim();
+  const crmManualServiceKeyCandidate = buildManualCrmServiceKey(crmManualServiceNameCandidate);
+  const canAddManualCrmService = Boolean(
+    crmManualServiceKeyCandidate
+    && !crmServiceCatalog.some(
+      (item) =>
+        item.serviceKey === crmManualServiceKeyCandidate
+        || normalizeSearchText(item.serviceName) === normalizeSearchText(crmManualServiceNameCandidate),
+    ),
+  );
   const crmServiceSearchToken = normalizeSearchText(crmServiceSearch);
   const crmFilteredServiceCatalog = crmServiceCatalog.filter((item) => {
     if (crmShowOnlySelectedServices && !item.rule?.active) {
@@ -3291,6 +3356,20 @@ export default function App() {
                     <p className="text-[11px] text-white/50">
                       Variaveis disponiveis nas mensagens: <span className="text-white/75">{'{{client_name}}'}</span>, <span className="text-white/75">{'{{service_name}}'}</span>, <span className="text-white/75">{'{{last_visit_at}}'}</span> e <span className="text-white/75">{'{{human_number}}'}</span>.
                     </p>
+                    {canAddManualCrmService && (
+                      <div className="flex items-center justify-between gap-3 flex-wrap rounded-md border border-amber-400/20 bg-amber-500/10 px-3 py-2">
+                        <p className="text-xs text-amber-100/90">
+                          Nao encontrou no Trinks? Adicione manualmente com o nome digitado.
+                        </p>
+                        <button
+                          type="button"
+                          onClick={handleAddManualCrmService}
+                          className="px-3 py-1.5 rounded-md border border-amber-300/30 bg-amber-400/15 text-amber-50 text-xs uppercase tracking-wider"
+                        >
+                          Adicionar manualmente
+                        </button>
+                      </div>
+                    )}
                     {!!crmEnabledServices.length && (
                       <div className="space-y-2">
                         <p className="text-xs uppercase tracking-wider text-white/55">Servicos habilitados no CRM</p>
@@ -3332,7 +3411,7 @@ export default function App() {
                       <tbody>
                         {!crmServiceCatalog.length && (
                           <tr>
-                            <td colSpan={8} className="py-3 text-white/60">Nenhum servico carregado do Trinks ainda.</td>
+                            <td colSpan={8} className="py-3 text-white/60">Nenhum servico carregado do Trinks ainda. Use "Adicionar manualmente" para cadastrar agora.</td>
                           </tr>
                         )}
                         {!!crmServiceCatalog.length && !crmFilteredServiceCatalog.length && (

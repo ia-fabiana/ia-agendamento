@@ -1,0 +1,19 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ls *.sh)",
+      "Bash(ls deploy*)",
+      "Bash(ssh:*)",
+      "Bash(scp /tmp/recreate_tenant.js root@204.168.176.220:/opt/ia-agendamento/recreate_tenant.js)",
+      "Bash(cat)",
+      "Bash(scp /tmp/debug_password.mjs root@204.168.176.220:/opt/ia-agendamento/debug_password.mjs)",
+      "Bash(scp /tmp/recreate_tenant.mjs root@204.168.176.220:/opt/ia-agendamento/recreate_tenant.mjs)",
+      "Bash(curl -s http://localhost:3001/api/health)",
+      "Bash(curl -s -X POST http://localhost:3001/api/admin/login -H 'Content-Type: application/json' -d '{\"tenantCode\":\"jacques-janine-leo\",\"username\":\"leopoldina\",\"password\":\"Lpo!2026#Acesso88\"}')",
+      "Bash(curl:*)",
+      "Bash(node:*)",
+      "Bash(ls -la server/tenants/*.json)",
+      "Bash(npm run:*)"
+    ]
+  }
+}

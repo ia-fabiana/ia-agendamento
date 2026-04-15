@@ -2825,8 +2825,11 @@ function listCrmCategoryOpportunitiesByCode(code, { status = "", limit = 200 } =
 function resolveServiceKeyFromCatalogItem(item) {
   const idCandidate = firstNonEmpty([
     toNonEmptyString(item?.id),
+    toNonEmptyString(item?.idServico),
     toNonEmptyString(item?.servicoId),
+    toNonEmptyString(item?.servico?.id),
     toNonEmptyString(item?.serviceId),
+    toNonEmptyString(item?.service?.id),
     toNonEmptyString(item?.codigo),
     toNonEmptyString(item?.code),
   ]);
@@ -2840,9 +2843,14 @@ function resolveServiceKeyFromCatalogItem(item) {
 function resolveCategoryKeyFromCatalogItem(item) {
   return firstNonEmpty([
     toNonEmptyString(item?.categoriaId),
+    toNonEmptyString(item?.categoriaServicoId),
+    toNonEmptyString(item?.grupoServicoId),
     toNonEmptyString(item?.categoria?.id),
+    toNonEmptyString(item?.grupoServico?.id),
     toNonEmptyString(item?.categoryId),
     toNonEmptyString(item?.category?.id),
+    toNonEmptyString(item?.groupId),
+    toNonEmptyString(item?.group?.id),
     normalizeTenantCode(item?.categoriaNome || item?.categoria || item?.category || item?.categoryName).replace(/-/g, "_"),
   ]);
 }
@@ -2850,23 +2858,47 @@ function resolveCategoryKeyFromCatalogItem(item) {
 function resolveCategoryNameFromCatalogItem(item) {
   return firstNonEmpty([
     toNonEmptyString(item?.categoriaNome),
+    toNonEmptyString(item?.categoriaServicoNome),
+    toNonEmptyString(item?.grupoServicoNome),
     toNonEmptyString(item?.categoria?.nome),
+    toNonEmptyString(item?.grupoServico?.nome),
     toNonEmptyString(item?.categoria),
     toNonEmptyString(item?.categoryName),
     toNonEmptyString(item?.category?.name),
     toNonEmptyString(item?.category),
+    toNonEmptyString(item?.groupName),
+    toNonEmptyString(item?.group?.name),
   ]);
 }
 
 function mapTrinksCatalogServiceItem(item) {
   const serviceKey = resolveServiceKeyFromCatalogItem(item);
-  const serviceName = toNonEmptyString(item?.nome || item?.name || item?.servicoNome);
+  const serviceName = firstNonEmpty([
+    toNonEmptyString(item?.nome),
+    toNonEmptyString(item?.name),
+    toNonEmptyString(item?.servicoNome),
+    toNonEmptyString(item?.nomeServico),
+    toNonEmptyString(item?.descricao),
+    toNonEmptyString(item?.titulo),
+    toNonEmptyString(item?.serviceName),
+    toNonEmptyString(item?.servico?.nome),
+    toNonEmptyString(item?.servico?.name),
+    toNonEmptyString(item?.service?.name),
+  ]);
   if (!serviceKey || !serviceName) {
     return null;
   }
 
-  const duration = Number(item?.duracaoEmMinutos || item?.duracao || item?.duracaoMinutos);
-  const price = Number(item?.valor || item?.preco);
+  const duration = Number(
+    item?.duracaoEmMinutos
+      || item?.duracao
+      || item?.duracaoMinutos
+      || item?.duracaoServico
+      || item?.duracaoServicoMinutos
+      || item?.tempo
+      || item?.tempoMinutos,
+  );
+  const price = Number(item?.valor || item?.preco || item?.valorServico || item?.price);
   const categoryKey = resolveCategoryKeyFromCatalogItem(item);
   const categoryName = resolveCategoryNameFromCatalogItem(item);
 
@@ -2875,13 +2907,15 @@ function mapTrinksCatalogServiceItem(item) {
     serviceName,
     categoryKey,
     categoryName,
-    serviceId: Number.isFinite(Number(item?.id || item?.servicoId || item?.serviceId))
-      ? Number(item?.id || item?.servicoId || item?.serviceId)
+    serviceId: Number.isFinite(Number(item?.id || item?.idServico || item?.servicoId || item?.serviceId || item?.servico?.id || item?.service?.id))
+      ? Number(item?.id || item?.idServico || item?.servicoId || item?.serviceId || item?.servico?.id || item?.service?.id)
       : null,
     durationMinutes: Number.isFinite(duration) && duration > 0 ? duration : null,
     price: Number.isFinite(price) ? price : null,
-    active: item?.ativo == null ? true : Boolean(item.ativo),
-    visibleToClient: item?.visivelCliente == null ? null : Boolean(item.visivelCliente),
+    active: item?.ativo == null && item?.active == null ? true : Boolean(item?.ativo ?? item?.active),
+    visibleToClient: item?.visivelCliente == null && item?.visibleToClient == null
+      ? null
+      : Boolean(item?.visivelCliente ?? item?.visibleToClient),
     raw: item,
   };
 }
@@ -6231,10 +6265,77 @@ async function findExistingClientByPhone(estabelecimentoId, clientPhone) {
 }
 
 function extractItems(payload) {
-  if (Array.isArray(payload)) return payload;
-  if (Array.isArray(payload?.items)) return payload.items;
-  if (Array.isArray(payload?.data)) return payload.data;
-  if (Array.isArray(payload?.result)) return payload.result;
+  if (Array.isArray(payload)) {
+    return payload;
+  }
+  if (!payload || typeof payload !== "object") {
+    return [];
+  }
+
+  const itemKeys = [
+    "items",
+    "itens",
+    "data",
+    "result",
+    "results",
+    "servicos",
+    "services",
+    "clientes",
+    "clients",
+    "agendamentos",
+    "appointments",
+    "profissionais",
+    "professionals",
+    "content",
+    "records",
+    "rows",
+    "values",
+    "value",
+  ];
+  const containerKeys = [
+    "data",
+    "result",
+    "response",
+    "payload",
+    "body",
+    "retorno",
+    "page",
+    "pagination",
+    "paginacao",
+    "meta",
+  ];
+
+  for (const key of itemKeys) {
+    if (Array.isArray(payload?.[key])) {
+      return payload[key];
+    }
+  }
+
+  for (const key of containerKeys) {
+    const container = payload?.[key];
+    if (!container || typeof container !== "object") {
+      continue;
+    }
+    if (Array.isArray(container)) {
+      return container;
+    }
+    for (const itemKey of itemKeys) {
+      if (Array.isArray(container?.[itemKey])) {
+        return container[itemKey];
+      }
+    }
+  }
+
+  const values = Object.values(payload);
+  for (const value of values) {
+    if (!value || typeof value !== "object") {
+      continue;
+    }
+    if (Array.isArray(value) && value.length && typeof value[0] === "object") {
+      return value;
+    }
+  }
+
   return [];
 }
 
@@ -7457,6 +7558,42 @@ async function trinksRequest(path, { method = "GET", estabelecimentoId, body, qu
     }
 
     if (response.ok) {
+      const businessMessage = toNonEmptyString(
+        json?.message || json?.mensagem || json?.error || json?.erro || "",
+      );
+      const normalizedBusinessMessage = normalizeForMatch(businessMessage);
+      const payloadItems = extractItems(json);
+      const hasListPayload = Array.isArray(payloadItems) && payloadItems.length > 0;
+      const businessRateLimit =
+        !hasListPayload
+        && (
+          normalizedBusinessMessage.includes("limit exceeded")
+          || normalizedBusinessMessage.includes("too many requests")
+          || normalizedBusinessMessage.includes("rate limit")
+          || normalizedBusinessMessage.includes("limite excedido")
+          || normalizedBusinessMessage.includes("limite atingido")
+        );
+
+      if (businessRateLimit) {
+        if (attempt < totalAttempts) {
+          const waitMs = TRINKS_RETRY_BASE_MS * (2 ** (attempt - 1));
+          await new Promise((resolve) => setTimeout(resolve, waitMs));
+          continue;
+        }
+
+        const rateLimitError = new Error(`Trinks: ${businessMessage || "Limit Exceeded"}`);
+        rateLimitError.status = 429;
+        rateLimitError.details = {
+          response: json || text,
+          attempt,
+          totalAttempts,
+          method,
+          path,
+          reason: "business_rate_limit",
+        };
+        throw rateLimitError;
+      }
+
       return json;
     }
 
