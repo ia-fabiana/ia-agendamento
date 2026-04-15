@@ -751,29 +751,16 @@ export default function App() {
   const handleSaveKnowledge = async () => {
     if (!appointmentService.current || isSavingKnowledge) return;
     setIsSavingKnowledge(true);
-    setKnowledgeStatus('Salvando...');
+    setKnowledgeStatus('Salvando base de conhecimento...');
 
     try {
-      // Save establishment ID if it's a tenant (not admin viewing other tenants)
-      const estId = currentTenant?.establishmentId;
-      if (adminToken.trim() && !resolveKnowledgeTenantScopeCode()) {
-        // Tenant saving their own establishmentId
-        try {
-          await appointmentService.current.saveEstablishmentId(adminToken, estId || null);
-        } catch (estError) {
-          console.warn('Aviso ao salvar establishmentId:', estError);
-          // Continue saving knowledge even if estId fails
-        }
-      }
-
       const parsed = safeParseKnowledge(knowledgeJson);
       const tenantScopeCode = resolveKnowledgeTenantScopeCode();
       const saved = await appointmentService.current.saveKnowledge(parsed, adminToken, tenantScopeCode);
       setKnowledgeJson(JSON.stringify(saved, null, 2));
-
-      setKnowledgeStatus('Estabelecimento e conhecimento salvos com sucesso.');
+      setKnowledgeStatus('Base de conhecimento salva com sucesso.');
     } catch (error) {
-      const message = error instanceof Error ? error.message : 'Erro ao salvar.';
+      const message = error instanceof Error ? error.message : 'Erro ao salvar base de conhecimento.';
       setKnowledgeStatus(message);
     } finally {
       setIsSavingKnowledge(false);
@@ -4139,21 +4126,6 @@ export default function App() {
                   </button>
                 </div>
                 {knowledgeStatus && <p className={`text-xs ${knowledgeStatusClass}`}>{knowledgeStatus}</p>}
-                <div className="rounded-lg bg-white/5 border border-amber-500/30 p-3 mb-3">
-                  <p className="text-xs text-amber-300 mb-2 font-semibold">⚙️ INTEGRAÇÃO TRINKS</p>
-                  <p className="text-xs text-white/70 mb-2">O Establishment ID diferencia suas unidades no sistema e conecta ao histórico de agendamentos no Trinks.</p>
-                  <input
-                    type="number"
-                    value={toText(currentTenant?.establishmentId || '')}
-                    onChange={(e) => {
-                      const newEstId = e.target.value.trim() ? Number(e.target.value.trim()) : null;
-                      setCurrentTenant(prev => prev ? { ...prev, establishmentId: newEstId } : null);
-                    }}
-                    placeholder="Ex: 62260"
-                    className="w-full rounded-md bg-[#0f1731] border border-white/15 text-white/90 px-3 py-2 text-sm"
-                  />
-                  <p className="text-xs text-white/50 mt-1">Salve e clique em 'Importar Histórico' do CRM para sincronizar agendamentos.</p>
-                </div>
                 <div className="grid sm:grid-cols-2 gap-3">
                   <input
                     value={toText(knowledgeObject?.identity?.brandName)}
