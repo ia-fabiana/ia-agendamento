@@ -11793,6 +11793,45 @@ app.put("/api/knowledge", (req, res) => {
   }
 });
 
+app.put("/api/tenant/me/establishment-id", (req, res) => {
+  try {
+    const principal = resolveAdminPrincipal(req);
+    if (!principal) {
+      return res.status(401).json({ status: "error", message: "Nao autorizado." });
+    }
+
+    if (principal.role !== "tenant") {
+      return res.status(403).json({
+        status: "error",
+        message: "Apenas tenants podem atualizar seu proprio establishmentId.",
+      });
+    }
+
+    const establishmentId = req.body?.establishmentId;
+    if (establishmentId !== null && establishmentId !== undefined && !Number.isFinite(Number(establishmentId))) {
+      return res.status(400).json({
+        status: "error",
+        message: "establishmentId deve ser um numero ou null.",
+      });
+    }
+
+    const tenant = updateTenantByCode(principal.tenantCode, {
+      establishmentId: establishmentId ? Number(establishmentId) : null,
+    });
+
+    return res.json({
+      status: "ok",
+      tenantCode: tenant.code,
+      establishmentId: tenant.establishmentId,
+    });
+  } catch (error) {
+    return res.status(500).json({
+      status: "error",
+      message: error.message || "Erro ao atualizar establishmentId.",
+    });
+  }
+});
+
 app.post("/api/admin/uploads/marketing-image", (req, res) => {
   try {
     const principal = requireAdminPrincipal(req, res);

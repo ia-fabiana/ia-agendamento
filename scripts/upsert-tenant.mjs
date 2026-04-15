@@ -88,7 +88,7 @@ function normalizeSchedulingProvider(value) {
 
 function hashTenantPassword(password, salt = "") {
   const effectiveSalt = toNonEmptyString(salt) || crypto.randomBytes(16).toString("hex");
-  const digest = crypto.scryptSync(String(password || ""), effectiveSalt, 64).toString("hex");
+  const digest = crypto.scryptSync(String(password || ""), Buffer.from(effectiveSalt, "hex"), 64).toString("hex");
   return `${effectiveSalt}:${digest}`;
 }
 

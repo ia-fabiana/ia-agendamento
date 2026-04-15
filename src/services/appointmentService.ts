@@ -454,6 +454,36 @@ export class AppointmentService {
     return data.knowledge || {};
   }
 
+  async saveEstablishmentId(adminToken: string, establishmentId: number | null) {
+    const headers = new Headers({ "Content-Type": "application/json" });
+    const normalizedToken = String(adminToken || "").trim();
+    if (normalizedToken) {
+      headers.set("x-admin-token", normalizedToken);
+    }
+
+    const response = await fetch(this.getBackendEndpoint("/api/tenant/me/establishment-id"), {
+      method: "PUT",
+      headers,
+      body: JSON.stringify({ establishmentId }),
+    });
+
+    if (!response.ok) {
+      let message = `Falha ao salvar establishmentId (${response.status}).`;
+      try {
+        const payload = (await response.json()) as { message?: string };
+        if (payload?.message) {
+          message = payload.message;
+        }
+      } catch {
+        // Keep fallback message.
+      }
+      throw new Error(message);
+    }
+
+    const data = (await response.json()) as { establishmentId?: number | null };
+    return data.establishmentId || null;
+  }
+
   async uploadMarketingImage(file: File, adminToken: string, tenantCode = "") {
     if (!file) {
       throw new Error("Selecione uma imagem para upload.");

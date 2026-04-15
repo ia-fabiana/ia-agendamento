@@ -1,0 +1,68 @@
+{
+  "tenant": {
+    "code": "jacques-janine-leo",
+    "name": "Leopoldina",
+    "segment": "salao",
+    "active": true,
+    "defaultProvider": "trinks",
+    "establishmentId": 62260
+  },
+  "knowledge": {
+    "identity": {
+      "brandName": "Leopoldina",
+      "assistantName": "Leopoldina",
+      "toneGuide": "acolhedor, profissional",
+      "toneOptions": [
+        "acolhedor",
+        "profissional"
+      ],
+      "toneCustom": ""
+    },
+    "business": {
+      "address": "",
+      "phone": "",
+      "openingHours": "",
+      "paymentMethods": [],
+      "allowedProfessionals": []
+    },
+    "policies": {
+      "latePolicy": "",
+      "cancellationPolicy": "",
+      "noShowPolicy": ""
+    },
+    "services": [],
+    "faq": [],
+    "marketing": {
+      "enabled": false,
+      "actions": []
+    }
+  },
+  "identifiers": [
+    {
+      "kind": "evolution_instance",
+      "value": "leopoldina"
+    },
+    {
+      "kind": "evolution_number",
+      "value": "5592544-8384"
+    }
+  ],
+  "providerConfigs": {
+    "trinks": {
+      "enabled": true,
+      "config": {}
+    },
+    "google_calendar": {
+      "enabled": false,
+      "config": {}
+    }
+  },
+  "users": [
+    {
+      "username": "leopoldina",
+      "displayName": "Leopoldina",
+      "password": "Lpo!2026#Acesso88",
+      "active": true
+    }
+  ]
+}
