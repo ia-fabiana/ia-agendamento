@@ -473,6 +473,17 @@ function sortCategoryOptionsAlphabetically(items: Array<{ categoryKey: string; c
   );
 }
 
+function formatTenantNameFromCode(value: string) {
+  const normalized = String(value || '')
+    .trim()
+    .replace(/[_-]+/g, ' ');
+  if (!normalized) {
+    return '';
+  }
+
+  return normalized.replace(/\b\w/g, (letter) => letter.toUpperCase());
+}
+
 function extractEvolutionInstanceFromIdentifiers(identifiers: AdminTenantIdentifier[]) {
   const list = Array.isArray(identifiers) ? identifiers : [];
   const found = list.find((item) => String(item?.kind || '').trim().toLowerCase() === 'evolution_instance');
@@ -674,6 +685,11 @@ export default function App() {
       const tenantCodeHint = String(params.get('tenant') || '').trim();
       const domainHint = tenantCodeHint ? '' : String(window.location.hostname || '').trim();
 
+      if (tenantCodeHint) {
+        setPublicTenantCode(tenantCodeHint);
+        setPublicTenantName(formatTenantNameFromCode(tenantCodeHint));
+      }
+
       try {
         const payload = (await appointmentService.current.getPublicTenantContext({
           tenantCode: tenantCodeHint || undefined,
@@ -681,15 +697,19 @@ export default function App() {
         })) as PublicTenantContext;
         const resolvedCode = String(payload?.tenant?.code || '').trim();
         const resolvedName = String(payload?.tenant?.name || '').trim();
-        setPublicTenantCode(resolvedCode);
-        setPublicTenantName(resolvedName);
+        if (resolvedCode) {
+          setPublicTenantCode(resolvedCode);
+          setPublicTenantName(resolvedName || formatTenantNameFromCode(resolvedCode));
+        }
 
         if (!adminToken.trim() && payload?.knowledge && typeof payload.knowledge === 'object') {
           setKnowledgeJson(JSON.stringify(payload.knowledge, null, 2));
         }
       } catch {
-        setPublicTenantCode('');
-        setPublicTenantName('');
+        if (!tenantCodeHint) {
+          setPublicTenantCode('');
+          setPublicTenantName('');
+        }
       }
     };
 
