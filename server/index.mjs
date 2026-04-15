@@ -13069,7 +13069,7 @@ app.post("/api/admin/tenants/:code/crm/sync-history", async (req, res) => {
     // Build set of appointment_ids already in audit (from previous backfills) to avoid duplicates
     const existingIds = new Set(
       db.prepare(
-        "SELECT appointment_id FROM appointment_audit WHERE tenant_code = ? AND event_type = 'trinks_backfill' AND appointment_id IS NOT NULL",
+        "SELECT appointment_id FROM appointment_audit WHERE tenant_code = ? AND event_type IN ('trinks_backfill', 'create') AND appointment_id IS NOT NULL",
       ).all(tenantCode).map((r) => Number(r.appointment_id)),
     );
 
@@ -13078,7 +13078,7 @@ app.post("/api/admin/tenants/:code/crm/sync-history", async (req, res) => {
         tenant_code, event_type, status, establishment_id, appointment_id,
         client_phone, client_name, service_name, professional_name,
         appointment_date, appointment_time, created_at
-      ) VALUES (?, 'trinks_backfill', 'success', ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ) VALUES (?, 'create', 'success', ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
 
     let inserted = 0;
