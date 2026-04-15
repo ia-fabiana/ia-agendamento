@@ -473,6 +473,21 @@ function sortCategoryOptionsAlphabetically(items: Array<{ categoryKey: string; c
   );
 }
 
+const PUBLIC_TENANT_CODE_ALIASES: Record<string, string> = {
+  leopoldina: 'jacques-janine-leo',
+  'jacques-janine-vila-leopoldina': 'jacques-janine-leo',
+  'jacques-janine-leopoldina': 'jacques-janine-leo',
+  'jj-leopoldina': 'jacques-janine-leo',
+};
+
+function resolveCanonicalTenantCode(value: string) {
+  const normalized = String(value || '').trim().toLowerCase();
+  if (!normalized) {
+    return '';
+  }
+  return PUBLIC_TENANT_CODE_ALIASES[normalized] || normalized;
+}
+
 function formatTenantNameFromCode(value: string) {
   const normalized = String(value || '')
     .trim()
@@ -485,7 +500,7 @@ function formatTenantNameFromCode(value: string) {
 }
 
 function normalizeTenantCodeMatch(value: string) {
-  return String(value || '').trim().toLowerCase();
+  return resolveCanonicalTenantCode(value);
 }
 
 function extractEvolutionInstanceFromIdentifiers(identifiers: AdminTenantIdentifier[]) {
@@ -686,12 +701,18 @@ export default function App() {
     const resolvePublicTenant = async () => {
       if (!appointmentService.current || typeof window === 'undefined') return;
       const params = new URLSearchParams(window.location.search);
-      const tenantCodeHint = String(params.get('tenant') || '').trim();
+      const rawTenantCodeHint = String(params.get('tenant') || '').trim();
+      const tenantCodeHint = resolveCanonicalTenantCode(rawTenantCodeHint);
       const domainHint = tenantCodeHint ? '' : String(window.location.hostname || '').trim();
 
       if (tenantCodeHint) {
         setPublicTenantCode(tenantCodeHint);
         setPublicTenantName(formatTenantNameFromCode(tenantCodeHint));
+        if (rawTenantCodeHint && rawTenantCodeHint !== tenantCodeHint) {
+          params.set('tenant', tenantCodeHint);
+          const nextUrl = `${window.location.pathname}?${params.toString()}${window.location.hash || ''}`;
+          window.history.replaceState({}, '', nextUrl);
+        }
       }
 
       try {
