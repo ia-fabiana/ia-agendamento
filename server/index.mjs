@@ -896,7 +896,7 @@ function hashSha256(value) {
 function hashTenantPassword(password, salt = "") {
   const normalizedPassword = String(password || "");
   const effectiveSalt = toNonEmptyString(salt) || crypto.randomBytes(16).toString("hex");
-  const digest = crypto.scryptSync(normalizedPassword, effectiveSalt, 64).toString("hex");
+  const digest = crypto.scryptSync(normalizedPassword, Buffer.from(effectiveSalt, "hex"), 64).toString("hex");
   return `${effectiveSalt}:${digest}`;
 }
 
