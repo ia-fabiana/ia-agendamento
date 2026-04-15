@@ -3013,9 +3013,17 @@ async function queryRecentTenantAppointmentsFromTrinks(tenant, { lookbackDays = 
         query: {
           page,
           pageSize: 50,
+          dataInicial: `${cutoffIso}T00:00:00`,
+          dataFinal: `${todayIso}T23:59:59`,
         },
       });
-    } catch {
+    } catch (err) {
+      const status = err?.status || 0;
+      if (status === 429) {
+        console.warn(`[queryRecentTrinksAppointments] tenant=${tenant.code} rate limit (429) na pagina ${page} — parando paginacao.`);
+      } else {
+        console.error(`[queryRecentTrinksAppointments] tenant=${tenant.code} erro na pagina ${page}:`, err?.message || err);
+      }
       break;
     }
 
@@ -13059,12 +13067,35 @@ app.post("/api/admin/tenants/:code/crm/sync-history", async (req, res) => {
     const lookbackDays = Math.min(Math.max(Number(req.body?.lookbackDays || 365), 7), 730);
     const limit = Math.min(Math.max(Number(req.body?.limit || 2000), 50), 5000);
 
+    if (!tenant.establishmentId) {
+      return res.status(400).json({ status: "error", message: "Tenant nao possui establishmentId configurado. Verifique as configuracoes do provider Trinks." });
+    }
+
     // Pull ALL services from Trinks — no service rule filter — so every client enters audit
-    const rows = await queryRecentTenantAppointmentsFromTrinks(tenant, {
-      lookbackDays,
-      limit,
-      serviceRules: [],
-    });
+    let rows = [];
+    try {
+      rows = await queryRecentTenantAppointmentsFromTrinks(tenant, {
+        lookbackDays,
+        limit,
+        serviceRules: [],
+      });
+    } catch (trinksErr) {
+      const msg = trinksErr?.message || "Erro ao consultar Trinks";
+      console.error(`[crm-sync-history] tenant=${tenantCode} erro Trinks:`, msg);
+      return res.status(502).json({ status: "error", message: `Erro ao buscar historico no Trinks: ${msg}` });
+    }
+
+    if (!rows.length) {
+      return res.json({
+        status: "ok",
+        tenantCode,
+        fetched: 0,
+        inserted: 0,
+        skipped: 0,
+        lookbackDays,
+        message: `Nenhum agendamento encontrado no Trinks para os ultimos ${lookbackDays} dias. Verifique se o establishmentId esta correto e se ha agendamentos com telefone cadastrado no periodo.`,
+      });
+    }
 
     // Build set of appointment_ids already in audit (from previous backfills) to avoid duplicates
     const existingIds = new Set(
