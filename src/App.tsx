@@ -484,6 +484,10 @@ function formatTenantNameFromCode(value: string) {
   return normalized.replace(/\b\w/g, (letter) => letter.toUpperCase());
 }
 
+function normalizeTenantCodeMatch(value: string) {
+  return String(value || '').trim().toLowerCase();
+}
+
 function extractEvolutionInstanceFromIdentifiers(identifiers: AdminTenantIdentifier[]) {
   const list = Array.isArray(identifiers) ? identifiers : [];
   const found = list.find((item) => String(item?.kind || '').trim().toLowerCase() === 'evolution_instance');
@@ -1547,8 +1551,18 @@ export default function App() {
 
   const handleTenantLogin = async () => {
     if (!appointmentService.current) return;
-    if (!tenantLoginCode.trim() || !tenantLoginUsername.trim() || !tenantLoginPassword) {
+    const effectiveTenantCode = String(publicTenantCode || tenantLoginCode || '').trim();
+    if (!effectiveTenantCode || !tenantLoginUsername.trim() || !tenantLoginPassword) {
       setAdminStatus('Informe tenant, usuario e senha para entrar.');
+      return;
+    }
+    if (
+      publicTenantCode
+      && normalizeTenantCodeMatch(tenantLoginCode) !== normalizeTenantCodeMatch(publicTenantCode)
+      && tenantLoginCode.trim()
+    ) {
+      setTenantLoginCode(publicTenantCode);
+      setAdminStatus(`Este link pertence ao tenant ${publicTenantCode}.`);
       return;
     }
 
@@ -1556,7 +1570,7 @@ export default function App() {
     setAdminStatus('');
     try {
       const response = await appointmentService.current.loginAdminTenantUser({
-        tenantCode: tenantLoginCode.trim(),
+        tenantCode: effectiveTenantCode,
         username: tenantLoginUsername.trim(),
         password: tenantLoginPassword,
       });
@@ -1565,11 +1579,18 @@ export default function App() {
       if (!token) {
         throw new Error('Login retornou sem token de sessao.');
       }
+      const loggedTenantCode = String(response.principal?.tenantCode || '').trim();
+      if (
+        publicTenantCode
+        && normalizeTenantCodeMatch(loggedTenantCode) !== normalizeTenantCodeMatch(publicTenantCode)
+      ) {
+        throw new Error(`Este link pertence ao tenant ${publicTenantCode}. Use a conta correspondente.`);
+      }
 
       setAdminToken(token);
       setTenantLoginPassword('');
       window.localStorage.setItem(ADMIN_TOKEN_STORAGE_KEY, token);
-      window.localStorage.setItem(TENANT_LOGIN_LAST_STORAGE_KEY, tenantLoginCode.trim());
+      window.localStorage.setItem(TENANT_LOGIN_LAST_STORAGE_KEY, effectiveTenantCode);
 
       await loadAdminSession(token);
       await loadAdminTenants(token);
@@ -1602,6 +1623,26 @@ export default function App() {
       setIsLoadingAdmin(false);
     }
   };
+
+  useEffect(() => {
+    if (!publicTenantCode || adminPrincipal?.role !== 'tenant') return;
+    const currentTenantCode = String(adminPrincipal?.tenantCode || '').trim();
+    if (normalizeTenantCodeMatch(currentTenantCode) === normalizeTenantCodeMatch(publicTenantCode)) {
+      return;
+    }
+
+    window.localStorage.removeItem(ADMIN_TOKEN_STORAGE_KEY);
+    setAdminToken('');
+    setAdminPrincipal(null);
+    setAdminTenants([]);
+    setSelectedAdminTenantCode('');
+    setAdminTenantIdentifiers([]);
+    setAdminTenantProviderConfigs([]);
+    setAdminTenantUsers([]);
+    setTenantLoginPassword('');
+    setTenantLoginCode(publicTenantCode);
+    setAdminStatus(`Este link pertence ao tenant ${publicTenantCode}. Faça login com a conta correta.`);
+  }, [adminPrincipal, publicTenantCode]);
 
   const handleUpdateTenant = async () => {
     if (!appointmentService.current || !adminToken || !selectedAdminTenantCode) {
@@ -2312,10 +2353,13 @@ export default function App() {
               <p className="text-xs uppercase tracking-wider text-white/60">Login cliente (tenant)</p>
               <div className="grid md:grid-cols-3 gap-2">
                 <input
-                  value={tenantLoginCode}
+                  value={publicTenantCode || tenantLoginCode}
                   onChange={(e) => setTenantLoginCode(e.target.value)}
                   placeholder="tenant code"
-                  className="rounded-md bg-[#0f1731] border border-white/15 text-white/90 px-3 py-2 text-sm"
+                  disabled={Boolean(publicTenantCode)}
+                  className={`rounded-md bg-[#0f1731] border border-white/15 text-white/90 px-3 py-2 text-sm ${
+                    publicTenantCode ? 'opacity-70 cursor-not-allowed' : ''
+                  }`}
                 />
                 <input
                   value={tenantLoginUsername}
@@ -3795,12 +3839,15 @@ export default function App() {
                       <div className="pt-3 border-t border-white/10 space-y-2">
                         <p className="text-xs uppercase tracking-wider text-white/60">Login cliente (tenant)</p>
                         <div className="grid md:grid-cols-3 gap-2">
-                          <input
-                            value={tenantLoginCode}
-                            onChange={(e) => setTenantLoginCode(e.target.value)}
-                            placeholder="tenant code"
-                            className="rounded-md bg-[#0f1731] border border-white/15 text-white/90 px-3 py-2 text-sm"
-                          />
+                        <input
+                          value={publicTenantCode || tenantLoginCode}
+                          onChange={(e) => setTenantLoginCode(e.target.value)}
+                          placeholder="tenant code"
+                          disabled={Boolean(publicTenantCode)}
+                          className={`rounded-md bg-[#0f1731] border border-white/15 text-white/90 px-3 py-2 text-sm ${
+                            publicTenantCode ? 'opacity-70 cursor-not-allowed' : ''
+                          }`}
+                        />
                           <input
                             value={tenantLoginUsername}
                             onChange={(e) => setTenantLoginUsername(e.target.value)}
