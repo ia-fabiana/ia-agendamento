@@ -771,11 +771,6 @@ export default function App() {
       const saved = await appointmentService.current.saveKnowledge(parsed, adminToken, tenantScopeCode);
       setKnowledgeJson(JSON.stringify(saved, null, 2));
 
-      // Reload tenant to show updated establishmentId
-      if (currentTenant && !tenantScopeCode) {
-        await loadTenant(currentTenant.code, adminToken);
-      }
-
       setKnowledgeStatus('Estabelecimento e conhecimento salvos com sucesso.');
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Erro ao salvar.';
