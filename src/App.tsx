@@ -2214,6 +2214,7 @@ export default function App() {
   const isTenantSession = adminPrincipal?.role === 'tenant';
   const sessionTenantName = String(adminPrincipal?.tenantName || selectedAdminTenant?.name || '').trim();
   const sessionTenantCode = String(adminPrincipal?.tenantCode || selectedAdminTenant?.code || '').trim();
+  const visibleEstablishmentId = String(adminEditEstablishmentId || selectedAdminTenant?.establishmentId || '').trim();
   const isAuthenticated = Boolean(adminPrincipal);
   const showSuperAdminEntry =
     typeof window !== 'undefined' && new URLSearchParams(window.location.search).get('admin') === '1';
@@ -4220,6 +4221,24 @@ export default function App() {
                   </button>
                 </div>
                 {knowledgeStatus && <p className={`text-xs ${knowledgeStatusClass}`}>{knowledgeStatus}</p>}
+                <div className="rounded-xl bg-white/5 border border-white/10 p-4 space-y-2">
+                  <div className="flex items-center justify-between gap-3 flex-wrap">
+                    <div>
+                      <p className="text-xs uppercase tracking-wider text-white/60">Identificacao Tecnica</p>
+                      <p className="text-sm text-white/90 mt-1">
+                        Establishment ID: <strong>{visibleEstablishmentId || 'nao configurado'}</strong>
+                      </p>
+                    </div>
+                    {sessionTenantCode && (
+                      <span className="text-xs rounded-full px-3 py-1 bg-brand-blue/15 border border-brand-blue/30 text-brand-blue">
+                        Tenant: {sessionTenantCode}
+                      </span>
+                    )}
+                  </div>
+                  <p className="text-xs text-white/55">
+                    Este campo identifica o salao no provider de agenda. A edicao continua no Painel Admin.
+                  </p>
+                </div>
                 <div className="grid sm:grid-cols-2 gap-3">
                   <input
                     value={toText(knowledgeObject?.identity?.brandName)}
