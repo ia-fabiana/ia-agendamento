@@ -3132,6 +3132,8 @@ async function queryRecentTenantAppointmentsFromTrinks(tenant, { lookbackDays = 
   const appointmentRows = [];
   const relevantClientIds = new Set();
   const seenAppointmentIds = new Set();
+  let firstPageFailure = null;
+  let pagesLoaded = 0;
 
   for (let page = 1; page <= maxPages; page += 1) {
     // Delay entre páginas para não estourar rate limit da Trinks (exceto página 1)
@@ -3150,6 +3152,7 @@ async function queryRecentTenantAppointmentsFromTrinks(tenant, { lookbackDays = 
           pageSize: 25,
         },
       });
+      pagesLoaded += 1;
     } catch (err) {
       const status = err?.status || 0;
       if (status === 429) {
@@ -3163,12 +3166,19 @@ async function queryRecentTenantAppointmentsFromTrinks(tenant, { lookbackDays = 
             tenantCode: tenant.code,
             query: { page, pageSize: 25 },
           });
+          pagesLoaded += 1;
         } catch {
           console.warn(`[queryRecentTrinksAppointments] tenant=${tenant.code} ainda em rate limit na pagina ${page} — parando.`);
+          if (!firstPageFailure) {
+            firstPageFailure = err;
+          }
           break;
         }
       } else {
         console.error(`[queryRecentTrinksAppointments] tenant=${tenant.code} erro na pagina ${page}:`, err?.message || err);
+        if (!firstPageFailure) {
+          firstPageFailure = err;
+        }
         break;
       }
     }
@@ -3244,6 +3254,13 @@ async function queryRecentTenantAppointmentsFromTrinks(tenant, { lookbackDays = 
     if (pageOldestDate && cutoffIso && pageOldestDate < cutoffIso) {
       break;
     }
+  }
+
+  if (!appointmentRows.length && pagesLoaded === 0 && firstPageFailure) {
+    const error = new Error(firstPageFailure?.message || "Erro ao buscar historico de agendamentos na Trinks.");
+    error.status = firstPageFailure?.status || 502;
+    error.details = firstPageFailure?.details || null;
+    throw error;
   }
 
   if (!appointmentRows.length || !relevantClientIds.size) {
