@@ -3224,7 +3224,8 @@ async function queryRecentTenantAppointmentsFromTrinks(tenant, { lookbackDays = 
       }
 
       const clientId = Number(normalized.raw?.cliente?.id ?? normalized.raw?.clienteId ?? normalized.raw?.clientId);
-      if (Number.isFinite(clientId) && clientId > 0) {
+      const appointmentPhone = extractPreferredPhoneFromAppointment(normalized.raw);
+      if (Number.isFinite(clientId) && clientId > 0 && !appointmentPhone) {
         relevantClientIds.add(clientId);
       }
 
@@ -3234,7 +3235,7 @@ async function queryRecentTenantAppointmentsFromTrinks(tenant, { lookbackDays = 
         establishmentId: tenant.establishmentId,
         clientId: Number.isFinite(clientId) && clientId > 0 ? clientId : null,
         clientName: toNonEmptyString(normalized.client),
-        clientPhone: "",
+        clientPhone: appointmentPhone,
         serviceName,
         professionalName: toNonEmptyString(normalized.professional),
         appointmentDate: normalized.date,
@@ -3263,14 +3264,18 @@ async function queryRecentTenantAppointmentsFromTrinks(tenant, { lookbackDays = 
     throw error;
   }
 
-  if (!appointmentRows.length || !relevantClientIds.size) {
+  if (!appointmentRows.length) {
     return appointmentRows;
+  }
+
+  if (!relevantClientIds.size) {
+    return appointmentRows.filter((row) => normalizePhone(row.clientPhone));
   }
 
   const clientCache = new Map();
   const clientIds = [...relevantClientIds];
-  for (let offset = 0; offset < clientIds.length; offset += 10) {
-    const batch = clientIds.slice(offset, offset + 10);
+  for (let offset = 0; offset < clientIds.length; offset += 3) {
+    const batch = clientIds.slice(offset, offset + 3);
     const results = await Promise.all(batch.map(async (clientId) => {
       try {
         const client = await getClientById(tenant.establishmentId, clientId);
@@ -3293,6 +3298,12 @@ async function queryRecentTenantAppointmentsFromTrinks(tenant, { lookbackDays = 
 
   return appointmentRows
     .map((row) => {
+      if (normalizePhone(row.clientPhone)) {
+        return {
+          ...row,
+          clientPhone: normalizePhone(row.clientPhone),
+        };
+      }
       const resolved = clientCache.get(row.clientId) || null;
       return {
         ...row,
@@ -6218,6 +6229,51 @@ function extractPreferredPhoneFromClient(item) {
   }
 
   for (const candidate of candidates) {
+    const normalized = typeof candidate === "object"
+      ? normalizeTrinksPhone(candidate)
+      : normalizePhone(candidate);
+    if (normalized) {
+      return normalized;
+    }
+  }
+
+  return "";
+}
+
+function extractPreferredPhoneFromAppointment(item) {
+  if (!item || typeof item !== "object") {
+    return "";
+  }
+
+  const nestedCandidates = [item?.cliente, item?.client, item?.customer, item?.contato, item?.clienteContato];
+  for (const candidate of nestedCandidates) {
+    const normalized = extractPreferredPhoneFromClient(candidate);
+    if (normalized) {
+      return normalized;
+    }
+  }
+
+  const directCandidates = [
+    item?.clienteTelefone,
+    item?.clienteCelular,
+    item?.clientPhone,
+    item?.customerPhone,
+    item?.telefone,
+    item?.celular,
+    item?.phone,
+    item?.whatsapp,
+    item?.cliente?.telefone,
+    item?.cliente?.celular,
+    item?.cliente?.phone,
+    item?.client?.telefone,
+    item?.client?.celular,
+    item?.client?.phone,
+    item?.customer?.telefone,
+    item?.customer?.celular,
+    item?.customer?.phone,
+  ];
+
+  for (const candidate of directCandidates) {
     const normalized = typeof candidate === "object"
       ? normalizeTrinksPhone(candidate)
       : normalizePhone(candidate);
